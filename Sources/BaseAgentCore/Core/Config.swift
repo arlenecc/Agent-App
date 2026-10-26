@@ -71,10 +71,11 @@ public struct AgentConfig: Sendable {
     public var maxContextTokens: Int = 32768
     /// prompt prefill 每次前向的 token 上限（0 = 使用 MLX 默认值）。
     public var promptBatchSize: Int = 1024
-    /// MLX 空闲 buffer cache 上限（MB）。只限制可复用 buffer，不含模型权重与 KV。
+    /// MLX 空闲 buffer cache 上限（MB）。只限制可复用 buffer，不含模型权重与 KV；
+    /// 运行时夹在 256...1024，默认 512。
     public var mlxCacheLimitMB: Int = 512
     /// MLX 全局内存硬上限（MB，含权重/KV/buffer）；0 = 自动取
-    /// min(物理内存 75%, 9.6GB)。
+    /// min(物理内存 65%, 9.6GB)。
     public var mlxMemoryLimitMB: Int = 0
     /// 主模型 KV cache 的 token 硬上限；0 表示跟随 maxContextTokens。
     /// 32k 约对应 1GB KV（Qwen3.5 只有 1/4 层是全注意力）。
@@ -113,19 +114,38 @@ public struct AgentConfig: Sendable {
     public var kernelMaxDigestLines: Int = 40
 
     // RAG
-    public var ragChunkSize: Int = 800
-    /// 默认取 chunk_size 的 5%。
-    public var ragChunkOverlap: Int = 40
+    /// 切片大小（token，含 overlap）。默认 500：bge-small-zh 上下文 512 token，
+    /// 留出 [CLS]/[SEP] 与估算误差的余量。实测纯中文约 1 字 ≈ 1 token，
+    /// 中英混排约 1.8 字符/token（500 token ≈ 600-900 字）。
+    public var ragChunkSize: Int = 500
+    /// 默认 chunk_size 的 10%（token）。计入 chunk_size 总预算，
+    /// 正文按 `chunk_size - overlap` 切片，拼好后仍不超过 500 token。
+    public var ragChunkOverlap: Int = 50
     /// 语义切片开关：开启时大段落在句间相似度低谷处断开（切片阶段需把
     /// 每个候选句嵌入一遍，显著慢于纯结构切片）；关闭时按标题结构 +
-    /// token 边界递归切片，速度快一个数量级，检索质量损失有限。
+    /// 字符边界递归切片，速度快一个数量级，检索质量损失有限。
     public var ragSemanticChunking: Bool = true
-    public var ragEmbeddingModel: String = "nomic-embed-text-v1.5-mlx-8bit"
-    /// 默认用 mxfp8 量化版：与 fp16 分数分布一致（int4 正样本分数会下移，
-    /// 实测 0.843→0.612 会跨过 0.7 重排阈值丢召回）；速度差 26% 在重排阶段不敏感。
-    /// 内存紧张时可配 bge-reranker-v2-m3-mlx-int4（355MB，需相应下调阈值）。
-    public var ragRerankModel: String = "bge-reranker-v2-m3-mlx-mxfp8"
+    /// 默认 bge-small-zh-v1.5（MLX fp16）：中文检索全面优于 nomic
+    /// （实测 Recall@1 9/10 vs 5/10、吞吐 8-10 倍），query 侧自动加官方检索指令。
+    public var ragEmbeddingModel: String = "bge-small-zh-v1.5-mlx"
+    /// 默认 ONNX int8 版 jina reranker：CPU 推理吞吐约为 MLX mxfp8 的 2 倍，
+    /// 1024 token 上下文。实测中文重排分数整体偏低（目标块 0.25-0.68），
+    /// 需配合 ragRerankThreshold=0.45 使用（原 0.7 阈值会滤掉全部结果）。
+    /// 追求排序质量可改回 bge-reranker-v2-m3-mlx-mxfp8（MLX 后端）并上调阈值。
+    public var ragRerankModel: String = "jina-reranker-v2-base-multilingual-onnx"
+    /// 重排分数过滤阈值（0-1）。全部低于阈值时回退原排序 topK，不会空结果。
+    public var ragRerankThreshold: Double = 0.45
     public var ragRerankEnabled: Bool = true
+    /// 检索结果格式化时单条片段的字符上限（超出截断加省略号）。
+    public var ragSearchMaxCharsPerResult: Int = 1_500
+    /// 检索结果总字符上限（超出截断）。
+    public var ragSearchMaxTotalChars: Int = 12_000
+    /// 辅助模型精简触发下限：检索结果总字数低于该值时原样返回，
+    /// 不调用辅助模型（内容不多时总结只会丢细节、平白增加延迟）。
+    public var ragAuxSummarizeMinChars: Int = 4_000
+    /// 辅助模型精简触发上限：超过该值的结果不做精简
+    ///（内容过大时一次性摘要不可靠）。
+    public var ragAuxSummarizeMaxChars: Int = 12_000
     /// 启动时自动同步知识库。默认关闭：首次全量同步会长时间占用
     /// embedding 模型与磁盘 IO，容易与对话争抢资源；需要时手动触发。
     public var ragAutoIngest: Bool = false
@@ -164,6 +184,27 @@ public struct AgentConfig: Sendable {
     /// 第二实例懒加载（仅在真正并发时才占内存），可提高扫描页吞吐。
     public var ragOvisInstances: Int = 2
 
+    // Embedding 子批自适应（AdaptiveEmbeddingScheduler）
+    /// 子批下限（2...64），默认 2；运行时还会夹到不超过上限。
+    public var ragEmbeddingMinBatch: Int = 2
+    /// 子批上限（2...256）。默认 32：实测 477 token 长块在 4-16 已达吞吐平台，
+    /// 32 兼顾短块；64 以上只增加内存与单批延迟。
+    public var ragEmbeddingMaxBatch: Int = 32
+    /// 每次同步的起始子批（2...256），默认 16；运行时夹到 [下限, 上限]。
+    public var ragEmbeddingInitialBatch: Int = 16
+    /// 每轮上探/下探的步进（1...16），默认 2。
+    public var ragEmbeddingBatchStep: Int = 2
+    /// 子批调参的进程 footprint 上限（MB，1024...32768），默认 6144。
+    /// 超过该值立即下调子批；bge 单独运行时峰值约 1.6GB。
+    public var ragEmbeddingMemoryLimitMB: Int = 6_144
+    /// 吞吐变化容差（0.01...0.5），默认 0.03。变化小于该比例视为测量噪声，
+    /// 不调整子批；实测同 batch 重复测量的噪声可达 ±20%，可调到 0.08-0.10。
+    public var ragEmbeddingThroughputTolerance: Double = 0.03
+    /// 每档至少观察的批次数（1...16，默认 2），与 probeSeconds 满足其一即评估。
+    public var ragEmbeddingProbeBatches: Int = 2
+    /// 每档至少观察的秒数（0.5...30，默认 2）。
+    public var ragEmbeddingProbeSeconds: Double = 2.0
+
     // SQLite + sqlite-vec 存储
     public var ragStorageBackend: String = "sqlite"
     public var ragSQLiteVecEnabled: Bool = true
@@ -181,6 +222,9 @@ public struct AgentConfig: Sendable {
     public var localLLMBackend: String = "mlx-lm"
     public var localLLMEnableThinking: Bool = true
 
+    /// 是否启用辅助模型。默认关闭：启动和知识同步前后都不加载辅助模型；
+    /// RAG 精简直接跳过，后台记忆/总结回退主模型（若主模型可用）。
+    public var auxEnabled: Bool = false
     public var auxLLMProvider: String = "local"
     public var auxLocalLLMModel: String = "models/Qwen3.5-2B-MLX-4bit"
     public var auxLocalLLMBackend: String = "mlx-lm"
@@ -196,21 +240,21 @@ public struct AgentConfig: Sendable {
     public var auxLocalLLMEnableThinking: Bool = false
 
     public var embeddingProvider: String = "local"
-    public var localEmbeddingModel: String = "nomic-embed-text-v1.5-mlx-8bit"
+    public var localEmbeddingModel: String = "bge-small-zh-v1.5-mlx"
     /// 显式本地目录；非空时优先于模型名。
     /// 使用相对模型根目录的路径，由 LocalModelRegistry 统一解析。
-    public var localEmbeddingModelPath: String = "models/nomic-embed-text-v1.5-mlx-8bit"
+    public var localEmbeddingModelPath: String = "models/bge-small-zh-v1.5-mlx"
     /// onnx / fastembed / mlx / gguf
     /// Embedding 后端：mlx（Metal GPU，默认，使用本地 8bit 量化权重）
     /// / onnx（CPU int8）/ fastembed / gguf。
     public var localEmbeddingBackend: String = "mlx"
 
     public var rerankerProvider: String = "local"
-    public var localRerankerModel: String = "bge-reranker-v2-m3-mlx-mxfp8"
-    public var localRerankerModelPath: String = "models/bge-reranker-v2-m3-mlx-mxfp8"
+    public var localRerankerModel: String = "jina-reranker-v2-base-multilingual-onnx"
+    public var localRerankerModelPath: String = "models/jina-reranker-v2-base-multilingual-onnx"
     /// onnx / fastembed / mlx / gguf
-    /// 默认 MLX：与默认模型 bge-reranker-v2-m3-mlx-mxfp8 的权重格式一致。
-    public var localRerankerBackend: String = "mlx"
+    /// 默认 ONNX：与默认模型 jina-reranker-v2-base-multilingual-onnx 的权重格式一致。
+    public var localRerankerBackend: String = "onnx"
 
     public var vlmProvider: String = "api"
     public var localVLMModel: String = ""
@@ -351,6 +395,16 @@ public struct AgentConfig: Sendable {
         }
         if let v = int("rag_vision_concurrency") { ragVisionConcurrency = max(0, v) }
         if let v = int("rag_ovis_instances") { ragOvisInstances = min(max(1, v), 2) }
+        if let v = int("rag_embedding_min_batch") { ragEmbeddingMinBatch = v }
+        if let v = int("rag_embedding_max_batch") { ragEmbeddingMaxBatch = v }
+        if let v = int("rag_embedding_initial_batch") { ragEmbeddingInitialBatch = v }
+        if let v = int("rag_embedding_batch_step") { ragEmbeddingBatchStep = v }
+        if let v = int("rag_embedding_memory_limit_mb") { ragEmbeddingMemoryLimitMB = v }
+        if let v = double("rag_embedding_throughput_tolerance") {
+            ragEmbeddingThroughputTolerance = v
+        }
+        if let v = int("rag_embedding_probe_batches") { ragEmbeddingProbeBatches = v }
+        if let v = double("rag_embedding_probe_seconds") { ragEmbeddingProbeSeconds = v }
         if let v = string("rag_embedding_model") { ragEmbeddingModel = v }
         if let v = string("rag_rerank_model") { ragRerankModel = v }
         if let v = bool("rag_rerank_enabled") { ragRerankEnabled = v }
@@ -374,6 +428,11 @@ public struct AgentConfig: Sendable {
         if let v = string("rag_storage_backend") { ragStorageBackend = v }
         if let v = bool("rag_sqlite_vec_enabled") { ragSQLiteVecEnabled = v }
         if let v = int("rag_rrf_k") { ragRRFK = v }
+        if let v = double("rag_rerank_threshold") { ragRerankThreshold = v }
+        if let v = int("rag_search_max_chars_per_result") { ragSearchMaxCharsPerResult = v }
+        if let v = int("rag_search_max_total_chars") { ragSearchMaxTotalChars = v }
+        if let v = int("rag_aux_summarize_min_chars") { ragAuxSummarizeMinChars = v }
+        if let v = int("rag_aux_summarize_max_chars") { ragAuxSummarizeMaxChars = v }
         if let v = int("rag_vector_overfetch") { ragVectorOverfetch = v }
         if let v = int("rag_fts_overfetch") { ragFTSOverfetch = v }
 
@@ -382,6 +441,7 @@ public struct AgentConfig: Sendable {
         if let v = string("local_llm_backend") { localLLMBackend = v }
         if let v = bool("local_llm_enable_thinking") { localLLMEnableThinking = v }
 
+        if let v = bool("aux_enabled") { auxEnabled = v }
         if let v = string("aux_llm_provider") { auxLLMProvider = v }
         if let v = string("aux_local_llm_model") { auxLocalLLMModel = v }
         if let v = string("aux_local_llm_backend") { auxLocalLLMBackend = v }
@@ -506,18 +566,48 @@ public struct AgentConfig: Sendable {
             || ragRerankModel == "BAAI/bge-reranker-v2-m3-int8" {
             ragRerankModel = "bge-reranker-v2-m3-mlx-mxfp8"
         }
+        // 上一版默认（bge mxfp8 + MLX）迁移到 jina ONNX：仅当模型与后端
+        // 都恰好等于旧默认时才迁移，用户显式选择的其他组合保持不变。
+        let legacyRerankerName = "bge-reranker-v2-m3-mlx-mxfp8"
+        if localRerankerBackend == "mlx",
+           localRerankerModel == legacyRerankerName,
+           localRerankerModelPath.isEmpty
+            || localRerankerModelPath == "models/\(legacyRerankerName)"
+            || localRerankerModelPath == legacyRerankerName
+            || localRerankerModelPath.hasSuffix("/\(legacyRerankerName)") {
+            localRerankerBackend = "onnx"
+            localRerankerModel = "jina-reranker-v2-base-multilingual-onnx"
+            localRerankerModelPath = "models/jina-reranker-v2-base-multilingual-onnx"
+            if ragRerankModel == legacyRerankerName {
+                ragRerankModel = "jina-reranker-v2-base-multilingual-onnx"
+            }
+        }
+        // 上一版默认（nomic 8bit）迁移到 bge-small-zh（MLX fp16）：中文检索
+        // 质量与速度全面占优。仅迁移恰好等于旧默认名/路径的配置。
+        let bgeName = "bge-small-zh-v1.5-mlx"
+        for legacy in ["nomic-embed-text-v1.5-mlx-8bit",
+                       "nomic-ai/nomic-embed-text-v1.5-mlx-8bit"] {
+            if ragEmbeddingModel == legacy { ragEmbeddingModel = bgeName }
+            if localEmbeddingModel == legacy { localEmbeddingModel = bgeName }
+        }
+        if localEmbeddingModelPath == "models/nomic-embed-text-v1.5-mlx-8bit"
+            || localEmbeddingModelPath == "nomic-embed-text-v1.5-mlx-8bit"
+            || localEmbeddingModelPath.hasSuffix("/nomic-embed-text-v1.5-mlx-8bit") {
+            localEmbeddingModelPath = "models/\(bgeName)"
+        }
         if maxTokens == 4096 { maxTokens = 32768 }
         if maxContextTokens < 8192 { maxContextTokens = maxTokens }
-        // 旧默认迁移到 800/40（5%）：500/50 是更早的默认，800/80 是上一版默认。
+        // 旧默认迁移到 500/50（10%）：800/40 是上一版默认，800/80 更早。
         // 只迁移「恰好等于旧默认值」的组合，用户自定义值保持不变。
-        if ragChunkSize == 500, ragChunkOverlap == 50 {
-            ragChunkSize = 800
-            ragChunkOverlap = 40
+        if ragChunkSize == 800, ragChunkOverlap == 40 {
+            ragChunkSize = 500
+            ragChunkOverlap = 50
         } else if ragChunkSize == 800, ragChunkOverlap == 80 {
-            ragChunkOverlap = 40
+            ragChunkSize = 500
+            ragChunkOverlap = 50
         }
         if ragChunkOverlap >= ragChunkSize {
-            ragChunkOverlap = max(0, ragChunkSize / 20)
+            ragChunkOverlap = max(0, ragChunkSize / 10)
         }
         if ragStorageBackend != "sqlite" { ragStorageBackend = "sqlite" }
 
@@ -537,6 +627,21 @@ public struct AgentConfig: Sendable {
         localRerankerBackend = Self.normalizeEmbeddingBackend(localRerankerBackend)
         if auxMaxContextTokens < 8192 { auxMaxContextTokens = max(8192, auxMaxTokens) }
         if auxMaxContextTokens <= 0 { auxMaxContextTokens = 32768 }
+        // MLX 空闲 buffer cache 运行时上限 1GB：旧配置可能残留 2048/4096，
+        // 加载时一并压回，避免配置文件里的值与实际生效值不一致。
+        mlxCacheLimitMB = max(256, min(1_024, mlxCacheLimitMB))
+        // Embedding 子批自适应参数：手改 config.json 或旧配置可能越界。
+        ragEmbeddingMaxBatch = max(2, min(256, ragEmbeddingMaxBatch))
+        ragEmbeddingMinBatch = max(2, min(64, ragEmbeddingMinBatch))
+        ragEmbeddingMinBatch = min(ragEmbeddingMinBatch, ragEmbeddingMaxBatch)
+        ragEmbeddingInitialBatch = max(ragEmbeddingMinBatch,
+                                       min(ragEmbeddingInitialBatch, ragEmbeddingMaxBatch))
+        ragEmbeddingBatchStep = max(1, min(16, ragEmbeddingBatchStep))
+        ragEmbeddingMemoryLimitMB = max(1_024, min(32_768, ragEmbeddingMemoryLimitMB))
+        ragEmbeddingThroughputTolerance = max(0.01,
+                                              min(0.5, ragEmbeddingThroughputTolerance))
+        ragEmbeddingProbeBatches = max(1, min(16, ragEmbeddingProbeBatches))
+        ragEmbeddingProbeSeconds = max(0.5, min(30, ragEmbeddingProbeSeconds))
     }
 
     /// 统一主/辅模型类型：mlx → mlx-lm；llama.cpp / llama_cpp → gguf。
@@ -599,6 +704,14 @@ public struct AgentConfig: Sendable {
             "rag_ingest_concurrency": ragIngestConcurrency,
             "rag_vision_concurrency": ragVisionConcurrency,
             "rag_ovis_instances": ragOvisInstances,
+            "rag_embedding_min_batch": ragEmbeddingMinBatch,
+            "rag_embedding_max_batch": ragEmbeddingMaxBatch,
+            "rag_embedding_initial_batch": ragEmbeddingInitialBatch,
+            "rag_embedding_batch_step": ragEmbeddingBatchStep,
+            "rag_embedding_memory_limit_mb": ragEmbeddingMemoryLimitMB,
+            "rag_embedding_throughput_tolerance": ragEmbeddingThroughputTolerance,
+            "rag_embedding_probe_batches": ragEmbeddingProbeBatches,
+            "rag_embedding_probe_seconds": ragEmbeddingProbeSeconds,
             "rag_embedding_model": ragEmbeddingModel,
             "rag_rerank_model": ragRerankModel,
             "rag_rerank_enabled": ragRerankEnabled,
@@ -621,12 +734,18 @@ public struct AgentConfig: Sendable {
             "rag_storage_backend": ragStorageBackend,
             "rag_sqlite_vec_enabled": ragSQLiteVecEnabled,
             "rag_rrf_k": ragRRFK,
+            "rag_rerank_threshold": ragRerankThreshold,
+            "rag_search_max_chars_per_result": ragSearchMaxCharsPerResult,
+            "rag_search_max_total_chars": ragSearchMaxTotalChars,
+            "rag_aux_summarize_min_chars": ragAuxSummarizeMinChars,
+            "rag_aux_summarize_max_chars": ragAuxSummarizeMaxChars,
             "rag_vector_overfetch": ragVectorOverfetch,
             "rag_fts_overfetch": ragFTSOverfetch,
             "llm_provider": llmProvider,
             "local_llm_model": localLLMModel,
             "local_llm_backend": localLLMBackend,
             "local_llm_enable_thinking": localLLMEnableThinking,
+            "aux_enabled": auxEnabled,
             "aux_llm_provider": auxLLMProvider,
             "aux_local_llm_model": auxLocalLLMModel,
             "aux_local_llm_backend": auxLocalLLMBackend,

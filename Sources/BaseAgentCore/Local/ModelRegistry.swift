@@ -80,7 +80,7 @@ public enum LocalModelRegistry {
     public static func defaultName(for kind: LocalModelKind) -> String? {
         switch kind {
         case .embedding: return "nomic-ai/nomic-embed-text-v1.5-Q"
-        case .reranker: return "bge-reranker-v2-m3-mlx-mxfp8"
+        case .reranker: return "jina-reranker-v2-base-multilingual-onnx"
         case .llm: return "qwen3.5-4b-agentic-coder-v4-4bit-mlx"
         case .aux: return "Qwen3.5-2B-MLX-4bit"
         case .vlm: return nil

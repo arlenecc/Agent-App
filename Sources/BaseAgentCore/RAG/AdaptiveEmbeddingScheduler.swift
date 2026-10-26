@@ -16,6 +16,15 @@ final class AsyncGate: @unchecked Sendable {
             return
         }
         await withCheckedContinuation { continuation in
+            lock.lock()
+            // 快速检查与注册之间存在窗口：若此时正好被 release，acquired 已
+            // 归还为 false。必须在这里领取，否则会漏唤醒、永久等待。
+            if !acquired {
+                acquired = true
+                lock.unlock()
+                continuation.resume()
+                return
+            }
             waiters.append(continuation)
             lock.unlock()
         }
@@ -88,6 +97,14 @@ final class AsyncSemaphore: @unchecked Sendable {
                     continuation.resume(returning: false)
                     return
                 }
+                // 与 AsyncGate 相同的窗口：快速检查后、注册前可能正好释放了
+                // 一个许可。此时直接领取，避免许可被归还却无人唤醒。
+                if available > 0 {
+                    available -= 1
+                    lock.unlock()
+                    continuation.resume(returning: true)
+                    return
+                }
                 waiters.append(Waiter(id: id, continuation: continuation))
                 lock.unlock()
             }
@@ -146,9 +163,9 @@ enum ProcessMemory {
 
 /// 多文件并发 ingest 时共享的 embedding 调度器：
 /// - 按底层 provider 的并发能力限流（MLX 串行，ONNX 可 2 路并发）；
-/// - 按吞吐与内存自动调整子批大小（默认 2...64，初始 16，步进 2）；
+/// - 按吞吐与内存自动调整子批大小（默认 2...32，初始 16，步进 2）；
 /// - 内存超过上限时立即下调，吞吐下降时反向探测，持续寻找当前内存下的最优值。
-public final class AdaptiveEmbeddingScheduler: EmbeddingProvider, @unchecked Sendable {
+public final class AdaptiveEmbeddingScheduler: EmbeddingProvider, EmbeddingTokenCounting, @unchecked Sendable {
 
     public struct Options: Sendable {
         public var minBatchSize: Int
@@ -157,24 +174,30 @@ public final class AdaptiveEmbeddingScheduler: EmbeddingProvider, @unchecked Sen
         public var step: Int
         /// 子批调参的内存上限（MB），默认 6GB。
         public var memoryLimitMB: Double
+        /// 吞吐变化容差（0.03 = ±3%）。变化小于该比例视为测量噪声，不调整子批。
+        public var throughputTolerance: Double
         /// 每个尺寸至少观察的批次数或秒数，避免测量噪声导致抖动。
         public var probeBatches: Int
         public var probeSeconds: Double
 
         public init(minBatchSize: Int = 2,
-                    maxBatchSize: Int = 64,
+                    maxBatchSize: Int = 32,
                     initialBatchSize: Int = 16,
                     step: Int = 2,
                     memoryLimitMB: Double = 6 * 1_024,
+                    throughputTolerance: Double = 0.03,
                     probeBatches: Int = 2,
                     probeSeconds: Double = 2.0) {
-            self.minBatchSize = minBatchSize
-            self.maxBatchSize = maxBatchSize
-            self.initialBatchSize = initialBatchSize
-            self.step = step
-            self.memoryLimitMB = memoryLimitMB
-            self.probeBatches = probeBatches
-            self.probeSeconds = probeSeconds
+            let normalizedMin = max(1, minBatchSize)
+            let normalizedMax = max(normalizedMin, maxBatchSize)
+            self.minBatchSize = normalizedMin
+            self.maxBatchSize = normalizedMax
+            self.initialBatchSize = min(max(normalizedMin, initialBatchSize), normalizedMax)
+            self.step = max(1, step)
+            self.memoryLimitMB = max(256, memoryLimitMB)
+            self.throughputTolerance = max(0.005, min(0.5, throughputTolerance))
+            self.probeBatches = max(1, probeBatches)
+            self.probeSeconds = max(0.1, probeSeconds)
         }
     }
 
@@ -265,6 +288,17 @@ public final class AdaptiveEmbeddingScheduler: EmbeddingProvider, @unchecked Sen
         await base.unload()
     }
 
+    /// 转发底层模型的窗口预算；底层不支持时视为不限（仍用保守估算器控长）。
+    public var maxContentTokens: Int {
+        (base as? EmbeddingTokenCounting)?.maxContentTokens ?? Int.max
+    }
+
+    /// 转发底层模型的精确 token 计数器；底层不支持时回退到估算器。
+    public func makeTokenCounter() async -> (@Sendable (String) -> Int)? {
+        guard let provider = base as? EmbeddingTokenCounting else { return nil }
+        return await provider.makeTokenCounter()
+    }
+
     // MARK: - 自适应子批
 
     private func record(chunks: Int, seconds: TimeInterval) {
@@ -301,7 +335,8 @@ public final class AdaptiveEmbeddingScheduler: EmbeddingProvider, @unchecked Sen
             }
         } else {
             let ratio = throughput / lastThroughput
-            if ratio >= 1.03 {
+            let tolerance = options.throughputTolerance
+            if ratio >= 1 + tolerance {
                 if direction > 0, batchSize < options.maxBatchSize {
                     newSize = min(options.maxBatchSize, batchSize + options.step)
                     reason = "吞吐提升，继续上探"
@@ -309,7 +344,7 @@ public final class AdaptiveEmbeddingScheduler: EmbeddingProvider, @unchecked Sen
                     newSize = max(options.minBatchSize, batchSize - options.step)
                     reason = "下调后吞吐提升，继续下探"
                 }
-            } else if ratio <= 0.97 {
+            } else if ratio <= 1 - tolerance {
                 direction = -direction
                 if direction > 0, batchSize < options.maxBatchSize {
                     newSize = min(options.maxBatchSize, batchSize + options.step)

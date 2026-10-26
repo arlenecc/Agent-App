@@ -9,7 +9,7 @@ import MLXLMCommon
 /// 模型专属处理：
 /// - nomic：`search_document:` / `search_query:` 前缀；
 /// - bge-zh：query 侧追加官方检索指令（document 不加），其余模型原样。
-public final class MLXEmbeddingProvider: EmbeddingProvider, @unchecked Sendable {
+public final class MLXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCounting, @unchecked Sendable {
     public static let bgeQueryInstruction = "为这个句子生成表示以用于检索相关文章："
 
     public let identifier: String
@@ -108,6 +108,17 @@ public final class MLXEmbeddingProvider: EmbeddingProvider, @unchecked Sendable 
     /// 释放 embedding 权重；provider 保留，下次 embed 时按需重载。
     public func unload() async {
         await state.unload()
+    }
+
+    /// 单条输入上限：窗口减去 [CLS]/[SEP]；nomic 还要给 document 前缀留余量。
+    /// bge-zh 的 document 不加指令前缀（query 才加），内容预算为 512 - 2 = 510。
+    public var maxContentTokens: Int {
+        max(16, maxLength - (usesNomicPrefix ? 10 : 2))
+    }
+
+    /// 切片用的精确 token 计数（不含特殊 token）：只加载 tokenizer，不牵动模型权重。
+    public func makeTokenCounter() async -> (@Sendable (String) -> Int)? {
+        await TokenizerCounterCache.shared.counter(for: directory)
     }
 }
 

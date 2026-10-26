@@ -4,8 +4,6 @@ macOS 原生自主 Agent。控制流是**三态自动机 + 五级上下文压缩
 
 详细模块设计与事务/检索流程见 [软件设计文档](docs/软件设计文档.md)。
 
-本仓库是原 Python 版本的完整 Swift 重构：移除了 docling / marker / PyMuPDF / LanceDB / PyQt6，改为 PDFKit、Apple Vision、sqlite-vec、SwiftUI 与 SwiftPM。
-
 ## 环境要求
 
 - macOS 14+
@@ -14,7 +12,7 @@ macOS 原生自主 Agent。控制流是**三态自动机 + 五级上下文压缩
   - LLM：MLX-LM / MLX-VLM 模型目录、GGUF 文件、ONNX 解码器目录（`input_ids` + `logits`，可选 `past_key_values`）
   - OCR VLM：MLX 模型目录、GGUF + mmproj；ONNX VLM 暂无通用图适配
   - Embedding / Reranker：ONNX 模型目录（含 `tokenizer.json`）、MLX 模型目录或 GGUF 文件
-  - 默认主模型 `models/qwen3.5-4b-agentic-coder-v4-4bit-mlx`，辅助模型 `models/Qwen3.5-2B-MLX-4bit`
+  - 默认主模型 `models/qwen3.5-4b-agentic-coder-v4-4bit-mlx`；辅助模型默认 `models/Qwen3.5-2B-MLX-4bit`，但默认**不启用**，需要在配置窗口显式勾选「启用」
 - 运行时已随包内置：
   - GGUF：llama.cpp 官方 XCFramework，进程内直接加载模型，不再启动 `llama-server`
   - ONNX：onnxruntime-swift，不再依赖 Python / `onnxruntime-genai`
@@ -34,7 +32,7 @@ swift run BaseAgent
 swift test --disable-sandbox
 ```
 
-测试覆盖（共 76 个 XCTest，8 个需要模型环境变量而默认跳过）：sqlite-vec 事务写入/回滚、两段式 KNN、FTS5 中文分词、RRF 混合检索、RAG 增量/删除清理、EPUB/DOCX/HTML 解析、扫描版 EPUB 归一化 + OCR、PDF 文本层、Ovis 文本页快路径、NaturalLanguage 切片、配置迁移与旧键兼容、Agent 工具循环、ask_user 续跑、checkpoint 同步、code_run 写护栏、L3 去重、大纲围栏，以及摘要溢出保留、代码围栏/中文换行/正文数字保留、技能索引入口回退、空库维度自愈、`models/` 相对路径解析，以及 KV 复用增量与完整 prompt 的逐 token 模板对齐、预热前缀对齐、清空对话时失效 KV cache；GGUF 模型路径/mmproj 解析、进程内 llama.cpp 框架加载、ONNX 缺少权重时的明确报错，合成 ONNX decoder 图的 past/present 管线，简单 HTML 表格转 Markdown、复杂表格保留 HTML、Markdown 语法/缩进保留、纯文本 HTML/实体/噪声清理、空行与空格密度压缩、跨目录副本与 content_hash 去重、手动向量去重保留最早入库切片并写副本 tombstone，以及切片缺失/旧版 manifest/失败页文件的增量重建。
+测试覆盖（共 132 个 XCTest，14 个需要模型/网络环境而默认跳过）：sqlite-vec 事务写入/回滚、两段式 KNN、FTS5 中文分词、RRF 混合检索、RAG 增量/删除清理、EPUB/DOCX/HTML 解析、扫描版 EPUB 归一化 + OCR、PDF 文本层、Ovis 文本页快路径、NaturalLanguage 切片、配置迁移与旧键兼容、Agent 工具循环、ask_user 续跑、checkpoint 同步、code_run 写护栏、L3 去重、大纲围栏，以及摘要溢出保留、代码围栏/中文换行/正文数字保留、技能索引入口回退、空库维度自愈、`models/` 相对路径解析，以及 KV 复用增量与完整 prompt 的逐 token 模板对齐、预热前缀对齐、清空对话时失效 KV cache；GGUF 模型路径/mmproj 解析、进程内 llama.cpp 框架加载、ONNX 缺少权重时的明确报错，合成 ONNX decoder 图的 past/present 管线，简单 HTML 表格转 Markdown、复杂表格保留 HTML、Markdown 语法/缩进保留、纯文本 HTML/实体/噪声清理、空行与空格密度压缩、跨目录副本与 content_hash 去重、手动向量去重保留最早入库切片并写副本 tombstone，以及切片缺失/旧版 manifest/失败页文件的增量重建。
 
 ## 界面
 
@@ -46,8 +44,8 @@ swift test --disable-sandbox
   - 主模型：本地模式 / OpenAI 兼容接口二选一，默认本地模式。
   - 本地模式：模型类型（MLX-LM / MLX-VLM / ONNX / GGUF）、本地路径与目录选择、`context`/`KV 上限`/`temp`/`top_p`/`min_p`/`top_k`/`repeat`/`batch`/超时，以及「加载模型」「卸载」。`KV 上限` 对应 `kv_cache_max_tokens` / `aux_kv_cache_max_tokens`，设为 0 表示跟随 Context；`batch` 对应 `prompt_batch_size`（辅助模型为 `aux_prompt_batch_size`），控制 prefill 每次前向的 token 上限，`0` 表示使用 MLX 默认值。
   - API 模式：Base URL、API Key、模型下拉与「获取模型」，同一组参数与「应用配置」。
-  - 辅助模型：本地模式同主模型布局，默认 `models/Qwen3.5-2B-MLX-4bit`。
-  - 启动时按配置预加载主/辅模型；未指定模型时使用默认主模型 `models/qwen3.5-4b-agentic-coder-v4-4bit-mlx`。加载会真正把参数应用到新创建的模型实例。
+  - 辅助模型：标题后带「启用」复选框（对应 `aux_enabled`，默认关闭）。本地模式同主模型布局，默认 `models/Qwen3.5-2B-MLX-4bit`；未启用时「加载模型 / 重新加载」按钮禁用。
+  - 启动时只预加载主模型；辅助模型仅在 `aux_enabled=true` 时加载。未指定模型时使用默认主模型 `models/qwen3.5-4b-agentic-coder-v4-4bit-mlx`。加载会真正把参数应用到新创建的模型实例。
 - **配置窗口（知识同步）**：工作目录与知识库目录；Embedding（FastEmbed / ONNX / MLX / GGUF）+ 模型名 + 本地路径 +「应用配置」+「同步知识」；Reranker 同布局 +「向量去重」（排查并清理向量库内重复的切片，保留入库时间最早的一份）+「停止同步」。高级区保留 PDF/EPUB OCR 引擎、OCR 模型（MLX / GGUF / ONNX）、mmproj、归一化/二值化、切片与重排开关。其中「启动时自动同步」对应 `rag_auto_ingest`，默认关闭；开启后每次启动会自动增量扫描知识库，首次全量同步可能长时间占用 embedding 模型与磁盘 IO。
 - 确认弹窗默认按钮为「拒绝」；`ask_user` 的回答作为工具结果继续同一轮推理。
 - RAG 状态在后台线程查询，不在主线程建库/COUNT；状态只读取来源总数与前 256 个来源名，大知识库不会把全部路径读入内存。连续应用配置只生效最后一次，旧同步完成后只重载它自己的引擎，不会影响新 Agent。
@@ -117,12 +115,12 @@ OvisOCR2 的 MLX 权重使用 `model_type=qwen3_5`（Qwen3.5-0.8B 后训练）�
 
 1. 结构切片：按 Markdown / 中文章节 / 编号标题切分章节；
 2. 语义切片：相邻句子 embedding 相似度低谷断开，embedding 不可用时退化为词重叠；
-3. 递归回退：段落 → 换行 → 句号 → 字符窗口，严格遵守 token 上限；
-4. 块间按 token 估算添加 overlap。
+3. 递归回退：段落 → 换行 → 句号 → 空格 → token 窗口，严格遵守 token 预算；
+4. 块间按 token 数添加 overlap（计入总预算）。
 
-默认 `chunk_size=800 tokens`、`overlap=40`（5%）；旧配置里的默认值 500/50 或 800/80 会在加载时自动迁移到 800/40，自定义组合保持不变。切片参数变化会改变每个文件记录在 manifest 里的 ingest 签名，下次同步只重建签名不一致的文件；中途停止后已完成的文件保留，下次从剩余文件继续。
+默认 `chunk_size=500 token`、`overlap=50 token`（10%，含在 500 内）。同步时优先用模型自带 `tokenizer.json` 做精确计数（不含特殊 token），分词器不可用时退回标定过的保守估算器（`EmbeddingTokenEstimator`）：以 bge 实测，纯中文约 1 字 ≈ 1 token，中英混排约 1.8 字符/token，英文约 3.5 字符/token；因此 500 token 大致对应 500 字中文或 600–900 字混排。正文预算先扣除 overlap 与分隔符，最终块连同 overlap 不超过 500，加上 `[CLS]/[SEP]` 为 502，不会被 bge-small-zh 的 512 token 窗口截断；若把切片大小调到超过模型窗口，同步时会自动压到窗口上限（bge 为 510）。所有切分路径都在句子结束处断开；旧配置里的默认值 800/40 或 800/80 会在加载时自动迁移到 500/50，自定义组合保持不变。切片参数变化会改变每个文件记录在 manifest 里的 ingest 签名，下次同步只重建签名不一致的文件；中途停止后已完成的文件保留，下次从剩余文件继续。
 
-多文件同步默认使用 6 个 worker（`rag_ingest_concurrency`，1...6）：解析/OCR 与其它文件的切片、embedding、入库流水线重叠。embedding 仍由共享调度器串行进入模型，子批从 16 开始、步进 2、范围 2...64；每 2 批根据吞吐和进程内存自动上探/下探，内存超过 6GB 立即下调，持续寻找当前内存下的最优吞吐。日志只保留每本书的开始、每分钟进度和完成汇总（含各阶段耗时与最终子批大小）。
+多文件同步默认使用 6 个 worker（`rag_ingest_concurrency`，1...6）：解析/OCR 与其它文件的切片、embedding、入库流水线重叠。embedding 仍由共享调度器串行进入模型，子批从 `rag_embedding_initial_batch` 开始（默认 16，运行时夹到 [下限, 上限]），按 `rag_embedding_batch_step` 步进（默认 2，1...16），范围由 `rag_embedding_min_batch`（默认 2，2...64）到 `rag_embedding_max_batch`（默认 32，2...256）；每 `rag_embedding_probe_batches` 批（默认 2）或 `rag_embedding_probe_seconds` 秒（默认 2）根据吞吐和进程内存自动上探/下探，进程 footprint 超过 `rag_embedding_memory_limit_mb`（默认 6144MB）立即下调；吞吐变化小于 `rag_embedding_throughput_tolerance`（默认 0.03 = ±3%）视为测量噪声，不调整。实测 bge 477 token 长块在 batch 4–16 已到吞吐平台，默认 32 兼顾短块；同 batch 重复测量的噪声可达 ±20%，需要更稳时可把容差调到 0.08–0.10。上限、内存阈值、容差和探测窗口可在设置窗口「知识同步配置」中调整；下限、起始子批和步进目前只通过 config.json 配置。日志只保留每本书的开始、每分钟进度和完成汇总（含各阶段耗时与最终子批大小）。
 
 ### 5. SQLite + sqlite-vec 存储
 
@@ -161,14 +159,14 @@ manifest 条目同时记录 `chunkCount` 与 `complete`：增量跳过前会校�
 - **重建前缀复用**：历史折叠、raw 窗口滑动、rollback 导致消息前缀变化时，从预热时保留的 system+tools 快照复制 KV cache，只 prefill 动态历史；system 前缀不再重复计算。实测 5471-token 重建从约 34s 降到 5.3s（805 token），另一次 626-token 重建约 4.1s。
 - **prefill 批量**：`prompt_batch_size` / `aux_prompt_batch_size`（默认 512，最小 64）映射到 `PrefillParameters.stepSize`，用于控制长 prompt prefill 每次前向的 token 数；调大通常能提高吞吐，但会占用更多内存。配置窗口的 `batch` 字段与 JSON 键一一对应。
 - **投机解码**：当前主/辅模型均为 Qwen3.5 hybrid（GDN/Mamba 层），`MambaCache.isTrimmable == false`，mlx-swift-lm 的 `SpeculativeTokenIterator` 会在初始化时直接拒绝；两个模型的实际权重中也没有 MTP 头（config 虽写 `mtp_num_hidden_layers=1`，safetensors 中 `mtp` key 为 0），因此无法复用辅助模型起草。若后续换成全注意力、缓存可裁剪且共享 tokenizer 的主/辅模型，可再接入该路径。
-- **内存上限**：`mlx_memory_limit_mb`（默认 0 = min(物理内存 75%, 9.6GB)）是 MLX 权重+KV+buffer 的总闸门；`mlx_cache_limit_mb`（默认 512）只限制 MLX 空闲 buffer。主模型 `kv_cache_max_tokens`（默认 32768，约 1GB KV）和辅助模型 `aux_kv_cache_max_tokens`（默认 16384，约 200MB）是 KV 硬上限，实际上下文取 `min(配置上下文, 上限)`，内核预算同步收紧。完整 prompt 超过预算时明确报错，不会继续分配 KV。辅助模型每次后台摘要/事实抽取后立即失效 KV；预热前缀快照只在 ≤8192 token 时保留。RAG 检索 `topK` 封顶 20，避免 reranker 批量被模型参数放大。
-- **模型常驻策略**：主模型、辅助模型、Reranker 持续使用，权重常驻不自动卸载；Embedding 与 OCR 只在检索/解析时使用，空闲 3 分钟后释放权重，下次按需重载。provider 对象保留，不影响任何工具调用。
+- **内存上限**：`mlx_memory_limit_mb`（默认 0 = min(物理内存 65%, 9.6GB)）是 MLX 权重+KV+buffer 的总闸门；`mlx_cache_limit_mb`（默认 512，运行时上限 1024）只限制 MLX 空闲 buffer。主模型 `kv_cache_max_tokens`（默认 32768，约 1GB KV）和辅助模型 `aux_kv_cache_max_tokens`（默认 16384，约 200MB）是 KV 硬上限，实际上下文取 `min(配置上下文, 上限)`，内核预算同步收紧。完整 prompt 超过预算时明确报错，不会继续分配 KV。辅助模型每次后台摘要/事实抽取后立即失效 KV；预热前缀快照只在 ≤8192 token 时保留。RAG 检索 `topK` 封顶 20，避免 reranker 批量被模型参数放大。
+- **模型常驻策略**：主模型、Reranker 持续使用，权重常驻不自动卸载；辅助模型仅在 `aux_enabled=true` 时常驻，关闭时 Agent 的 `auxLLM` 保持 `nil`（RAG 精简跳过，后台记忆/总结回退主模型）；Embedding 与 OCR 只在检索/解析时使用，空闲 3 分钟后释放权重，下次按需重载。provider 对象保留，不影响任何工具调用。
 - 为提升缓存命中，system prompt 只保留稳定前缀（`BASE_SYSTEM_PROMPT`），工作记忆、当天事实、checkpoint、技能与知识库状态等动态内容拼在 user 消息尾部；同一轮内的动态上下文做缓存，避免工具循环中反复变化。运行日志会输出 `[mlx-kv] reuse=… cached=… delta=…` 与 `[mlx] prompt=… cached=… generated=…`，可直接确认本轮复用了多少 token。
 - nomic embedding 使用 `search_document: ` / `search_query: ` 前缀，mean pooling + L2 归一化；MLX embedding 从 `config.json` 读取隐藏维度。
 - 模型查找顺序：配置显式路径 → `<workspace>/models/<name>` → `~/base-agent/models/<name>` → HuggingFace / FastEmbed 缓存。旧配置的 `models/<name>` 相对写法会自动去掉 `models/` 前缀后在这些根目录下查找。
-- 主/辅模型支持**独立预加载与卸载**：启动时按 `llm_provider` 预加载；「加载模型」只替换对应槽位的模型实例并读入权重，另一个模型保持常驻；「卸载」只作用于当前模型。加载参数（context / temp / top_p / min_p / top_k / repeat / batch / thinking）进入模型实例缓存键，修改后会创建新实例。
+- 主/辅模型支持**独立预加载与卸载**：启动时按 `llm_provider` 预加载主模型，辅助模型仅在 `aux_enabled=true` 时预加载；「加载模型」只替换对应槽位的模型实例并读入权重，另一个模型保持常驻；「卸载」只作用于当前模型。加载参数（context / temp / top_p / min_p / top_k / repeat / batch / thinking）进入模型实例缓存键，修改后会创建新实例。
 - 生成、加载、预热、知识同步期间禁用模型加载/卸载/同步按钮与消息发送；配置切换会等待旧请求结束后丢弃其流式缓冲，迟到的 50ms flush 也不会写进新气泡。
-- **知识同步期间释放模型**：同步开始前卸载已加载的主/辅模型并清理 LLM 缓存，同步结束（成功/失败/取消）后按同步前状态自动重新加载，主模型会重新预热。日志依次输出「已卸载主模型 / 已卸载辅助模型 / 重新加载 / 主模型预热结束」；模型未加载时输出「无需卸载」，API 模式的主模型客户端保持原样。同步期间配置窗口的加载按钮会拒绝操作。`applyConfig { 同步 }` 路径不再并行预加载模型，避免同步期间模型又常驻内存。
+- **知识同步期间释放模型**：同步开始前卸载已加载的主/辅模型并清理 LLM 缓存，同步结束（成功/失败/取消）后按同步前状态自动重新加载，主模型会重新预热。开始与恢复两处都会检查 `aux_enabled`：关闭时日志写「主模型（辅助模型未启用）」，不会卸载、创建或重新加载辅助模型。日志依次输出「已卸载主模型 / 已卸载辅助模型 / 重新加载 / 主模型预热结束」；模型未加载时输出「无需卸载」，API 模式的主模型客户端保持原样。同步期间配置窗口的加载按钮会拒绝操作。`applyConfig { 同步 }` 路径不再并行预加载模型，避免同步期间模型又常驻内存。
 - 「停止同步」会立即把状态栏改为「正在停止同步…」并禁用停止按钮，同时设置 RAG 取消标志并取消同步 Task；RAG 在文件边界、embedding 批次边界以及解析完成后都会检查取消，不再等整个文件/长 OCR 完成才响应。
 
 PDF Ovis 引擎按 `rag_ocr_model_path` / `rag_ocr_model_name` 加载，不受 `vlm_provider` 影响。
@@ -183,18 +181,20 @@ PDF Ovis 引擎按 `rag_ocr_model_path` / `rag_ocr_model_name` 加载，不受 `
   "local_llm_backend": "mlx-lm",
   "local_llm_model": "models/qwen3.5-4b-agentic-coder-v4-4bit-mlx",
   "local_llm_enable_thinking": true,
+  "aux_enabled": false,
   "aux_llm_provider": "local",
   "aux_local_llm_backend": "mlx-lm",
   "aux_local_llm_model": "models/Qwen3.5-2B-MLX-4bit",
   "aux_max_context_tokens": 32768,
   "embedding_provider": "local",
   "local_embedding_backend": "mlx",
-  "local_embedding_model": "nomic-ai/nomic-embed-text-v1.5-Q",
-  "local_embedding_model_path": "models/nomic-embed-text-v1.5-mlx",
+  "local_embedding_model": "bge-small-zh-v1.5-mlx",
+  "local_embedding_model_path": "models/bge-small-zh-v1.5-mlx",
   "reranker_provider": "local",
-  "local_reranker_backend": "mlx",
-  "local_reranker_model": "BAAI/bge-reranker-v2-m3-int8",
-  "local_reranker_model_path": "models/bge-reranker-v2-m3-mlx-mxfp8",
+  "local_reranker_backend": "onnx",
+  "local_reranker_model": "jina-reranker-v2-base-multilingual-onnx",
+  "local_reranker_model_path": "models/jina-reranker-v2-base-multilingual-onnx",
+  "rag_rerank_threshold": 0.45,
   "rag_pdf_engine": "ovis",
   "rag_epub_ocr_engine": "vision",
   "rag_ocr_preprocess": true,
@@ -257,13 +257,6 @@ docs/软件设计文档.md
 - 本机已实测：GGUF LLM（Qwen3.5-9B，CPU 与 Metal GPU，工具调用正常）、GGUF VLM（Qwythos-9B + mmproj，OCR 输出正确）、GGUF Embedding（nomic-embed-text-v1.5，768 维）、GGUF system 前缀预热复用、MLX-VLM 主模型（Qwen3.5-2B）。ONNX LLM、ONNX VLM 与 GGUF Reranker 的代码路径已接入，但当前机器没有对应模型，未做推理实测；缺少模型或运行时会给出明确错误。
 - 配置窗口覆盖主要参数；MCP 服务器列表等高级配置仍可直接编辑 `~/.base-agent/config.json`。
 
-## 已移除
-
-- docling、marker：PDF 仅保留 Ovis 与 PDFKit+Vision 两条路径。
-- PyMuPDF：全部 PDF 操作改由 PDFKit / CoreGraphics / Vision 完成。
-- LanceDB：改为 SQLite + sqlite-vec + FTS5。
-- PyQt6：改为 SwiftUI。
-- Python 运行时、uv/poetry 依赖与 PyInstaller 打包脚本。
 
 ## License
 

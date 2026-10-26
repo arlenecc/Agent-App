@@ -625,17 +625,45 @@ final class ParserTests: XCTestCase {
         // docling 已移除：未识别的旧值统一回退到 Apple Vision，避免默默走 Ovis。
         XCTAssertEqual(config.ragPDFEngine, .vision)
         XCTAssertEqual(config.ragEmbeddingModel, "nomic-ai/nomic-embed-text-v1.5-Q")
-        // overlap 越界时按 chunk_size 的 5% 重置：500 / 20 = 25。
-        XCTAssertEqual(config.ragChunkOverlap, 25)
+        // overlap 越界时按默认比例（chunk_size 的 10%）重置：500 / 10 = 50。
+        XCTAssertEqual(config.ragChunkOverlap, 50)
     }
 
     func testConfigMigratesOldChunkDefaults() throws {
         let path = directory.appendingPathComponent("config-chunks.json")
-        try #"{"rag_chunk_size":500,"rag_chunk_overlap":50}"#
+        try #"{"rag_chunk_size":800,"rag_chunk_overlap":40}"#
             .write(to: path, atomically: true, encoding: .utf8)
         let config = AgentConfig.load(path.path)
-        XCTAssertEqual(config.ragChunkSize, 800)
-        XCTAssertEqual(config.ragChunkOverlap, 40)
+        // 旧默认 800/40（5%）迁移到 500/50（10%，适配 bge 512 token 上下文）。
+        XCTAssertEqual(config.ragChunkSize, 500)
+        XCTAssertEqual(config.ragChunkOverlap, 50)
+    }
+
+    /// 新默认值：bge embedding、500/50 切片、检索 5 条与辅助模型精简区间。
+    func testConfigNewRAGDefaults() throws {
+        let config = AgentConfig()
+        XCTAssertEqual(config.ragEmbeddingModel, "bge-small-zh-v1.5-mlx")
+        XCTAssertEqual(config.localEmbeddingModelPath, "models/bge-small-zh-v1.5-mlx")
+        XCTAssertEqual(config.ragChunkSize, 500)
+        XCTAssertEqual(config.ragChunkOverlap, 50)
+        XCTAssertEqual(config.ragSearchMaxTotalChars, 12_000)
+        XCTAssertEqual(config.ragAuxSummarizeMinChars, 4_000)
+        XCTAssertEqual(config.ragAuxSummarizeMaxChars, 12_000)
+        let options = ChunkingOptions(config: config)
+        XCTAssertEqual(options.chunkSizeTokens, 500, "切片预算按 token 计，含 overlap")
+        XCTAssertEqual(options.overlapTokens, 50, "overlap 占 10%，计入 500 token 总预算")
+
+        // 阈值可持久化并回读（用户后续可直接改配置文件调参）。
+        let path = directory.appendingPathComponent("config-rag-thresholds.json")
+        let json = #"{"rag_aux_summarize_min_chars":3000,"rag_aux_summarize_max_chars":9000,"#
+            + #""rag_search_max_total_chars":10000,"rag_rerank_threshold":0.55}"#
+        try json.write(to: path, atomically: true, encoding: .utf8)
+        let loaded = AgentConfig.load(path.path)
+        XCTAssertEqual(loaded.ragAuxSummarizeMinChars, 3_000)
+        XCTAssertEqual(loaded.ragAuxSummarizeMaxChars, 9_000)
+        XCTAssertEqual(loaded.ragSearchMaxTotalChars, 10_000)
+        XCTAssertEqual(loaded.ragRerankThreshold, 0.55)
+        XCTAssertEqual(loaded.export()["rag_aux_summarize_min_chars"] as? Int, 3_000)
     }
 
     /// 跨轮 KV/前缀复用开关：默认开启、可关闭，且写入导出字典。
@@ -660,6 +688,120 @@ final class ParserTests: XCTestCase {
         XCTAssertFalse(config.ragSemanticChunking)
         XCTAssertFalse(config.export()["rag_semantic_chunking"] as? Bool ?? true)
         XCTAssertFalse(ChunkingOptions(config: config).enableSemantic)
+    }
+
+    /// MLX buffer cache 上限：默认 512MB，旧配置里的超大值加载时压回 1GB。
+    func testConfigClampsMLXCacheLimit() throws {
+        XCTAssertEqual(AgentConfig().mlxCacheLimitMB, 512)
+
+        let path = directory.appendingPathComponent("config-mlx-cache.json")
+        try #"{"mlx_cache_limit_mb":4096,"mlx_memory_limit_mb":0}"#
+            .write(to: path, atomically: true, encoding: .utf8)
+        var config = AgentConfig.load(path.path)
+        XCTAssertEqual(config.mlxCacheLimitMB, 1_024)
+        XCTAssertEqual(config.export()["mlx_cache_limit_mb"] as? Int, 1_024)
+
+        try #"{"mlx_cache_limit_mb":128}"#
+            .write(to: path, atomically: true, encoding: .utf8)
+        config = AgentConfig.load(path.path)
+        XCTAssertEqual(config.mlxCacheLimitMB, 256)
+    }
+
+    /// Embedding 子批自适应参数：默认 2 / 32 / 16 / 2 / 6144 / 3% / 2 批 / 2s，
+    /// 并夹取越界值与下限高于上限的冲突。
+    func testConfigEmbeddingSchedulerDefaultsAndClamps() throws {
+        let defaults = AgentConfig()
+        XCTAssertEqual(defaults.ragEmbeddingMinBatch, 2)
+        XCTAssertEqual(defaults.ragEmbeddingMaxBatch, 32)
+        XCTAssertEqual(defaults.ragEmbeddingInitialBatch, 16)
+        XCTAssertEqual(defaults.ragEmbeddingBatchStep, 2)
+        XCTAssertEqual(defaults.ragEmbeddingMemoryLimitMB, 6_144)
+        XCTAssertEqual(defaults.ragEmbeddingThroughputTolerance, 0.03, accuracy: 1e-9)
+        XCTAssertEqual(defaults.ragEmbeddingProbeBatches, 2)
+        XCTAssertEqual(defaults.ragEmbeddingProbeSeconds, 2.0, accuracy: 1e-9)
+
+        let path = directory.appendingPathComponent("config-embedding-scheduler.json")
+        let high = """
+        {"rag_embedding_min_batch":999,
+         "rag_embedding_max_batch":999,
+         "rag_embedding_initial_batch":999,
+         "rag_embedding_batch_step":999,
+         "rag_embedding_memory_limit_mb":999999,
+         "rag_embedding_throughput_tolerance":9,
+         "rag_embedding_probe_batches":99,
+         "rag_embedding_probe_seconds":999}
+        """
+        try high.write(to: path, atomically: true, encoding: .utf8)
+        var config = AgentConfig.load(path.path)
+        XCTAssertEqual(config.ragEmbeddingMinBatch, 64)
+        XCTAssertEqual(config.ragEmbeddingMaxBatch, 256)
+        XCTAssertEqual(config.ragEmbeddingInitialBatch, 256)
+        XCTAssertEqual(config.ragEmbeddingBatchStep, 16)
+        XCTAssertEqual(config.ragEmbeddingMemoryLimitMB, 32_768)
+        XCTAssertEqual(config.ragEmbeddingThroughputTolerance, 0.5, accuracy: 1e-9)
+        XCTAssertEqual(config.ragEmbeddingProbeBatches, 16)
+        XCTAssertEqual(config.ragEmbeddingProbeSeconds, 30, accuracy: 1e-9)
+        let exported = config.export()
+        XCTAssertEqual(exported["rag_embedding_min_batch"] as? Int, 64)
+        XCTAssertEqual(exported["rag_embedding_max_batch"] as? Int, 256)
+        XCTAssertEqual(exported["rag_embedding_initial_batch"] as? Int, 256)
+        XCTAssertEqual(exported["rag_embedding_batch_step"] as? Int, 16)
+        XCTAssertEqual(exported["rag_embedding_memory_limit_mb"] as? Int, 32_768)
+        XCTAssertEqual(exported["rag_embedding_throughput_tolerance"] as? Double, 0.5)
+        XCTAssertEqual(exported["rag_embedding_probe_batches"] as? Int, 16)
+        XCTAssertEqual(exported["rag_embedding_probe_seconds"] as? Double, 30)
+
+        let low = """
+        {"rag_embedding_min_batch":0,
+         "rag_embedding_max_batch":1,
+         "rag_embedding_initial_batch":0,
+         "rag_embedding_batch_step":0,
+         "rag_embedding_memory_limit_mb":128,
+         "rag_embedding_throughput_tolerance":0.0001,
+         "rag_embedding_probe_batches":0,
+         "rag_embedding_probe_seconds":0}
+        """
+        try low.write(to: path, atomically: true, encoding: .utf8)
+        config = AgentConfig.load(path.path)
+        XCTAssertEqual(config.ragEmbeddingMinBatch, 2)
+        XCTAssertEqual(config.ragEmbeddingMaxBatch, 2)
+        XCTAssertEqual(config.ragEmbeddingInitialBatch, 2)
+        XCTAssertEqual(config.ragEmbeddingBatchStep, 1)
+        XCTAssertEqual(config.ragEmbeddingMemoryLimitMB, 1_024)
+        XCTAssertEqual(config.ragEmbeddingThroughputTolerance, 0.01, accuracy: 1e-9)
+        XCTAssertEqual(config.ragEmbeddingProbeBatches, 1)
+        XCTAssertEqual(config.ragEmbeddingProbeSeconds, 0.5, accuracy: 1e-9)
+
+        // 下限高于上限、起始值超出区间时，按 max 收口。
+        let conflict = """
+        {"rag_embedding_min_batch":20,
+         "rag_embedding_max_batch":8,
+         "rag_embedding_initial_batch":99}
+        """
+        try conflict.write(to: path, atomically: true, encoding: .utf8)
+        config = AgentConfig.load(path.path)
+        XCTAssertEqual(config.ragEmbeddingMaxBatch, 8)
+        XCTAssertEqual(config.ragEmbeddingMinBatch, 8)
+        XCTAssertEqual(config.ragEmbeddingInitialBatch, 8)
+    }
+
+    /// 辅助模型默认关闭：缺省即为 false，且 `aux_enabled` 可显式打开/关闭。
+    func testConfigAuxEnabledDefaultsOff() throws {
+        XCTAssertFalse(AgentConfig().auxEnabled)
+        XCTAssertEqual(AgentConfig().export()["aux_enabled"] as? Bool, false)
+
+        let path = directory.appendingPathComponent("config-aux-enabled.json")
+        try #"{"aux_enabled":true}"#
+            .write(to: path, atomically: true, encoding: .utf8)
+        var config = AgentConfig.load(path.path)
+        XCTAssertTrue(config.auxEnabled)
+        XCTAssertEqual(config.export()["aux_enabled"] as? Bool, true)
+
+        try #"{"aux_enabled":false}"#
+            .write(to: path, atomically: true, encoding: .utf8)
+        config = AgentConfig.load(path.path)
+        XCTAssertFalse(config.auxEnabled)
+        XCTAssertEqual(config.export()["aux_enabled"] as? Bool, false)
     }
 
     /// MLX embedding 默认后端：别名能把 Q 名解析到本地目录。
@@ -692,9 +834,10 @@ final class ParserTests: XCTestCase {
         XCTAssertEqual(config.auxLocalLLMBackend, "mlx-lm")
         XCTAssertEqual(config.auxLocalLLMModel, "models/Qwen3.5-2B-MLX-4bit")
         XCTAssertEqual(config.localEmbeddingBackend, "mlx")
-        // 旧 fp16 MLX 路径应迁移到 8bit 量化版目录名。
+        // 旧 fp16 MLX 路径先迁 8bit 量化名，再被新默认迁移链带到
+        // bge-small-zh（中文检索全面占优）。
         XCTAssertEqual(config.localEmbeddingModelPath,
-                       "nomic-ai/nomic-embed-text-v1.5-mlx-8bit")
+                       "models/bge-small-zh-v1.5-mlx")
         XCTAssertEqual(config.localRerankerBackend, "mlx")
         XCTAssertEqual(config.localRerankerModelPath,
                        "models/bge-reranker-v2-m3-mlx-mxfp8")

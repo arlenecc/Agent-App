@@ -37,6 +37,7 @@ struct SettingsView: View {
 
     // MARK: 辅助模型
 
+    @State private var auxEnabled = false
     @State private var auxBackend = "mlx-lm"
     @State private var auxPath = ""
     @State private var auxContext = 32768
@@ -56,7 +57,7 @@ struct SettingsView: View {
     @State private var knowledgeBase = ""
     @State private var embeddingBackend = "onnx"
     @State private var embeddingPath = ""
-    @State private var rerankerBackend = "mlx"
+    @State private var rerankerBackend = "onnx"
     @State private var rerankerPath = ""
 
     // MARK: 高级 RAG
@@ -68,11 +69,16 @@ struct SettingsView: View {
     @State private var vlmBackend = "mlx"
     @State private var ocrPreprocess = true
     @State private var ocrBinarize = true
-    @State private var chunkSize = 800
-    @State private var chunkOverlap = 40
+    @State private var chunkSize = 500
+    @State private var chunkOverlap = 50
     @State private var rerankEnabled = true
     @State private var semanticChunking = true
     @State private var autoIngest = false
+    @State private var embeddingMaxBatch = 32
+    @State private var embeddingMemoryLimitMB = 6_144
+    @State private var embeddingThroughputTolerance = 0.03
+    @State private var embeddingProbeBatches = 2
+    @State private var embeddingProbeSeconds = 2.0
     @State private var showAdvanced = false
 
     @State private var statusMessage = ""
@@ -248,7 +254,13 @@ struct SettingsView: View {
 
     private var auxModelBlock: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("辅助模型").font(.subheadline).bold()
+            HStack(spacing: 10) {
+                Text("辅助模型").font(.subheadline).bold()
+                Toggle("启用", isOn: $auxEnabled)
+                    .toggleStyle(.checkbox)
+                    .help("默认关闭：启动和知识同步前后都不加载辅助模型；关闭时 RAG 精简跳过，后台记忆/总结回退主模型。修改后需点击「应用配置」或「同步知识」保存")
+                Spacer()
+            }
             localModelRows(
                 backend: $auxBackend,
                 path: $auxPath,
@@ -269,11 +281,11 @@ struct SettingsView: View {
                         Button("重新加载") { loadAuxModel() }
                             .buttonStyle(.borderedProminent)
                             .tint(.green)
-                            .disabled(model.isModelLoading || model.isRunning
+                            .disabled(!auxEnabled || model.isModelLoading || model.isRunning
                                 || model.isWarmingUp || model.isSyncing)
                     } else {
                         Button("加载模型") { loadAuxModel() }
-                            .disabled(model.isModelLoading || model.isRunning
+                            .disabled(!auxEnabled || model.isModelLoading || model.isRunning
                                 || model.isWarmingUp || model.isSyncing)
                     }
                     Button("卸载") { model.unloadAuxModel() }
@@ -477,10 +489,34 @@ struct SettingsView: View {
                             Toggle("启动时自动同步", isOn: $autoIngest)
                             Toggle("语义切片", isOn: $semanticChunking)
                                 .help("开启后大段落在句间相似度低谷处断开，切片阶段需嵌入全部候选句，明显更慢；关闭则按结构+token 边界递归切片")
-                            Stepper("切片大小：\(chunkSize)", value: $chunkSize,
+                            Stepper("切片大小：\(chunkSize) token", value: $chunkSize,
                                     in: 100...4000, step: 50)
-                            Stepper("overlap：\(chunkOverlap)", value: $chunkOverlap,
+                                .help("含 overlap 的总预算。bge-small-zh 上下文为 512 token，超过 510 时会自动压到上限；纯中文约 1 字 ≈ 1 token，中英混排约 1.8 字符/token")
+                            Stepper("overlap：\(chunkOverlap) token", value: $chunkOverlap,
                                     in: 0...1000, step: 10)
+                                .help("占切片大小的 10%，计入总预算：正文按 chunk_size − overlap 切片")
+                        }
+                        HStack(spacing: 14) {
+                            Stepper("子批上限：\(embeddingMaxBatch)",
+                                    value: $embeddingMaxBatch, in: 2...256, step: 2)
+                                .help("embedding 自适应子批的最大值。实测 477 token 长块在 batch 4-16 已到吞吐平台，默认 32 兼顾短块；64 以上只增加内存与单批延迟")
+                            Stepper("内存阈值：\(embeddingMemoryLimitMB) MB",
+                                    value: $embeddingMemoryLimitMB,
+                                    in: 1_024...32_768, step: 512)
+                                .help("进程 footprint 超过该值立即下调子批；bge 单独运行峰值约 1.6GB，默认 6144MB")
+                            Stepper("吞吐容差：\(Int((embeddingThroughputTolerance * 100).rounded()))%",
+                                    value: $embeddingThroughputTolerance,
+                                    in: 0.01...0.50, step: 0.01)
+                                .help("吞吐变化小于该比例视为测量噪声，不调整子批；默认 3%，实测噪声较大时可调到 8-10%")
+                        }
+                        HStack(spacing: 14) {
+                            Stepper("探测批次数：\(embeddingProbeBatches)",
+                                    value: $embeddingProbeBatches, in: 1...16)
+                                .help("每档至少观察多少个 embedding 批后评估一次，默认 2")
+                            Stepper("探测窗口：\(String(format: "%.1f", embeddingProbeSeconds)) s",
+                                    value: $embeddingProbeSeconds, in: 0.5...30, step: 0.5)
+                                .help("每档至少观察多少秒后评估一次，默认 2s；与探测批次数满足其一即评估")
+                            Spacer(minLength: 8)
                         }
                     }
                     .padding(.top, 8)
@@ -582,6 +618,7 @@ struct SettingsView: View {
         apiKey = config.apiKey
         apiModel = config.model
 
+        auxEnabled = config.auxEnabled
         auxBackend = normalizedLLMType(config.auxLocalLLMBackend)
         auxPath = config.auxLocalLLMModel
         auxTokenizer = config.auxTokenizerPath
@@ -620,6 +657,11 @@ struct SettingsView: View {
         rerankEnabled = config.ragRerankEnabled
         semanticChunking = config.ragSemanticChunking
         autoIngest = config.ragAutoIngest
+        embeddingMaxBatch = config.ragEmbeddingMaxBatch
+        embeddingMemoryLimitMB = config.ragEmbeddingMemoryLimitMB
+        embeddingThroughputTolerance = config.ragEmbeddingThroughputTolerance
+        embeddingProbeBatches = config.ragEmbeddingProbeBatches
+        embeddingProbeSeconds = config.ragEmbeddingProbeSeconds
     }
 
     private func loadMainModel() {
@@ -783,6 +825,7 @@ struct SettingsView: View {
             config.model = apiModel.trimmingCharacters(in: .whitespacesAndNewlines)
         }
 
+        config.auxEnabled = auxEnabled
         config.auxLLMProvider = "local"
         config.auxLocalLLMBackend = AgentConfig.normalizeLLMBackend(auxBackend)
         config.auxLocalLLMModel = auxPath.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -841,6 +884,12 @@ struct SettingsView: View {
         config.ragRerankEnabled = rerankEnabled
         config.ragSemanticChunking = semanticChunking
         config.ragAutoIngest = autoIngest
+        config.ragEmbeddingMaxBatch = min(max(2, embeddingMaxBatch), 256)
+        config.ragEmbeddingMemoryLimitMB = min(max(1_024, embeddingMemoryLimitMB), 32_768)
+        config.ragEmbeddingThroughputTolerance = min(max(0.01, embeddingThroughputTolerance),
+                                                      0.5)
+        config.ragEmbeddingProbeBatches = min(max(1, embeddingProbeBatches), 16)
+        config.ragEmbeddingProbeSeconds = min(max(0.5, embeddingProbeSeconds), 30)
 
         if mainMode == "local", !config.localLLMModel.isEmpty,
            config.localLLMModel != model.config.localLLMModel {

@@ -4,7 +4,11 @@ import Foundation
 
 /// 两个 reranker 方案的对比基准：
 /// - A：`models/bge-reranker-v2-m3-mlx-mxfp8`（MLX 加载，24 层 XLM-R large，GPU）
-/// - B：`models/bge-reranker-base-ONNX/model_quantized.onnx`（ONNX Runtime，12 层 XLM-R base，强制 CPU）
+/// - B：`models/jina-reranker-v2-base-multilingual-onnx/model_quantized.onnx`
+///   （ONNX Runtime，12 层 XLM-R base，1024 token 上下文，强制 CPU）
+///
+/// 历史基准（同语料）：bge-reranker-base-ONNX 已于 2026-10-26 完成对比，
+/// 结果见 /tmp/rerank_bench_report.md 历史版本与项目记忆。
 ///
 /// 需要真实模型与语料，默认跳过；设置 `RERANK_BENCH=1` 启用。
 /// 可选环境变量：
@@ -17,7 +21,7 @@ import Foundation
 final class RerankerBenchmarkTests: XCTestCase {
 
     private static let mlxModelName = "bge-reranker-v2-m3-mlx-mxfp8"
-    private static let onnxModelName = "bge-reranker-base-ONNX"
+    private static let onnxModelName = "jina-reranker-v2-base-multilingual-onnx"
 
     /// 与 EmbeddingBenchmarkTests 相同的 10 条中文 query 与目标段落（真实书籍原文）。
     private static var targets: [EmbeddingBenchmarkTests.Target] { EmbeddingBenchmarkTests.targets }
@@ -62,15 +66,15 @@ final class RerankerBenchmarkTests: XCTestCase {
         EmbeddingBenchmarkTests.configureMetallib()
 
         var report = "# Reranker 对比基准：bge-reranker-v2-m3-mlx-mxfp8 (MLX/GPU) " +
-            "vs bge-reranker-base-ONNX model_quantized (CPU only)\n\n"
+            "vs jina-reranker-v2-base-multilingual-onnx model_quantized (CPU only)\n\n"
         report += "- 方案A：bge-reranker-v2-m3（XLM-R large 24 层，mxfp8，MLX 加载走 GPU）\n"
-        report += "- 方案B：bge-reranker-base（XLM-R base 12 层，ONNX int8，" +
-            "OrtSession 无 CoreML EP 纯 CPU，intraOpThreads=4）\n\n"
+        report += "- 方案B：jina-reranker-v2-base-multilingual（XLM-R base 12 层，ONNX int8，" +
+            "1024 token 上下文，OrtSession 无 CoreML EP 纯 CPU，intraOpThreads=4）\n\n"
 
         // ---------- tokenizer 统计（上下文/截断影响） ----------
         report += "## Tokenizer 统计（语料 \(corpus.count) 块 + 10 目标块）\n\n"
         report += await Self.tokenizerStats(directory: mlxDir, corpus: corpus, label: "v2-m3-mlx（8192 上下文）")
-        report += await Self.tokenizerStats(directory: onnxDir, corpus: corpus, label: "base-onnx（512 上下文）")
+        report += await Self.tokenizerStats(directory: onnxDir, corpus: corpus, label: "jina-onnx（1024 上下文）")
 
         // ---------- Provider 构建 ----------
         let mlx = MLXReranker(directory: mlxDir, modelName: Self.mlxModelName)
@@ -270,5 +274,44 @@ final class RerankerBenchmarkTests: XCTestCase {
 
     private static func formatScores(_ values: [Double]) -> String {
         values.map { String(format: "%.2f", $0) }.joined(separator: ", ")
+    }
+
+    /// 配置化接入验证：`localRerankerBackend=onnx` + jina 路径，
+    /// 走 LocalModelFactory.makeReranker 完整链路（与设置界面保存后的生产行为一致）。
+    func testJinaRerankerViaFactoryConfig() async throws {
+        guard ProcessInfo.processInfo.environment["RERANK_BENCH"] == "1" else {
+            throw XCTSkip("未设置 RERANK_BENCH=1，跳过真实模型基准测试")
+        }
+        let modelsRoot = EmbeddingBenchmarkTests.resolveModelsRoot()
+        let jinaDir = modelsRoot.appendingPathComponent(Self.onnxModelName, isDirectory: true)
+        guard FileManager.default.fileExists(
+            atPath: jinaDir.appendingPathComponent("model_quantized.onnx").path) else {
+            throw XCTSkip("模型缺失：\(jinaDir.path)")
+        }
+
+        var config = AgentConfig()
+        config.rerankerProvider = "local"
+        config.localRerankerBackend = "onnx"
+        config.localRerankerModelPath = jinaDir.path
+        config.localRerankerModel = Self.onnxModelName
+
+        let provider = try XCTUnwrap(LocalModelFactory.shared.makeReranker(config: config))
+
+        // 无关基线用算式短句：jina 对口语化短句存在系统性高分偏好
+        //（单文档实测「今天天气很好」0.802 > 相关段落 0.721），不适合做基线。
+        let docs = [Self.targets[0].passage, "今天天气很好，适合出门散步。", "1 + 1 = 2"]
+        let scores: [Double]
+        do {
+            scores = try await provider.rerank(query: Self.targets[0].query, documents: docs)
+        } catch {
+            XCTFail("makeReranker 链路 rerank 失败：\(error.localizedDescription)")
+            return
+        }
+        XCTAssertEqual(scores.count, 3)
+        for score in scores {
+            XCTAssertTrue(score >= 0 && score <= 1, "分数应归一化到 [0,1]，实际 \(score)")
+        }
+        XCTAssertGreaterThan(scores[0], scores[2], "相关文档分数应高于算式短句基线")
+        print("[bench] jina via factory: \(scores.map { String(format: "%.3f", $0) })")
     }
 }

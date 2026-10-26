@@ -29,6 +29,7 @@ struct SemanticChunker {
         }
 
         let threshold = adaptiveThreshold(similarities, fallback: options.semanticThreshold)
+        let budget = options.chunkSizeTokens
         var chunks: [String] = []
         var current: [String] = []
         var currentTokens = 0
@@ -42,23 +43,27 @@ struct SemanticChunker {
         }
 
         for index in sentences.indices {
-            current.append(sentences[index])
-            currentTokens += RecursiveChunker.tokenCount(sentences[index])
+            let sentence = sentences[index]
+            let sentenceTokens = options.tokenCounter(sentence)
+            // 先判断再追加：保证整片不超过 token 预算；
+            // 单句超预算时先独占一片，交给 TextChunker 的递归回退再拆。
+            if !current.isEmpty, currentTokens + sentenceTokens + 1 > budget {
+                flush()
+            }
+            current.append(sentence)
+            currentTokens += sentenceTokens + (current.count > 1 ? 1 : 0)
 
             let hasNext = index + 1 < sentences.count
-            let overBudget = currentTokens >= options.chunkSizeTokens ||
-                current.joined(separator: " ").count >= options.maxChunkChars
             let boundary = hasNext && similarities[index] <= threshold
-            if overBudget || boundary {
+            if boundary {
                 flush()
             }
         }
         flush()
 
         guard !chunks.isEmpty else { return nil }
-        // 单块仍超限 → 交给递归切片，避免返回一个巨型 chunk。
-        if chunks.count == 1,
-           RecursiveChunker.tokenCount(chunks[0]) > options.chunkSizeTokens {
+        // 单块仍超限（例如整段只有一句超长文本）→ 交给递归切片。
+        if chunks.count == 1, options.tokenCounter(chunks[0]) > budget {
             return RecursiveChunker.split(text, options: options)
         }
         return chunks

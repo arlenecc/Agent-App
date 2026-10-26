@@ -46,17 +46,18 @@ public final class LocalModelFactory: @unchecked Sendable {
     }
 
     /// 设置 MLX buffer cache 上限（MB）。只限制空闲 buffer，不限制权重与 KV。
+    /// 上限 1GB：再大只是多留可复用 buffer，收益有限却会抬高常驻 footprint。
     public func setCacheLimitMB(_ megabytes: Int) {
-        let clamped = max(256, min(4_096, megabytes))
+        let clamped = max(256, min(1_024, megabytes))
         MLX.Memory.cacheLimit = clamped * 1_024 * 1_024
     }
 
     /// 设置 MLX 全局内存硬上限（MB）。这是权重 + KV + buffer 的总闸门，
-    /// 用于兜底防止泄漏把系统内存吃光；0 表示按 min(物理内存 75%, 9.6GB)
+    /// 用于兜底防止泄漏把系统内存吃光；0 表示按 min(物理内存 65%, 9.6GB)
     /// 自动取值，避免大内存机器把上限放得过高。
     public func setMemoryLimitMB(_ megabytes: Int) {
         let physicalMB = Int(ProcessInfo.processInfo.physicalMemory / 1_024 / 1_024)
-        let automatic = max(1_024, min(physicalMB * 3 / 4, 9_830))
+        let automatic = max(1_024, min(physicalMB * 65 / 100, 9_830))
         let requested = megabytes > 0 ? megabytes : automatic
         let clamped = max(1_024, min(requested, max(1_024, physicalMB - 2_048)))
         MLX.Memory.memoryLimit = clamped * 1_024 * 1_024
@@ -146,49 +147,56 @@ public final class LocalModelFactory: @unchecked Sendable {
         let name = config.localEmbeddingModel.isEmpty
             ? config.ragEmbeddingModel
             : config.localEmbeddingModel
-        // MLX 后端默认用独立的 MLX 权重目录名（8bit 量化，167MB；实测与 fp16
-        // 余弦相似度 >0.999、速度持平，省 39% 内存），与 ONNX 量化名区分；
-        // 显式配置了 local_embedding_model / _path 时以用户配置为准。
+        // MLX 后端默认用独立的 MLX 权重目录名（bge-small-zh-v1.5，中文检索
+        // 全面优于 nomic），与 ONNX 量化名区分；显式配置了
+        // local_embedding_model / _path 时以用户配置为准。
         let effectiveName = (backend == "mlx"
                              && config.localEmbeddingModel.isEmpty
                              && config.localEmbeddingModelPath.isEmpty)
-            ? "nomic-ai/nomic-embed-text-v1.5-mlx-8bit"
+            ? "bge-small-zh-v1.5-mlx"
             : name
         let value = config.localEmbeddingModelPath.isEmpty
             ? effectiveName
             : config.localEmbeddingModelPath
         let key = "embedding:\(backend):\(value)"
 
-        return embeddings.value(for: key) {
-            do {
-                if backend == "gguf" {
-                    let file = try GGUFFileResolver.resolve(
-                        kind: .embedding, value: value, config: config)
-                    return LlamaCppEmbeddingProvider(modelPath: file.path, modelName: value)
+        // 先解析目录：失败不进缓存——目录可能尚未就绪或依赖运行中才设置的
+        // 环境变量（如测试的 BASE_AGENT_MODELS_DIR），缓存失败实例会让
+        // 后续有效配置永远拿到 Failing。
+        let directory: URL
+        do {
+            if backend == "gguf" {
+                let file = try GGUFFileResolver.resolve(
+                    kind: .embedding, value: value, config: config)
+                return embeddings.value(for: key) {
+                    LlamaCppEmbeddingProvider(modelPath: file.path, modelName: value)
                 }
-                let directory = try LocalModelRegistry.resolveDirectory(
-                    kind: .embedding,
-                    value: value,
-                    config: config,
-                    // 非 MLX 后端不得命中 MLX 权重别名（目录里没有 ONNX 权重）。
-                    aliasFilter: backend == "mlx"
-                        ? nil : { !$0.hasSuffix("-mlx") }
-                )
-                if backend == "mlx" {
-                    // 实测多实例只是共享同一块 GPU，吞吐无收益且内存翻倍，
-                    // 因此固定单实例；并发由 AdaptiveEmbeddingScheduler 串行。
-                    return MLXEmbeddingProvider(directory: directory, modelName: value)
-                }
-                return ONNXEmbeddingProvider(
-                    directory: directory,
-                    modelName: value)
-            } catch {
-                AgentLog.warning("本地 Embedding 不可用：\(error.localizedDescription)")
-                return FailingEmbeddingProvider(
-                    identifier: "local:\(backend):\(value)",
-                    error: error
-                )
             }
+            directory = try LocalModelRegistry.resolveDirectory(
+                kind: .embedding,
+                value: value,
+                config: config,
+                // 非 MLX 后端不得命中 MLX 权重别名（目录里没有 ONNX 权重）。
+                aliasFilter: backend == "mlx"
+                    ? nil : { !$0.hasSuffix("-mlx") }
+            )
+        } catch {
+            AgentLog.warning("本地 Embedding 不可用：\(error.localizedDescription)")
+            return FailingEmbeddingProvider(
+                identifier: "local:\(backend):\(value)",
+                error: error
+            )
+        }
+
+        if backend == "mlx" {
+            // 实测多实例只是共享同一块 GPU，吞吐无收益且内存翻倍，
+            // 因此固定单实例；并发由 AdaptiveEmbeddingScheduler 串行。
+            return embeddings.value(for: key) {
+                MLXEmbeddingProvider(directory: directory, modelName: value)
+            }
+        }
+        return embeddings.value(for: key) {
+            ONNXEmbeddingProvider(directory: directory, modelName: value)
         }
     }
 

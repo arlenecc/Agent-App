@@ -22,16 +22,17 @@ final class ChunkingTests: XCTestCase {
         XCTAssertEqual(nodes[2].level, 1)
 
         let options = ChunkingOptions(chunkSizeTokens: 12, overlapTokens: 3,
-                                      minChunkChars: 10, maxChunkChars: 500,
-                                      enableSemantic: false)
+                                      minChunkTokens: 10,
+                                      enableSemantic: false,
+                                      tokenCounter: { $0.count })
         let document = ParsedDocument(text: text, source: "doc.md")
         let chunks = await TextChunker(options: options).chunk(document: document, variant: .hybrid)
         XCTAssertGreaterThan(chunks.count, 1)
         XCTAssertEqual(chunks.map(\.chunkIndex), Array(0..<chunks.count))
         XCTAssertTrue(chunks.contains { $0.heading.contains("第一章") })
         XCTAssertTrue(chunks.allSatisfy { !$0.text.isEmpty })
-        XCTAssertTrue(chunks.allSatisfy { $0.text.count <= options.maxChunkChars + 80 },
-                      "chunk 不应突破字符上限")
+        XCTAssertTrue(chunks.allSatisfy { options.tokenCounter($0.text) <= options.chunkSizeTokens },
+                      "chunk 含 overlap 不应突破 token 上限")
     }
 
     /// 分页标记与页码不进入切片，溯源只保留文件名（source）。
@@ -52,8 +53,9 @@ final class ChunkingTests: XCTestCase {
         这是第八页的正文内容，与前文不连续，页码应压缩为独立区间。
         """
         let options = ChunkingOptions(chunkSizeTokens: 200, overlapTokens: 0,
-                                      minChunkChars: 10, maxChunkChars: 500,
-                                      enableSemantic: false)
+                                      minChunkTokens: 10,
+                                      enableSemantic: false,
+                                      tokenCounter: { $0.count })
         let document = ParsedDocument(text: text, source: "book.pdf")
         let chunks = await TextChunker(options: options).chunk(document: document)
         XCTAssertFalse(chunks.isEmpty)
@@ -90,14 +92,15 @@ final class ChunkingTests: XCTestCase {
         XCTAssertEqual(nodes.map(\.title), ["第一章 绪论"])
     }
 
-    /// 长章节必须走语义切片；语义片即使短于 minChunkChars 也不能被合并。
+    /// 长章节必须走语义切片；语义片即使短于 minChunkTokens 也不能被合并。
     func testSemanticBoundariesSurviveMinChunkChars() async {
         let text = """
         苹果是一种常见的水果，富含维生素和膳食纤维。香蕉也是一种常见的水果，口感香甜且价格实惠。今天天气晴朗，阳光明媚，适合外出散步。天空没有云朵，微风轻拂，让人心情愉快。
         """
         let options = ChunkingOptions(chunkSizeTokens: 80, overlapTokens: 0,
-                                      minChunkChars: 80, maxChunkChars: 500,
-                                      semanticThreshold: 0.55, enableSemantic: true)
+                                      minChunkTokens: 80,
+                                      semanticThreshold: 0.55, enableSemantic: true,
+                                      tokenCounter: { $0.count })
         let document = ParsedDocument(text: text, source: "fruit.md")
         // 前两句水果、后两句天气：主题之间相似度为 0，主题内部为 1。
         let similarity: SemanticChunker.AdjacentSimilarity = { sentences in
@@ -122,8 +125,9 @@ final class ChunkingTests: XCTestCase {
         苹果是一种常见的水果。香蕉也是一种常见的水果。今天天气晴朗。天空没有云朵。
         """
         let options = ChunkingOptions(chunkSizeTokens: 200, overlapTokens: 40,
-                                      minChunkChars: 1, maxChunkChars: 500,
-                                      enableSemantic: true)
+                                      minChunkTokens: 1,
+                                      enableSemantic: true,
+                                      tokenCounter: { $0.count })
         let document = ParsedDocument(text: text, source: "short.md")
         let chunks = await TextChunker(options: options)
             .chunk(document: document, variant: .hybrid)
@@ -162,8 +166,9 @@ final class ChunkingTests: XCTestCase {
         苹果是一种水果。香蕉也是一种水果。今天天气晴朗。天空没有云朵。
         """
         let options = ChunkingOptions(chunkSizeTokens: 8, overlapTokens: 2,
-                                      minChunkChars: 1, maxChunkChars: 400,
-                                      semanticThreshold: 0.9, enableSemantic: true)
+                                      minChunkTokens: 1,
+                                      semanticThreshold: 0.9, enableSemantic: true,
+                                      tokenCounter: { $0.count })
         let document = ParsedDocument(text: text, source: "fruit.md")
         let similarity: SemanticChunker.AdjacentSimilarity = { sentences in
             Array(repeating: 0.0, count: max(0, sentences.count - 1))
@@ -210,5 +215,42 @@ final class ChunkingTests: XCTestCase {
         }, "长正文句子不应被误判为标题")
         let section = nodes.first { $0.title.contains("Sampling") }
         XCTAssertEqual(section?.level, 2)
+    }
+
+    // MARK: token 预算
+
+    /// 估算器必须偏保守（估算 ≥ 实际 token），保证硬切回退也不会把块推出上下文窗口。
+    /// 实际 token 数由模型自带 tokenizer.json 实测。
+    func testEmbeddingTokenEstimatorIsConservativeUpperBound() {
+        let chinese = "云计算技术近年来在数据存储与弹性伸缩方面发展迅速，企业纷纷将业务迁移上云。"
+        XCTAssertGreaterThanOrEqual(EmbeddingTokenEstimator.count(chinese), 37, "实测 37 token")
+        XCTAssertLessThanOrEqual(EmbeddingTokenEstimator.count(chinese), 42,
+                                 "纯中文不应被过度放大（1 字 ≈ 1 token）")
+
+        let english = "Retrieval-augmented generation combines a vector store with a language model."
+        XCTAssertGreaterThanOrEqual(EmbeddingTokenEstimator.count(english), 20, "实测 20 token")
+
+        let hash = "a3f5c9e1b7d26840f1e2d3c4b5a697887766554433221100ffeeddccbbaa9988"
+        XCTAssertGreaterThanOrEqual(EmbeddingTokenEstimator.count(hash), 40,
+                                    "实测 40 token（哈希/编号是最坏情况）")
+
+        XCTAssertEqual(EmbeddingTokenEstimator.count(""), 0)
+    }
+
+    /// overlap 计入总预算：任何切片（含重叠）都不超过 chunk_size token，
+    /// 且中文正文仍在句号处断开。
+    func testChunkTokenBudgetIncludesOverlap() async {
+        let text = String(repeating: "苹果是一种常见的水果，富含维生素和膳食纤维。", count: 40)
+        let options = ChunkingOptions(chunkSizeTokens: 100, overlapTokens: 10,
+                                      minChunkTokens: 1,
+                                      enableSemantic: false)
+        let document = ParsedDocument(text: text, source: "budget.md")
+        let chunks = await TextChunker(options: options)
+            .chunk(document: document, variant: .recursive)
+        XCTAssertGreaterThan(chunks.count, 1)
+        XCTAssertTrue(chunks.allSatisfy { EmbeddingTokenEstimator.count($0.text) <= options.chunkSizeTokens },
+                      "含 overlap 的切片不应超过 100 token：\(chunks.map { EmbeddingTokenEstimator.count($0.text) })")
+        XCTAssertTrue(chunks.allSatisfy { $0.text.hasSuffix("。") },
+                      "切片应在句子结束处断开：\(chunks.map { "\($0.text.suffix(6))[\(EmbeddingTokenEstimator.count($0.text))]" })")
     }
 }

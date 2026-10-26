@@ -105,6 +105,16 @@ public protocol EmbeddingProvider: AnyObject, Sendable {
     var maxConcurrentRuns: Int { get }
 }
 
+/// 能提供精确 token 计数的 embedding：切片时改用模型真实分词器控长，
+/// 避免估算误差把块推出模型上下文窗口。
+public protocol EmbeddingTokenCounting: Sendable {
+    /// 单条文本可安全送入模型的最大内容 token 数：
+    /// 已扣除 [CLS]/[SEP] 等特殊 token与模型专属前缀。
+    var maxContentTokens: Int { get }
+    /// 同步 token 计数器（不含特殊 token）；分词器不可用时返回 nil。
+    func makeTokenCounter() async -> (@Sendable (String) -> Int)?
+}
+
 public extension EmbeddingProvider {
     func unload() async {}
     var maxConcurrentRuns: Int { 1 }

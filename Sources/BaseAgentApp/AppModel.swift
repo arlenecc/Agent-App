@@ -212,8 +212,15 @@ final class AppViewModel: ObservableObject {
         if agent?.discardPersistedPlan() == true {
             appendLog("[plan] 已清除上次未完成的计划")
         }
-        // 默认在后台加载主/辅模型；模型缺失时只记录可诊断错误，不阻塞启动。
-        Task { await preloadModels(main: config.llmProvider == "local", aux: true) }
+        // 默认在后台加载主模型；辅助模型需在设置中显式启用后才加载，
+        // 模型缺失时只记录可诊断错误，不阻塞启动。
+        if !config.auxEnabled {
+            appendLog("[model] 辅助模型未启用，启动时不加载")
+        }
+        Task {
+            await preloadModels(main: config.llmProvider == "local",
+                                aux: config.auxEnabled)
+        }
     }
 
     // MARK: Agent 生命周期
@@ -244,7 +251,11 @@ final class AppViewModel: ObservableObject {
         let llm = LocalModelFactory.shared.makeLLM(config: config)
         let callbacks = UICallbacks(model: self, cancel: cancelFlag)
         let newAgent = Agent(llm: llm, config: config, callbacks: callbacks)
-        newAgent.auxLLM = LocalModelFactory.shared.makeAuxLLM(config: config)
+        // 未启用时保持 auxLLM 为 nil：RAG 精简会直接跳过，后台任务回退主模型，
+        // 也不会被同步前后的恢复逻辑误加载。
+        newAgent.auxLLM = config.auxEnabled
+            ? LocalModelFactory.shared.makeAuxLLM(config: config)
+            : nil
         agent = newAgent
         refreshRAGStatus()
         Task { [weak newAgent] in
@@ -259,7 +270,9 @@ final class AppViewModel: ObservableObject {
                      afterApply: (@MainActor () -> Void)? = nil) {
         // 先停掉在途对话，再关闭 Agent，避免旧 Task 继续使用已释放/已换配置的模型。
         let wasMainLoaded = mainModelLoaded
-        let wasAuxLoaded = auxModelLoaded
+        let auxWasLoaded = auxModelLoaded
+        // 新配置关闭辅助模型时，即使旧模型已加载也不恢复，避免误启动。
+        let wasAuxLoaded = auxWasLoaded && newConfig.auxEnabled
         let oldTask = runTask
         runGeneration += 1
         configGeneration += 1
@@ -292,6 +305,9 @@ final class AppViewModel: ObservableObject {
                 self.agent?.close()
                 LocalModelFactory.shared.clearCaches()
                 self.buildAgent()
+                if auxWasLoaded && !newConfig.auxEnabled {
+                    self.appendLog("[model] 辅助模型已关闭，不再加载")
+                }
                 self.plan = nil
                 self.isRunning = false
                 self.isSyncing = false
@@ -402,6 +418,15 @@ final class AppViewModel: ObservableObject {
                 }
 
             case .aux:
+                // 配置关闭辅助模型时，卸载旧实例并直接返回，绝不创建新实例。
+                guard newConfig.auxEnabled else {
+                    agent.unloadAuxLLM()
+                    LocalModelFactory.shared.unloadLLMCaches()
+                    self.auxModelLoaded = false
+                    self.appendLog("[model] 辅助模型未启用，跳过加载")
+                    self.statusText = "辅助模型未启用"
+                    break
+                }
                 // 先释放旧辅助模型，再按新参数创建；主模型不受影响。
                 agent.unloadAuxLLM()
                 LocalModelFactory.shared.unloadLLMCaches()
@@ -436,7 +461,9 @@ final class AppViewModel: ObservableObject {
 
     /// 主动把主/辅模型权重加载到内存。API 模式的主模型不需要预加载。
     func preloadModels(main: Bool, aux: Bool) async {
-        guard main || aux else { return }
+        // 未启用时忽略所有 aux 预加载请求，避免同步恢复/旧调用误启动。
+        let shouldLoadAux = aux && config.auxEnabled
+        guard main || shouldLoadAux else { return }
         let generation = configGeneration
         isModelLoading = true
         statusText = "模型加载中…"
@@ -470,7 +497,7 @@ final class AppViewModel: ObservableObject {
             }
         }
 
-        if aux, let service = agent?.auxLLM as? PreloadableLLMService {
+        if shouldLoadAux, let service = agent?.auxLLM as? PreloadableLLMService {
             do {
                 try await service.preload()
                 guard configGeneration == generation else { return }
@@ -1023,8 +1050,10 @@ final class AppViewModel: ObservableObject {
                              restore: (main: Bool, aux: Bool)?, generation: Int) {
         // applyConfig 后的同步：模型尚未加载，按应用配置前的状态在同步结束后恢复。
         let wasMain = restore?.main ?? mainModelLoaded
-        let wasAux = restore?.aux ?? auxModelLoaded
-        appendLog("[rag] 同步开始：先卸载主/辅助模型，结束后重新加载并预热主模型")
+        // 同步结束后的恢复也必须看当前开关：关闭时即使旧状态是已加载也不恢复。
+        let wasAux = (restore?.aux ?? auxModelLoaded) && config.auxEnabled
+        let modelNote = config.auxEnabled ? "主/辅助模型" : "主模型（辅助模型未启用）"
+        appendLog("[rag] 同步开始：先卸载\(modelNote)，结束后重新加载并预热主模型")
         // 同步期间卸载已加载的主/辅模型，释放权重与 KV cache。
         suspendModelsForSync()
 
@@ -1089,7 +1118,9 @@ final class AppViewModel: ObservableObject {
     private func suspendModelsForSync() {
         // 只卸载本地可预加载模型；API 模式的 OpenAI 客户端不占本地权重，保持原样。
         let hasMain = mainModelLoaded || agent?.llm is PreloadableLLMService
-        let hasAux = auxModelLoaded || agent?.auxLLM is PreloadableLLMService
+        // 辅助模型关闭时视为没有可卸载的辅助模型，避免同步路径误触。
+        let hasAux = config.auxEnabled
+            && (auxModelLoaded || agent?.auxLLM is PreloadableLLMService)
         guard hasMain || hasAux else {
             appendLog("[model] 知识同步前模型未加载，无需卸载")
             return
@@ -1110,18 +1141,22 @@ final class AppViewModel: ObservableObject {
 
     /// 同步结束后恢复同步前已加载的模型；主模型会重新预热。
     private func resumeModelsAfterSync(main: Bool, aux: Bool) async {
-        guard main || aux, let agent else { return }
-        appendLog("[model] 知识同步结束：重新加载"
-            + "\(main ? "主模型" : "")\(main && aux ? "与" : "")\(aux ? "辅助模型" : "")"
+        // 恢复前再次确认开关：同步期间被关闭（或旧状态带 aux）时都不能误加载。
+        let shouldLoadAux = aux && config.auxEnabled
+        guard main || shouldLoadAux, let agent else { return }
+        var parts: [String] = []
+        if main { parts.append("主模型") }
+        if shouldLoadAux { parts.append("辅助模型") }
+        appendLog("[model] 知识同步结束：重新加载\(parts.joined(separator: "与"))"
             + (main ? "，主模型加载后自动预热" : ""))
         statusText = "同步结束，重新加载模型…"
         if main, agent.llm is UnloadedLLMService {
             agent.switchLLM(LocalModelFactory.shared.makeLLM(config: config))
         }
-        if aux, agent.auxLLM == nil {
+        if shouldLoadAux, agent.auxLLM == nil {
             agent.auxLLM = LocalModelFactory.shared.makeAuxLLM(config: config)
         }
-        await preloadModels(main: main, aux: aux)
+        await preloadModels(main: main, aux: shouldLoadAux)
     }
 
     func stopSync() {

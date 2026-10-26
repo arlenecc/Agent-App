@@ -40,6 +40,40 @@ final class EmbeddingSchedulerTests: XCTestCase {
         }
     }
 
+    private final class CountingEmbedding: EmbeddingProvider, EmbeddingTokenCounting, @unchecked Sendable {
+        let identifier = "counting"
+        let dimension = 1
+        let maxContentTokens = 128
+
+        func embedDocuments(_ texts: [String]) async throws -> [[Float]] {
+            texts.map { _ in [0] }
+        }
+
+        func embedQuery(_ text: String) async throws -> [Float] {
+            [0]
+        }
+
+        func makeTokenCounter() async -> (@Sendable (String) -> Int)? {
+            { $0.count }
+        }
+    }
+
+    /// ingest 拿到的是调度器而不是底层 provider，必须把窗口预算与精确计数器转发出去，
+    /// 否则 bge 的 512 token 窗口在切片阶段完全失去保护。
+    func testSchedulerForwardsTokenCountingCapability() async {
+        let scheduler = AdaptiveEmbeddingScheduler(base: CountingEmbedding(), log: { _ in })
+        XCTAssertEqual(scheduler.maxContentTokens, 128)
+        let counter = await scheduler.makeTokenCounter()
+        XCTAssertEqual(counter?("云计算"), 3)
+    }
+
+    func testSchedulerWithoutTokenCountingFallsBack() async {
+        let scheduler = AdaptiveEmbeddingScheduler(base: RecordingEmbedding(), log: { _ in })
+        XCTAssertEqual(scheduler.maxContentTokens, Int.max, "不支持的底层不限制切片大小")
+        let counter = await scheduler.makeTokenCounter()
+        XCTAssertNil(counter, "应回退到保守估算器")
+    }
+
     func testSchedulerPreservesOrderAndBatchBounds() async throws {
         let base = RecordingEmbedding()
         let scheduler = AdaptiveEmbeddingScheduler(
@@ -73,5 +107,21 @@ final class EmbeddingSchedulerTests: XCTestCase {
         _ = try await (first, second)
 
         XCTAssertEqual(base.maxConcurrent, 1)
+    }
+
+    /// 配置层可能传入越界值，Options 自己也要夹到安全范围。
+    func testSchedulerOptionsNormalizeBounds() {
+        let options = AdaptiveEmbeddingScheduler.Options(
+            minBatchSize: 0, maxBatchSize: 1, initialBatchSize: 99, step: 0,
+            memoryLimitMB: 1, throughputTolerance: 9,
+            probeBatches: 0, probeSeconds: 0)
+        XCTAssertEqual(options.minBatchSize, 1)
+        XCTAssertEqual(options.maxBatchSize, 1)
+        XCTAssertEqual(options.initialBatchSize, 1)
+        XCTAssertEqual(options.step, 1)
+        XCTAssertEqual(options.memoryLimitMB, 256)
+        XCTAssertEqual(options.throughputTolerance, 0.5)
+        XCTAssertEqual(options.probeBatches, 1)
+        XCTAssertEqual(options.probeSeconds, 0.1)
     }
 }

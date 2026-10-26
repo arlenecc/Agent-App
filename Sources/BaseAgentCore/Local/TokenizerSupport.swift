@@ -372,3 +372,24 @@ public struct LocalTokenizerLoader: MLXLMCommon.TokenizerLoader {
         return MLXTokenizerBridge(tokenizer.base)
     }
 }
+
+/// 切片阶段使用的精确 token 计数器：只加载 tokenizer、不加载模型权重，按目录缓存。
+public actor TokenizerCounterCache {
+    public static let shared = TokenizerCounterCache()
+
+    private var counters: [String: @Sendable (String) -> Int] = [:]
+
+    /// 返回不含特殊 token 的同步计数器；模型目录缺少 tokenizer 时返回 nil。
+    public func counter(for directory: URL) async -> (@Sendable (String) -> Int)? {
+        let key = directory.standardizedFileURL.path
+        if let cached = counters[key] { return cached }
+        guard let tokenizer = try? await LocalTokenizer.load(directory: directory) else {
+            return nil
+        }
+        let counter: @Sendable (String) -> Int = { text in
+            tokenizer.encode(text, addSpecialTokens: false).count
+        }
+        counters[key] = counter
+        return counter
+    }
+}

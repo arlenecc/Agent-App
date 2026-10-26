@@ -65,7 +65,7 @@ public final class TextChunker: TextChunkingStrategy {
 
     /// 单个章节的切分结果。
     /// `mergeable` 表示片段是否允许与相邻片段合并：整章/语义切片是完整语义单元，
-    /// 绝不能再被 `minChunkChars` 合并回去，否则语义边界会被抹掉。
+    /// 绝不能再被 `minChunkTokens` 合并回去，否则语义边界会被抹掉。
     private struct SectionPieces {
         var texts: [String]
         var mergeable: Bool
@@ -75,9 +75,9 @@ public final class TextChunker: TextChunkingStrategy {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return SectionPieces(texts: [], mergeable: false) }
 
-        // 短章节整章即一个切片（按字符数对齐切片大小设置，默认 800 字）。
+        // 短章节整章即一个切片（按 token 预算对齐切片大小设置，默认 500 token）。
         // 长章节必须走语义/递归切分，禁止退化为按页切。
-        if trimmed.count <= options.chunkSizeTokens, trimmed.count <= options.maxChunkChars {
+        if options.tokenCounter(trimmed) <= options.chunkSizeTokens {
             return SectionPieces(texts: [trimmed], mergeable: false)
         }
 
@@ -89,7 +89,7 @@ public final class TextChunker: TextChunkingStrategy {
             if let semantic = await SemanticChunker.split(trimmed, options: options,
                                                           similarity: similarity),
                !semantic.isEmpty {
-                return SectionPieces(texts: enforceMaxChars(semantic), mergeable: false)
+                return SectionPieces(texts: enforceMaxTokens(semantic), mergeable: false)
             }
             return SectionPieces(texts: RecursiveChunker.split(trimmed, options: options),
                                  mergeable: true)
@@ -98,7 +98,7 @@ public final class TextChunker: TextChunkingStrategy {
                 if let semantic = await SemanticChunker.split(trimmed, options: options,
                                                               similarity: similarity),
                    !semantic.isEmpty {
-                    return SectionPieces(texts: enforceMaxChars(semantic), mergeable: false)
+                    return SectionPieces(texts: enforceMaxTokens(semantic), mergeable: false)
                 }
             }
             return SectionPieces(texts: RecursiveChunker.split(trimmed, options: options),
@@ -106,10 +106,10 @@ public final class TextChunker: TextChunkingStrategy {
         }
     }
 
-    private func enforceMaxChars(_ pieces: [String]) -> [String] {
+    private func enforceMaxTokens(_ pieces: [String]) -> [String] {
         var output: [String] = []
         for piece in pieces {
-            if piece.count <= options.maxChunkChars {
+            if options.tokenCounter(piece) <= options.chunkSizeTokens {
                 output.append(piece)
             } else {
                 output.append(contentsOf: RecursiveChunker.split(piece, options: options))
@@ -120,11 +120,11 @@ public final class TextChunker: TextChunkingStrategy {
 
     // MARK: Overlap
 
-    /// 把上一块尾部约 `overlapTokens` 的内容前置到当前块。
+    /// 把上一块尾部约 `overlapTokens` token 的内容前置到当前块。
     /// 使用「原始块」而不是已加重叠的块，避免重叠逐段复合膨胀。
     ///
     /// 合并与 overlap 都严格限制在同一章节内、且片段本身允许合并：
-    /// 整章切片与语义切片是完整语义单元，不能被 `minChunkChars` 或 overlap
+    /// 整章切片与语义切片是完整语义单元，不能被 `minChunkTokens` 或 overlap
     /// 跨边界拼接（否则语义边界会被抹掉，或重新退化成按页/跨主题切片）。
     private func applyOverlap(
         _ pieces: [(text: String, heading: String,
@@ -134,7 +134,7 @@ public final class TextChunker: TextChunkingStrategy {
         guard !pieces.isEmpty else { return [] }
 
         // 先合并过短块，再做 overlap：反过来会让 overlap 后的块再次被合并，
-        // 最终突破 chunkSize / maxChunkChars。
+        // 最终突破 chunkSize 预算。
         var merged = pieces
         var index = 1
         while index < merged.count {
@@ -142,8 +142,8 @@ public final class TextChunker: TextChunkingStrategy {
             var previous = merged[index - 1]
             if piece.mergeable, previous.mergeable,
                piece.sectionIndex == previous.sectionIndex,
-               piece.text.count < options.minChunkChars,
-               previous.text.count + piece.text.count + 1 <= options.maxChunkChars {
+               options.tokenCounter(piece.text) < options.minChunkTokens,
+               options.tokenCounter(previous.text + "\n" + piece.text) <= options.contentBudgetTokens {
                 previous.text += "\n" + piece.text
                 merged[index - 1] = previous
                 merged.remove(at: index)
@@ -164,53 +164,39 @@ public final class TextChunker: TextChunkingStrategy {
             let tail = canOverlap ? overlapTail(previous.text, tokens: overlapTokens) : ""
             if tail.isEmpty || current.text.hasPrefix(tail) {
                 output.append(current)
-            } else if tail.count + current.text.count + 1 <= options.maxChunkChars {
+            } else if options.tokenCounter(tail + "\n" + current.text) <= options.chunkSizeTokens {
                 var value = current
                 value.text = tail + "\n" + current.text
                 output.append(value)
             } else {
-                // 当前块已接近字符上限：宁可不要 overlap，也不产生超长块。
+                // 当前块已接近 token 预算：宁可不要 overlap，也不产生超长块。
                 output.append(current)
             }
         }
         return output.map { (text: $0.text, heading: $0.heading) }
     }
 
+    /// 取尾部约 `tokens` token 的文本，并向后挪到自然句界，避免从半句开始。
     private func overlapTail(_ text: String, tokens: Int) -> String {
         guard tokens > 0, !text.isEmpty else { return "" }
-        let chars = Array(text)
-        var accumulated = 0.0
-        var index = chars.count
-        while index > 0 {
-            accumulated += charTokenWeight(chars[index - 1])
-            index -= 1
-            if accumulated >= Double(tokens) {
-                break
-            }
+        if options.tokenCounter(text) <= tokens {
+            let value = text.trimmingCharacters(in: .whitespacesAndNewlines)
+            return value.count >= 12 ? value : ""
         }
-        guard index < chars.count else { return "" }
-        // 向前挪到自然句界/空白，避免从半个词开始。
-        var start = index
-        let limit = min(chars.count, index + 40)
+        let raw = EmbeddingTokenEstimator.suffix(text, tokens: tokens)
+        let all = Array(raw)
+        var start = 0
+        // 向后挪到自然句界/空白，避免从半个词开始。
+        let limit = min(all.count, 40)
         while start < limit {
-            let ch = chars[start]
+            let ch = all[start]
             if ch == "\n" || ch == "。" || ch == "！" || ch == "？" || ch == "." || ch == " " {
                 start += 1
                 break
             }
             start += 1
         }
-        let tail = String(chars[start...]).trimmingCharacters(in: .whitespacesAndNewlines)
+        let tail = String(all[start...]).trimmingCharacters(in: .whitespacesAndNewlines)
         return tail.count >= 12 ? tail : ""
-    }
-
-    private func charTokenWeight(_ ch: Character) -> Double {
-        guard let scalar = ch.unicodeScalars.first else { return 0.3 }
-        switch scalar.value {
-        case 0x4E00...0x9FFF, 0x3400...0x4DBF, 0x3040...0x30FF:
-            return 1.0 / 1.3
-        default:
-            return 1.0 / 3.5
-        }
     }
 }

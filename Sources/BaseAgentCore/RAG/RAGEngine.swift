@@ -551,7 +551,17 @@ public final class RAGEngine {
             stats.errors.append("embedding 模型不可用")
             return stats
         }
-        let scheduler = AdaptiveEmbeddingScheduler(base: baseEmbedding, log: logFn)
+        let scheduler = AdaptiveEmbeddingScheduler(
+            base: baseEmbedding,
+            options: .init(minBatchSize: config.ragEmbeddingMinBatch,
+                           maxBatchSize: config.ragEmbeddingMaxBatch,
+                           initialBatchSize: config.ragEmbeddingInitialBatch,
+                           step: config.ragEmbeddingBatchStep,
+                           memoryLimitMB: Double(config.ragEmbeddingMemoryLimitMB),
+                           throughputTolerance: config.ragEmbeddingThroughputTolerance,
+                           probeBatches: config.ragEmbeddingProbeBatches,
+                           probeSeconds: config.ragEmbeddingProbeSeconds),
+            log: logFn)
         let jobs = uniqueFiles.enumerated().map { index, file in
             IngestJob(index: index, total: total, file: file,
                       label: "[\(index + 1)/\(total)] \(file.relativePath)")
@@ -659,7 +669,7 @@ public final class RAGEngine {
             ? config.ragEmbeddingModel : config.localEmbeddingModel
         let fields: [(String, String)] = [
             // 渲染/清洗逻辑变化时递增，强制旧缓存文件重建。
-            ("pipeline_version", "6"),
+            ("pipeline_version", "7"),
             ("pdf_engine", config.ragPDFEngine.rawValue),
             ("epub_ocr_engine", config.ragEPUBOCREngine.rawValue),
             ("ocr_engine", config.ragOCREngine),
@@ -827,7 +837,25 @@ public final class RAGEngine {
             var chunkDocument = parsed
             chunkDocument.text = text
             var lastChunkLog = Date()
-            let chunks = await TextChunker(options: ChunkingOptions(config: config))
+            // 模型分词器可用时改用精确 token 计数：整块（含 overlap）不超过
+            // 上下文窗口，避免尾部被 embedding 的 prefix(maxLength) 静默截断。
+            var chunkOptions = ChunkingOptions(config: config)
+            if let provider = embedding as? EmbeddingTokenCounting {
+                // 用户把切片调得比模型窗口还大时以模型为准（bge-small-zh 为
+                // 512 - [CLS]/[SEP] = 510），overlap 同步压缩到 10%。
+                let limit = max(16, provider.maxContentTokens)
+                if chunkOptions.chunkSizeTokens > limit {
+                    let configured = chunkOptions.chunkSizeTokens
+                    chunkOptions.chunkSizeTokens = limit
+                    chunkOptions.overlapTokens = min(chunkOptions.overlapTokens, limit / 10)
+                    log("RAG: \(job.label) 切片大小 \(configured) 超过模型输入上限，"
+                        + "已限制为 \(limit) token")
+                }
+                if let counter = await provider.makeTokenCounter() {
+                    chunkOptions.tokenCounter = counter
+                }
+            }
+            let chunks = await TextChunker(options: chunkOptions)
                 .chunk(document: chunkDocument, variant: .hybrid) { done, total in
                     // 语义切片用本地词向量算相似度，大文档仍可能耗时较久——
                     // 与向量化进度同节奏（60 秒一条）输出切片进度。
@@ -1120,9 +1148,11 @@ public final class RAGEngine {
                     for index in hits.indices {
                         hits[index].score = scores[index]
                     }
-                    // 原项目在重排序后丢弃 0.7 以下结果；全部低于阈值时
+                    // 重排序后丢弃阈值以下结果（默认 0.45，适配 jina ONNX 的
+                    // 分数分布；bge-mlx 方案可上调至 0.7）；全部低于阈值时
                     // 回退到原排序的 topK 候选，避免模型完全拿不到上下文。
-                    let filtered = hits.filter { $0.score >= 0.7 }
+                    let threshold = config.ragRerankThreshold
+                    let filtered = hits.filter { $0.score >= threshold }
                         .sorted { $0.score > $1.score }
                     hits = filtered.isEmpty
                         ? Array(hits.sorted { $0.score > $1.score }.prefix(topK))
@@ -1136,10 +1166,12 @@ public final class RAGEngine {
     }
 
     public func searchFormatted(query: String, topK: Int = 3, source: String? = nil,
-                                maxCharsPerResult: Int = 1500,
-                                maxTotalChars: Int = 8000) async throws -> String {
+                                maxCharsPerResult: Int? = nil,
+                                maxTotalChars: Int? = nil) async throws -> String {
         let hits = try await search(query: query, topK: topK, source: source)
         guard !hits.isEmpty else { return "（知识库中未找到相关内容）" }
+        let perResultLimit = max(200, maxCharsPerResult ?? config.ragSearchMaxCharsPerResult)
+        let totalLimit = max(1_000, maxTotalChars ?? config.ragSearchMaxTotalChars)
         var lines = ["从知识库检索到 \(hits.count) 条相关内容（混合检索 + RRF\(config.ragRerankEnabled ? " + 重排序" : "")）：", ""]
         var total = lines.joined().count
         for (index, hit) in hits.enumerated() {
@@ -1151,19 +1183,41 @@ public final class RAGEngine {
             let header = "### [\(index + 1)] 来源: \(name) (\(scoreLabel): "
                 + String(format: "%.4f", hit.score) + ")\(heading)"
             var text = hit.text
-            if text.count > maxCharsPerResult {
-                text = String(text.prefix(maxCharsPerResult)) + "…"
+            if text.count > perResultLimit {
+                text = String(text.prefix(perResultLimit)) + "…"
             }
             lines.append(header)
             lines.append(text)
             lines.append("")
             total += header.count + text.count + 1
-            if total >= maxTotalChars {
+            if total >= totalLimit {
                 lines.append("…（结果过长，已截断）")
                 break
             }
         }
-        return lines.joined(separator: "\n")
+        let output = lines.joined(separator: "\n")
+        return await condenseIfNeeded(output)
+    }
+
+    // MARK: 辅助模型精简
+
+    /// 可选的辅助模型精简器（由 Agent 注入，动态读取当前 auxLLM）。
+    /// 返回 nil 表示不精简（未配置辅助模型、精简失败或结果为空）。
+    public var auxCondenser: ((String) async -> String?)?
+
+    /// 结果总字数落在 [min, max] 区间时交给辅助模型精简：
+    /// - 低于下限：内容不多，总结只会丢细节、平白增加延迟，原样返回；
+    /// - 高于上限：内容过大，一次性摘要不可靠，原样返回。
+    /// 精简失败或输出为空时回退原文，绝不让检索结果变空。
+    private func condenseIfNeeded(_ output: String) async -> String {
+        let count = output.count
+        guard count >= config.ragAuxSummarizeMinChars,
+              count <= config.ragAuxSummarizeMaxChars,
+              let condenser = auxCondenser else { return output }
+        if let condensed = await condenser(output), !condensed.isEmpty {
+            return condensed
+        }
+        return output
     }
 
     // MARK: Meta

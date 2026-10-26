@@ -12,23 +12,29 @@ public enum ChunkVariant: String, Sendable {
 }
 
 public struct ChunkingOptions: Sendable {
+    /// 单片 token 预算（含 overlap）。bge-small-zh 上下文 512 token，
+    /// 默认 500 并给 [CLS]/[SEP] 与估算误差留出余量。
     public var chunkSizeTokens: Int
+    /// 相邻切片重叠的 token 数（默认 10%），计入 `chunkSizeTokens` 总预算。
     public var overlapTokens: Int
-    public var minChunkChars: Int
-    public var maxChunkChars: Int
+    /// 允许与相邻片段合并的最小长度（token）。
+    public var minChunkTokens: Int
     /// 语义切分阈值：相邻句子相似度低于该值时断开。
     public var semanticThreshold: Double
     public var enableSemantic: Bool
+    /// token 估算器；测试可注入 1 字 = 1 token 的确定性实现。
+    public var tokenCounter: @Sendable (String) -> Int
 
-    public init(chunkSizeTokens: Int = 800, overlapTokens: Int = 40,
-                minChunkChars: Int = 80, maxChunkChars: Int = 4000,
-                semanticThreshold: Double = 0.55, enableSemantic: Bool = true) {
+    public init(chunkSizeTokens: Int = 500, overlapTokens: Int = 50,
+                minChunkTokens: Int = 60,
+                semanticThreshold: Double = 0.55, enableSemantic: Bool = true,
+                tokenCounter: @escaping @Sendable (String) -> Int = { EmbeddingTokenEstimator.count($0) }) {
         self.chunkSizeTokens = chunkSizeTokens
         self.overlapTokens = overlapTokens
-        self.minChunkChars = minChunkChars
-        self.maxChunkChars = maxChunkChars
+        self.minChunkTokens = minChunkTokens
         self.semanticThreshold = semanticThreshold
         self.enableSemantic = enableSemantic
+        self.tokenCounter = tokenCounter
     }
 
     public init(config: AgentConfig) {
@@ -36,6 +42,13 @@ public struct ChunkingOptions: Sendable {
                   overlapTokens: config.ragChunkOverlap,
                   semanticThreshold: 0.55,
                   enableSemantic: config.ragSemanticChunking)
+    }
+
+    /// 递归片段最终要与 overlap 拼在同一片，正文预算先扣除 overlap
+    /// 与分隔符的 token，保证拼好后仍不超过 `chunkSizeTokens`。
+    var contentBudgetTokens: Int {
+        let reserved = overlapTokens > 0 ? overlapTokens + 2 : 0
+        return max(1, chunkSizeTokens - reserved)
     }
 }
 

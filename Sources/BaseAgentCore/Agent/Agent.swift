@@ -311,6 +311,12 @@ public final class Agent: @unchecked Sendable {
         }
         self.tools.session = self.session
         self.tools.ragEngine = self.ragEngine
+        // RAG 检索结果的辅助模型精简：动态读取当前 auxLLM（AppModel 可在
+        // 运行中替换辅助模型），阈值判断在 RAGEngine.condenseIfNeeded 内。
+        self.ragEngine.auxCondenser = { [weak self] text in
+            guard let self, self.auxLLM != nil else { return nil }
+            return await self.condenseRAGResult(text)
+        }
     }
 
     private lazy var kernel: KernelLoop = {
@@ -1028,6 +1034,25 @@ public final class Agent: @unchecked Sendable {
     }
 
     // MARK: 模型辅助
+
+    /// 用辅助模型精简 RAG 检索结果：压缩冗余表述，保留关键事实/数值/结论，
+    /// 供主模型直接使用。输出为空或失败由调用方回退原文。
+    private func condenseRAGResult(_ text: String) async -> String? {
+        guard beginBackgroundIfIdle() else { return nil }
+        defer { endBackground() }
+        let output = await collectChat([
+            ChatMessage(role: .system,
+                        content: "你是检索结果精简器。压缩给定内容的冗余表述与重复信息，"
+                            + "严格保留：关键事实、数值、名称、结论、因果与来源标注。"
+                            + "不要编造、不要添加原文没有的信息、不要发表评论。"
+                            + "直接输出精简后的内容，不加前言或解释。"),
+            ChatMessage(role: .user, content: text),
+        ], temperature: 0.2)
+        let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        log("[rag] 辅助模型精简：\(text.count) 字 -> \(trimmed.count) 字")
+        return trimmed
+    }
 
     private static func stripJSONFence(_ raw: String) -> String {
         var text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
