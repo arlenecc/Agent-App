@@ -1,0 +1,374 @@
+import Foundation
+import Tokenizers
+import MLXLMCommon
+
+/// 一批已 padding 的 token 序列。
+public struct TokenizedBatch: Sendable {
+    public var inputIDs: [[Int]]
+    public var attentionMask: [[Int]]
+
+    public init(inputIDs: [[Int]], attentionMask: [[Int]]) {
+        self.inputIDs = inputIDs
+        self.attentionMask = attentionMask
+    }
+
+    public var batchSize: Int { inputIDs.count }
+    public var sequenceLength: Int { inputIDs.first?.count ?? 0 }
+}
+
+/// 本地 tokenizer 封装：encode/decode、截断、padding、pair 编码与 chat template。
+///
+/// `Tokenizer` 由 `swift-transformers` 的 `AutoTokenizer` 加载；同一模型目录只应加载一次。
+public final class LocalTokenizer: @unchecked Sendable {
+    public let base: any Tokenizers.Tokenizer
+    public let directory: URL
+    /// padding token；tokenizer_config.json 缺失时回退到 eos / 0。
+    public let padTokenId: Int
+    public let tokenizerClass: String
+    public let modelType: String
+    /// XLM-R 风格（`<s> A </s></s> B </s>`）的 pair 编码。
+    public let usesXLMRPairFormat: Bool
+
+    private init(
+        base: any Tokenizers.Tokenizer,
+        directory: URL,
+        padTokenId: Int,
+        tokenizerClass: String,
+        modelType: String
+    ) {
+        self.base = base
+        self.directory = directory
+        self.padTokenId = padTokenId
+        self.tokenizerClass = tokenizerClass
+        self.modelType = modelType
+        let lowerClass = tokenizerClass.lowercased()
+        let lowerType = modelType.lowercased()
+        self.usesXLMRPairFormat = lowerClass.contains("xlmroberta")
+            || lowerClass.contains("xlm-roberta")
+            || lowerType.contains("xlm-roberta")
+            || lowerType.contains("xlm_roberta")
+    }
+
+    /// 从模型目录加载 tokenizer。`tokenizer.json` 与 `tokenizer_config.json` 必须同目录。
+    public static func load(directory: URL) async throws -> LocalTokenizer {
+        let fm = FileManager.default
+        let tokenizerURL = directory.appendingPathComponent("tokenizer.json")
+        let configURL = directory.appendingPathComponent("tokenizer_config.json")
+
+        guard fm.fileExists(atPath: tokenizerURL.path) else {
+            throw LocalModelError.missingTokenizer(directory: directory.path, file: "tokenizer.json")
+        }
+        guard fm.fileExists(atPath: configURL.path) else {
+            throw LocalModelError.missingTokenizer(directory: directory.path, file: "tokenizer_config.json")
+        }
+
+        let base: any Tokenizers.Tokenizer
+        do {
+            // 非严格模式：tokenizer_config 里的 tokenizer_class 可能来自更新版本的
+            // transformers（如 Qwen3_5Tokenizer）；只要 tokenizer.json 是标准 BPE，
+            // 就应回退到 BPE 而不是直接拒绝加载整个模型。
+            base = try await Tokenizers.AutoTokenizer.from(modelFolder: directory, strict: false)
+        } catch {
+            throw LocalModelError.runtime("tokenizer 加载失败（\(directory.path)）：\(error.localizedDescription)")
+        }
+
+        let config = readJSON(configURL) ?? [:]
+        let tokenizerClass = (config["tokenizer_class"] as? String)
+            ?? (config["model_type"] as? String)
+            ?? ""
+        let modelType = (config["model_type"] as? String) ?? ""
+
+        var padID: Int?
+        if let value = config["pad_token_id"] as? Int, value >= 0 {
+            padID = value
+        } else if let token = config["pad_token"] as? String, !token.isEmpty {
+            padID = base.convertTokenToId(token)
+        }
+        if padID == nil {
+            padID = base.eosTokenId
+        }
+
+        return LocalTokenizer(
+            base: base,
+            directory: directory,
+            padTokenId: padID ?? 0,
+            tokenizerClass: tokenizerClass,
+            modelType: modelType
+        )
+    }
+
+    // MARK: - 单条编码 / 解码
+
+    public func encode(_ text: String, addSpecialTokens: Bool = true) -> [Int] {
+        base.encode(text: text, addSpecialTokens: addSpecialTokens)
+    }
+
+    /// 编码并按 maxLength 从右侧截断。
+    public func encode(_ text: String, addSpecialTokens: Bool = true, maxLength: Int) -> [Int] {
+        truncate(base.encode(text: text, addSpecialTokens: addSpecialTokens), maxLength: maxLength)
+    }
+
+    public func decode(_ ids: [Int], skipSpecialTokens: Bool = false) -> String {
+        base.decode(tokens: ids, skipSpecialTokens: skipSpecialTokens)
+    }
+
+    // MARK: - 批量编码与 padding
+
+    /// 对一组文本做右 padding，返回 input_ids 与 attention_mask。
+    public func encodeBatch(
+        _ texts: [String],
+        maxLength: Int,
+        addSpecialTokens: Bool = true
+    ) -> TokenizedBatch {
+        var sequences: [[Int]] = []
+        sequences.reserveCapacity(texts.count)
+        for text in texts {
+            var ids = base.encode(text: text, addSpecialTokens: addSpecialTokens)
+            ids = truncate(ids, maxLength: maxLength)
+            if ids.isEmpty {
+                // 空文本也要保留一个位置，避免 ONNX 收到 T=0 的张量。
+                ids = [padTokenId]
+            }
+            sequences.append(ids)
+        }
+        return pad(sequences)
+    }
+
+    /// 对已编码序列做右 padding。
+    public func pad(_ sequences: [[Int]]) -> TokenizedBatch {
+        let width = sequences.map(\.count).max() ?? 0
+        var ids: [[Int]] = []
+        var masks: [[Int]] = []
+        ids.reserveCapacity(sequences.count)
+        masks.reserveCapacity(sequences.count)
+
+        for sequence in sequences {
+            let padding = max(0, width - sequence.count)
+            ids.append(sequence + Array(repeating: padTokenId, count: padding))
+            masks.append(Array(repeating: 1, count: sequence.count) + Array(repeating: 0, count: padding))
+        }
+        return TokenizedBatch(inputIDs: ids, attentionMask: masks)
+    }
+
+    // MARK: - 交叉编码器 pair 编码
+
+    /// 将 query/document 编码成 reranker 需要的 pair 序列。
+    ///
+    /// - XLM-R（bge-reranker-v2-m3）：`<s> query </s></s> document </s>`
+    /// - BERT 系：`[CLS] query [SEP] document [SEP]`
+    public func encodePair(query: String, document: String, maxLength: Int) -> [Int] {
+        let queryIDs = base.encode(text: query, addSpecialTokens: false)
+        let documentIDs = base.encode(text: document, addSpecialTokens: false)
+
+        var ids: [Int] = []
+        if usesXLMRPairFormat, let bos = base.bosTokenId, let eos = base.eosTokenId {
+            ids.append(bos)
+            ids.append(contentsOf: queryIDs)
+            ids.append(eos)
+            ids.append(eos)
+            ids.append(contentsOf: documentIDs)
+            ids.append(eos)
+        } else {
+            let cls = base.convertTokenToId("[CLS]") ?? base.bosTokenId
+            let sep = base.convertTokenToId("[SEP]") ?? base.eosTokenId
+            if let cls { ids.append(cls) }
+            ids.append(contentsOf: queryIDs)
+            if let sep { ids.append(sep) }
+            ids.append(contentsOf: documentIDs)
+            if let sep { ids.append(sep) }
+        }
+        return truncate(ids, maxLength: maxLength)
+    }
+
+    // MARK: - Chat template
+
+    /// 应用模型自带的 chat template。`enable_thinking` 传给 Qwen3 系模板。
+    public func applyChatTemplate(
+        messages: [ChatMessage],
+        tools: [JSONValue]? = nil,
+        enableThinking: Bool
+    ) throws -> [Int] {
+        try applyChatTemplate(messages: messages, tools: tools,
+                              enableThinking: enableThinking, addGenerationPrompt: true)
+    }
+
+    /// 显式控制是否追加 generation prompt；预热只需 system + tools 前缀。
+    public func applyChatTemplate(
+        messages: [ChatMessage],
+        tools: [JSONValue]?,
+        enableThinking: Bool,
+        addGenerationPrompt: Bool
+    ) throws -> [Int] {
+        guard base.hasChatTemplate else {
+            throw LocalModelError.invalidConfiguration(
+                "tokenizer_config.json 未提供 chat_template（目录：\(directory.path)）"
+            )
+        }
+
+        let formatted: [Tokenizers.Message] = messages.map { message in
+            var dictionary: [String: any Sendable] = [
+                "role": message.role.rawValue,
+                "content": message.content,
+            ]
+            if let name = message.name, !name.isEmpty {
+                dictionary["name"] = name
+            }
+            if let toolCallID = message.toolCallID, !toolCallID.isEmpty {
+                dictionary["tool_call_id"] = toolCallID
+            }
+            if let toolCalls = message.toolCalls, !toolCalls.isEmpty {
+                dictionary["tool_calls"] = toolCalls.map { call -> [String: any Sendable] in
+                    let arguments = call.rawArguments.isEmpty
+                        ? JSONValue.object(call.arguments).jsonString()
+                        : call.rawArguments
+                    return [
+                        "id": call.id,
+                        "type": "function",
+                        "function": [
+                            "name": call.name,
+                            "arguments": arguments,
+                        ] as [String: any Sendable],
+                    ]
+                }
+            }
+            return dictionary
+        }
+
+        let toolSpecs: [Tokenizers.ToolSpec]? = tools?.compactMap { tool -> Tokenizers.ToolSpec? in
+            guard let object = tool.objectValue else { return nil }
+            var result: [String: any Sendable] = [:]
+            for (key, value) in object {
+                result[key] = sendableValue(value)
+            }
+            return result
+        }
+
+        let context: [String: any Sendable] = ["enable_thinking": enableThinking]
+        do {
+            return try base.applyChatTemplate(
+                messages: formatted,
+                chatTemplate: nil,
+                addGenerationPrompt: addGenerationPrompt,
+                truncation: false,
+                maxLength: nil,
+                tools: toolSpecs,
+                additionalContext: context
+            )
+        } catch {
+            throw LocalModelError.runtime("chat template 应用失败：\(error.localizedDescription)")
+        }
+    }
+
+    // MARK: - 内部工具
+
+    private func truncate(_ ids: [Int], maxLength: Int) -> [Int] {
+        guard maxLength > 0, ids.count > maxLength else { return ids }
+        return Array(ids.prefix(maxLength))
+    }
+
+    private static func readJSON(_ url: URL) -> [String: Any]? {
+        guard let data = try? Data(contentsOf: url),
+              let object = try? JSONSerialization.jsonObject(with: data),
+              let dictionary = object as? [String: Any] else {
+            return nil
+        }
+        return dictionary
+    }
+}
+
+/// 将 `JSONValue` 递归转换为 Swift `Sendable` 容器，供 Jinja chat template 使用。
+private func sendableValue(_ value: JSONValue) -> any Sendable {
+    switch value {
+    case .null:
+        // 用 Optional<Int>.none 表示 null，避免依赖 NSNull 的 Sendable 标注。
+        return Int?.none
+    case .bool(let value):
+        return value
+    case .int(let value):
+        return value
+    case .double(let value):
+        return value
+    case .string(let value):
+        return value
+    case .array(let values):
+        return values.map { sendableValue($0) }
+    case .object(let object):
+        var result: [String: any Sendable] = [:]
+        for (key, value) in object {
+            result[key] = sendableValue(value)
+        }
+        return result
+    }
+}
+
+/// 把 `swift-transformers` 的 tokenizer 桥接给 `MLXLMCommon`。
+public final class MLXTokenizerBridge: MLXLMCommon.Tokenizer, @unchecked Sendable {
+    private let base: any Tokenizers.Tokenizer
+
+    public init(_ base: any Tokenizers.Tokenizer) {
+        self.base = base
+    }
+
+    public func encode(text: String, addSpecialTokens: Bool) -> [Int] {
+        base.encode(text: text, addSpecialTokens: addSpecialTokens)
+    }
+
+    public func decode(tokenIds: [Int], skipSpecialTokens: Bool) -> String {
+        base.decode(tokens: tokenIds, skipSpecialTokens: skipSpecialTokens)
+    }
+
+    public func convertTokenToId(_ token: String) -> Int? {
+        base.convertTokenToId(token)
+    }
+
+    public func convertIdToToken(_ id: Int) -> String? {
+        base.convertIdToToken(id)
+    }
+
+    public var bosToken: String? { base.bosToken }
+    public var eosToken: String? { base.eosToken }
+    public var unknownToken: String? { base.unknownToken }
+
+    public func applyChatTemplate(
+        messages: [[String: any Sendable]],
+        tools: [[String: any Sendable]]?,
+        additionalContext: [String: any Sendable]?
+    ) throws -> [Int] {
+        try base.applyChatTemplate(
+            messages: messages,
+            tools: tools,
+            additionalContext: additionalContext
+        )
+    }
+
+    /// 显式控制是否追加 generation prompt。
+    ///
+    /// 预热只缓存 system + tools 前缀，不能把 `<|im_start|>assistant` 头
+    /// 也预填充进去，否则正式请求的 user 增量会接在 assistant 头后面。
+    public func applyChatTemplate(
+        messages: [[String: any Sendable]],
+        tools: [[String: any Sendable]]?,
+        additionalContext: [String: any Sendable]?,
+        addGenerationPrompt: Bool
+    ) throws -> [Int] {
+        try base.applyChatTemplate(
+            messages: messages,
+            chatTemplate: nil,
+            addGenerationPrompt: addGenerationPrompt,
+            truncation: false,
+            maxLength: nil,
+            tools: tools,
+            additionalContext: additionalContext
+        )
+    }
+}
+
+/// 供 `MLXLLM` / `MLXVLM` 本地目录加载使用的 tokenizer loader。
+public struct LocalTokenizerLoader: MLXLMCommon.TokenizerLoader {
+    public init() {}
+
+    public func load(from directory: URL) async throws -> any MLXLMCommon.Tokenizer {
+        let tokenizer = try await LocalTokenizer.load(directory: directory)
+        return MLXTokenizerBridge(tokenizer.base)
+    }
+}

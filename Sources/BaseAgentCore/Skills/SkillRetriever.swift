@@ -1,0 +1,351 @@
+import Foundation
+
+/// 语义/混合检索返回的候选技能。
+public struct RetrievedSkill: Sendable, Equatable {
+    public var dir: String
+    public var name: String
+    public var tags: [String]
+    public var description: String
+    public var score: Double
+    public var bm25Score: Double
+
+    public init(dir: String, name: String, tags: [String], description: String,
+                score: Double, bm25Score: Double) {
+        self.dir = dir
+        self.name = name
+        self.tags = tags
+        self.description = description
+        self.score = score
+        self.bm25Score = bm25Score
+    }
+}
+
+/// 技能语义检索器。
+///
+/// 召回策略与 Python `skill_retriever.py` 对齐：
+/// 1. 向量通道：description（权重 0.6）+ examples（0.4），单通道阈值 0.5；
+/// 2. BM25 关键词通道；
+/// 3. 混合时向量得分优先，BM25 命中只作为补充（保证词面匹配不漏）；
+/// 4. 未注入 embedding 时仅使用 BM25，完全离线可用。
+public final class SkillRetriever {
+    public let manager: SkillManager
+    public var skillsDirectory: String { manager.skillsDirectory }
+    public var builtinDirectories: [String] { manager.builtinDirectories }
+
+    private let embedding: EmbeddingProvider?
+    private let lock = NSRecursiveLock()
+
+    private struct SkillVector {
+        var fingerprint: String
+        var description: [Float]
+        var examples: [Float]
+        var examplesEmpty: Bool
+    }
+
+    private struct BM25Doc {
+        var skill: Skill
+        var termFrequency: [String: Int]
+        var length: Int
+    }
+
+    private var vectors: [String: SkillVector] = [:]   // key = 技能绝对路径
+    private var bm25Docs: [BM25Doc] = []
+    private var idf: [String: Double] = [:]
+    private var averageLength: Double = 0
+    private var bm25Signature = ""
+    private var forceScan = false
+
+    private let k1 = 1.5
+    private let b = 0.75
+
+    public init(manager: SkillManager, embedding: EmbeddingProvider? = nil) {
+        self.manager = manager
+        self.embedding = embedding
+    }
+
+    public convenience init(skillsDirectory: String,
+                            builtinDirectories: [String] = [],
+                            embedding: EmbeddingProvider? = nil) {
+        self.init(manager: SkillManager(skillsDirectory: skillsDirectory,
+                                        builtinDirectories: builtinDirectories),
+                  embedding: embedding)
+    }
+
+    /// 便捷构造：主目录 `<workspace>/skills`。
+    public convenience init(workspace: String,
+                            builtinDirectories: [String] = [],
+                            embedding: EmbeddingProvider? = nil) {
+        self.init(manager: SkillManager(workspace: workspace,
+                                        builtinDirectories: builtinDirectories),
+                  embedding: embedding)
+    }
+
+    public func markStale() {
+        lock.lock(); forceScan = true; lock.unlock()
+        manager.markStale()
+    }
+
+    /// 读取技能目录（拒绝 `..` / 绝对路径；允许指向技能目录的外部软链接）。
+    public func readSkillDir(_ path: String) -> String? {
+        manager.resolveSkillDirectory(path)
+    }
+
+    /// 混合检索，返回带目录的候选。
+    public func retrieve(query: String, topK: Int = 5) async -> [RetrievedSkill] {
+        let q = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !q.isEmpty else { return [] }
+        let limit = max(1, min(topK, 20))
+        let skills = await refreshIndex()
+
+        let queryTokens = SkillTextTokenizer.tokens(q)
+        let rawBM25 = bm25Score(for: queryTokens)
+        // 与 Python 版一致：BM25 通道只取前 3 个候选。
+        let bm25Top = rawBM25.sorted {
+            if $0.value != $1.value { return $0.value > $1.value }
+            return $0.key < $1.key
+        }.prefix(3)
+        let bm25Scores = Dictionary(uniqueKeysWithValues: bm25Top.map { ($0.key, $0.value) })
+
+        var queryVector: [Float]?
+        if let embedding {
+            queryVector = try? await embedding.embedQuery(q)
+        }
+
+        var candidates: [String: RetrievedSkill] = [:]
+        var byPath: [String: Skill] = [:]
+        for skill in skills { byPath[skill.absolutePath] = skill }
+
+        // 1) 关键词通道
+        for (path, score) in bm25Scores where score > 0 {
+            guard let skill = byPath[path] else { continue }
+            candidates[path] = RetrievedSkill(
+                dir: skill.directory, name: skill.name, tags: skill.tags,
+                description: skill.description,
+                score: queryVector == nil ? score : 0,
+                bm25Score: score)
+        }
+
+        // 2) 向量通道（含对关键词命中的分数补齐）；取融合分前 topK 个候选。
+        //    不能用固定小窗口截断：技能少时会把语义正确的候选整个滤掉
+        //    （实测 4 技能取 3 时正确技能被截，BM25 候选又因 score 置 0 沉底）。
+        if let queryVector {
+            lock.lock(); let snapshot = vectors; lock.unlock()
+            var ranked: [(path: String, candidate: RetrievedSkill)] = []
+            for skill in skills {
+                guard let vector = snapshot[skill.absolutePath],
+                      vector.fingerprint == skill.fingerprint else { continue }
+                let descriptionScore = Self.cosine(queryVector, vector.description)
+                let fused: Double
+                if vector.examplesEmpty {
+                    fused = descriptionScore
+                } else {
+                    let examplesScore = Self.cosine(queryVector, vector.examples)
+                    fused = 0.6 * descriptionScore + 0.4 * examplesScore
+                }
+                let keywordScore = bm25Scores[skill.absolutePath] ?? 0
+                ranked.append((path: skill.absolutePath, candidate: RetrievedSkill(
+                    dir: skill.directory, name: skill.name, tags: skill.tags,
+                    description: skill.description,
+                    score: fused,
+                    bm25Score: keywordScore)))
+            }
+            ranked.sort {
+                if $0.candidate.score != $1.candidate.score {
+                    return $0.candidate.score > $1.candidate.score
+                }
+                return $0.path < $1.path
+            }
+            for item in ranked.prefix(limit) {
+                let keywordScore = bm25Scores[item.path] ?? 0
+                guard item.candidate.score >= 0.5 || keywordScore > 0 else { continue }
+                let existing = candidates[item.path]
+                candidates[item.path] = RetrievedSkill(
+                    dir: item.candidate.dir, name: item.candidate.name,
+                    tags: item.candidate.tags, description: item.candidate.description,
+                    score: max(item.candidate.score, existing?.score ?? 0),
+                    bm25Score: keywordScore)
+            }
+        }
+
+        return candidates.values.sorted {
+            if $0.score != $1.score { return $0.score > $1.score }
+            if $0.bm25Score != $1.bm25Score { return $0.bm25Score > $1.bm25Score }
+            return $0.name.localizedStandardCompare($1.name) == .orderedAscending
+        }.prefix(limit).map { $0 }
+    }
+
+    /// 转换成共享契约中的 `SkillSuggestion`。
+    public func suggestions(query: String, topK: Int = 5) async -> [SkillSuggestion] {
+        await retrieve(query: query, topK: topK).map {
+            SkillSuggestion(name: $0.name,
+                            description: $0.description,
+                            score: $0.score)
+        }
+    }
+
+    /// 释放内存索引（检索器仍可继续使用，下次会重建）。
+    public func close() {
+        lock.lock()
+        vectors = [:]
+        bm25Docs = []
+        idf = [:]
+        bm25Signature = ""
+        lock.unlock()
+    }
+
+    // MARK: - 索引同步
+
+    private func refreshIndex() async -> [Skill] {
+        lock.lock()
+        let force = forceScan
+        forceScan = false
+        lock.unlock()
+
+        let skills = manager.scan(force: force)
+        rebuildBM25(skills, force: force)
+
+        if let embedding {
+            await syncVectors(skills, embedding: embedding)
+        }
+        return skills
+    }
+
+    private func rebuildBM25(_ skills: [Skill], force: Bool) {
+        // 技能未变化时跳过全文分词：每次检索都对所有技能重新 tokenize
+        // 是纯粹的重复开销。
+        let signature = skills.map { "\($0.absolutePath)|\($0.fingerprint)" }
+            .joined(separator: "\n")
+        lock.lock()
+        let unchanged = !force && signature == bm25Signature && !bm25Docs.isEmpty
+        lock.unlock()
+        if unchanged { return }
+
+        var docs: [BM25Doc] = []
+        var documentFrequency: [String: Int] = [:]
+        var totalLength = 0
+
+        for skill in skills {
+            let text = String([
+                skill.name,
+                skill.tags.joined(separator: " "),
+                skill.description,
+                skill.whenToUse,
+                String(skill.examples.prefix(3_000)),
+            ].joined(separator: "\n").prefix(6_000))
+            let tokens = SkillTextTokenizer.tokens(text)
+            guard !tokens.isEmpty else { continue }
+            var tf: [String: Int] = [:]
+            for token in tokens { tf[token, default: 0] += 1 }
+            for token in Set(tokens) { documentFrequency[token, default: 0] += 1 }
+            docs.append(BM25Doc(skill: skill, termFrequency: tf, length: tokens.count))
+            totalLength += tokens.count
+        }
+
+        let count = Double(max(docs.count, 1))
+        var computedIDF: [String: Double] = [:]
+        for (token, df) in documentFrequency {
+            computedIDF[token] = log((count - Double(df) + 0.5) / (Double(df) + 0.5) + 1)
+        }
+
+        lock.lock()
+        bm25Docs = docs
+        idf = computedIDF
+        averageLength = docs.isEmpty ? 0 : Double(totalLength) / Double(docs.count)
+        bm25Signature = signature
+        // 清理已删除技能的向量，避免内存无界增长。
+        let alive = Set(skills.map(\.absolutePath))
+        vectors = vectors.filter { alive.contains($0.key) }
+        lock.unlock()
+    }
+
+    private func bm25Score(for queryTokens: [String]) -> [String: Double] {
+        guard !queryTokens.isEmpty else { return [:] }
+        lock.lock(); let docs = bm25Docs; let idfSnapshot = idf
+        let avg = averageLength; lock.unlock()
+        guard avg > 0 else { return [:] }
+
+        var scores: [String: Double] = [:]
+        for doc in docs {
+            var score = 0.0
+            for token in queryTokens {
+                guard let tf = doc.termFrequency[token], let tokenIDF = idfSnapshot[token] else {
+                    continue
+                }
+                let denominator = Double(tf) + k1 * (1 - b + b * Double(doc.length) / avg)
+                score += tokenIDF * Double(tf) * (k1 + 1) / denominator
+            }
+            if score > 0 {
+                scores[doc.skill.absolutePath] = score
+            }
+        }
+        return scores
+    }
+
+    private func syncVectors(_ skills: [Skill], embedding: EmbeddingProvider) async {
+        var missing: [Skill] = []
+        lock.lock()
+        for skill in skills {
+            if vectors[skill.absolutePath]?.fingerprint != skill.fingerprint {
+                missing.append(skill)
+            }
+        }
+        lock.unlock()
+        guard !missing.isEmpty else { return }
+
+        let descriptionTexts = missing.map { skill in
+            String((skill.description.isEmpty ? skill.name : skill.description).prefix(2_000))
+        }
+        let exampleTexts = missing.map { skill in
+            let source = skill.examples.isEmpty ? skill.description : skill.examples
+            return String((source.isEmpty ? skill.name : source).prefix(3_000))
+        }
+
+        do {
+            // 描述与示例经常完全相同（无 examples 时回退 description）：
+            // 去重后只 embed 一次，长技能列表下能省掉近一半推理。
+            var order: [String] = []
+            var seen = Set<String>()
+            for text in descriptionTexts + exampleTexts where seen.insert(text).inserted {
+                order.append(text)
+            }
+            var cache: [String: [Float]] = [:]
+            var offset = 0
+            while offset < order.count {
+                try Task.checkCancellation()
+                let batch = Array(order[offset..<min(offset + 32, order.count)])
+                let embedded = try await embedding.embedDocuments(batch)
+                guard embedded.count == batch.count else {
+                    throw AgentError.storage("skill_retriever embedding 数量不一致")
+                }
+                for (text, vector) in zip(batch, embedded) { cache[text] = vector }
+                offset += batch.count
+            }
+            lock.lock()
+            for (index, skill) in missing.enumerated() {
+                guard let descriptionVector = cache[descriptionTexts[index]],
+                      let exampleVector = cache[exampleTexts[index]] else { continue }
+                vectors[skill.absolutePath] = SkillVector(
+                    fingerprint: skill.fingerprint,
+                    description: descriptionVector,
+                    examples: exampleVector,
+                    examplesEmpty: skill.examples.isEmpty)
+            }
+            lock.unlock()
+        } catch {
+            AgentLog.warning("skill_retriever: 语义索引不可用，回退 BM25: \(error.localizedDescription)")
+        }
+    }
+
+    private static func cosine(_ a: [Float], _ b: [Float]) -> Double {
+        guard a.count == b.count, !a.isEmpty else { return 0 }
+        var dot = 0.0, na = 0.0, nb = 0.0
+        for i in 0..<a.count {
+            let x = Double(a[i]), y = Double(b[i])
+            dot += x * y
+            na += x * x
+            nb += y * y
+        }
+        let denominator = na.squareRoot() * nb.squareRoot()
+        return denominator > 0 ? max(0, min(1, dot / denominator)) : 0
+    }
+}

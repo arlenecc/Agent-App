@@ -1,0 +1,816 @@
+import Foundation
+import SwiftSoup
+
+// MARK: - 工具层错误
+
+/// 工具内部可预期的失败。工具通常把它转成 `ToolResult.fail`，不让异常穿透到
+/// registry（与 Python 工具直接返回 ToolResult 的语义一致）。
+public enum ToolError: Error, LocalizedError {
+    case message(String)
+
+    public var errorDescription: String? {
+        switch self {
+        case .message(let text): return text
+        }
+    }
+
+    public var message: String {
+        switch self {
+        case .message(let text): return text
+        }
+    }
+}
+
+// MARK: - 公共辅助
+
+/// 基础工具层共享的辅助函数：工作区路径安全解析、参数校验、体积/超时限制、
+/// head+tail 截断、受限进程执行、HTML/Markdown 文本化与错误包装。
+public enum ToolSupport {
+
+    // MARK: 限制常量（对齐 Python tools）
+
+    /// file_read 单次返回的最大字符数。
+    public static let maxReadChars = 200_000
+    /// file_write 单次写入的最大字符数（读取上限的 5 倍）。
+    public static let maxWriteChars = 5 * maxReadChars
+    /// file_modify 允许整文件读入的最大字节数。
+    public static let maxModifyBytes = 10 * 1024 * 1024
+    /// shell_run/code_run 单路 stdout/stderr 的字符上限。
+    public static let maxOutputChars = 200_000
+    /// 进程超时的上下限（秒）。
+    public static let minTimeout: Double = 1
+    public static let maxTimeout: Double = 600
+    /// web_scan 单次抓取的最大字节数。
+    public static let maxFetchBytes = 8 * 1024 * 1024
+    /// 交给 HTML 解析器的最大字符数。
+    public static let maxParseChars = 2 * 1024 * 1024
+
+    // MARK: JSON Schema 构造
+
+    /// 构造工具参数 JSON Schema（type=object）。
+    public static func objectSchema(properties: [String: JSONValue],
+                                    required: [String] = []) -> JSONValue {
+        .object([
+            "type": .string("object"),
+            "properties": .object(properties),
+            "required": .array(required.map { .string($0) }),
+        ])
+    }
+
+    /// `{"type":"string","description":...}` 参数项。
+    public static func stringProperty(_ description: String,
+                                      enumValues: [String]? = nil) -> JSONValue {
+        var object: [String: JSONValue] = [
+            "type": .string("string"),
+            "description": .string(description),
+        ]
+        if let enumValues {
+            object["enum"] = .array(enumValues.map { .string($0) })
+        }
+        return .object(object)
+    }
+
+    /// `{"type":"boolean","description":...}` 参数项。
+    public static func boolProperty(_ description: String) -> JSONValue {
+        .object([
+            "type": .string("boolean"),
+            "description": .string(description),
+        ])
+    }
+
+    /// `{"type":"number","description":...}` 参数项。
+    public static func numberProperty(_ description: String) -> JSONValue {
+        .object([
+            "type": .string("number"),
+            "description": .string(description),
+        ])
+    }
+
+    /// `{"type":"array","description":...,"items":...}` 参数项。
+    public static func arrayProperty(_ description: String,
+                                     items: JSONValue) -> JSONValue {
+        .object([
+            "type": .string("array"),
+            "description": .string(description),
+            "items": items,
+        ])
+    }
+
+    // MARK: 参数读取与校验
+
+    /// 读取必填字符串参数；缺失/null 抛 `ToolError`。
+    /// 非字符串标量按 Python `str()` 语义强制转换，容器类型转成紧凑 JSON。
+    public static func requireString(_ args: [String: JSONValue],
+                                     _ key: String) throws -> String {
+        guard let value = args[key], !value.isNull else {
+            throw ToolError.message("missing required argument: \(key)")
+        }
+        return coerceString(value)
+    }
+
+    /// 读取可选字符串参数；缺失/null 返回 nil。
+    public static func optionalString(_ args: [String: JSONValue],
+                                      _ key: String) -> String? {
+        guard let value = args[key], !value.isNull else { return nil }
+        return coerceString(value)
+    }
+
+    /// 读取字符串参数，缺失/null 返回默认值。
+    public static func string(_ args: [String: JSONValue],
+                              _ key: String,
+                              default defaultValue: String = "") -> String {
+        optionalString(args, key) ?? defaultValue
+    }
+
+    public static func optionalBool(_ args: [String: JSONValue],
+                                    _ key: String) -> Bool? {
+        guard let value = args[key] else { return nil }
+        return value.boolValue
+    }
+
+    public static func bool(_ args: [String: JSONValue],
+                            _ key: String,
+                            default defaultValue: Bool = false) -> Bool {
+        optionalBool(args, key) ?? defaultValue
+    }
+
+    public static func optionalDouble(_ args: [String: JSONValue],
+                                      _ key: String) -> Double? {
+        guard let value = args[key] else { return nil }
+        return value.doubleValue
+    }
+
+    public static func double(_ args: [String: JSONValue],
+                              _ key: String,
+                              default defaultValue: Double) -> Double {
+        optionalDouble(args, key) ?? defaultValue
+    }
+
+    public static func optionalInt(_ args: [String: JSONValue],
+                                   _ key: String) -> Int? {
+        guard let value = args[key] else { return nil }
+        return value.intValue
+    }
+
+    /// 与 Python `str(value)` 等价的宽松转换。
+    public static func coerceString(_ value: JSONValue) -> String {
+        switch value {
+        case .string(let s): return s
+        case .int(let i): return String(i)
+        case .double(let d): return String(d)
+        case .bool(let b): return b ? "true" : "false"
+        case .null: return ""
+        case .array, .object: return value.jsonString()
+        }
+    }
+
+    /// 把超时钳制到 [1, 600] 秒；畸形值回退默认值。
+    public static func clampTimeout(_ value: Double?, default defaultValue: Double) -> Double {
+        let candidate = value ?? defaultValue
+        guard candidate.isFinite else { return defaultValue }
+        return max(minTimeout, min(candidate, maxTimeout))
+    }
+
+    // MARK: 错误包装
+
+    /// 把任意错误转成给模型看的稳定文案。
+    public static func errorText(_ error: Error) -> String {
+        if let toolError = error as? ToolError {
+            return toolError.message
+        }
+        if let agentError = error as? AgentError {
+            return agentError.errorDescription ?? agentError.localizedDescription
+        }
+        let nsError = error as NSError
+        return "\(nsError.domain)(\(nsError.code)): \(nsError.localizedDescription)"
+    }
+
+    /// 统一把错误包装成失败结果。
+    public static func failure(_ error: Error) -> ToolResult {
+        .fail(errorText(error))
+    }
+
+    // MARK: 工作区路径安全
+
+    /// 解析路径并锁定在 workspace 内。
+    ///
+    /// - 相对路径按 workspace 拼接；绝对路径必须落在 workspace 内。
+    /// - 使用 `resolvingSymlinksInPath` 解析符号链接后再做前缀比对，避免
+    ///   workspace 内的 symlink 指向外部目录时绕过检查。
+    /// - 越界抛 `ToolError`（文案与 Python 一致）。
+    public static func resolveWorkspacePath(_ path: String,
+                                            workspace: String) throws -> String {
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            throw ToolError.message("path is required")
+        }
+        let ws = realPath(workspace)
+        let candidate: String
+        if trimmed.hasPrefix("/") {
+            candidate = trimmed
+        } else {
+            candidate = (ws as NSString).appendingPathComponent(trimmed)
+        }
+        let full = realPath(candidate)
+        guard full == ws || full.hasPrefix(ws + "/") else {
+            throw ToolError.message("Path '\(path)' is outside the workspace")
+        }
+        return full
+    }
+
+    /// 解析符号链接并标准化路径（等价 Python os.path.realpath）。
+    public static func realPath(_ path: String) -> String {
+        URL(fileURLWithPath: path)
+            .resolvingSymlinksInPath()
+            .standardizedFileURL
+            .path
+    }
+
+    /// workspace/.agent/<name> 状态文件路径。
+    public static func stateFile(_ name: String, workspace: String) -> String {
+        URL(fileURLWithPath: workspace)
+            .appendingPathComponent(".agent", isDirectory: true)
+            .appendingPathComponent(name)
+            .path
+    }
+
+    public static func fileSize(_ path: String) -> Int {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: path)
+        return (attributes?[.size] as? NSNumber)?.intValue ?? 0
+    }
+
+    // MARK: 输出截断
+
+    /// 保留头 + 尾的截断：超长输出里最有价值的信息往往在末尾（报错摘要）。
+    public static func truncateHeadTail(_ text: String,
+                                        limit: Int = maxOutputChars,
+                                        tailRatio: Double = 0.25) -> String {
+        let count = text.count
+        guard count > limit else { return text }
+        let tailBudget = Int(Double(limit) * tailRatio)
+        let headBudget = max(0, limit - tailBudget)
+        return String(text.prefix(headBudget))
+            + "\n… [输出超过 \(limit) 字符，中间已截断] …\n"
+            + String(text.suffix(tailBudget))
+    }
+
+    /// 按行去空白并丢弃空行（web 正文清洗用）。
+    public static func normalizeLines(_ text: String) -> String {
+        text.components(separatedBy: .newlines)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n")
+    }
+
+    /// 合并 stdout/stderr（与 Python `_combine` 格式一致）。
+    public static func combineOutput(stdout: String, stderr: String) -> String {
+        guard !stderr.isEmpty else { return stdout }
+        return stdout + (stdout.isEmpty ? "" : "\n") + "[stderr]\n" + stderr
+    }
+
+    // MARK: UTF-8 解码
+
+    /// 解码 UTF-8 前缀；若末尾截断了多字节字符，最多回退 3 字节再试。
+    /// 返回 nil 表示内容不是合法 UTF-8（按二进制处理）。
+    public static func decodeUTF8Prefix(_ data: Data) -> String? {
+        if let text = String(data: data, encoding: .utf8) {
+            return text
+        }
+        guard data.count > 1 else { return nil }
+        for drop in 1...min(3, data.count - 1) {
+            let trimmed = Data(data.dropLast(drop))
+            if let text = String(data: trimmed, encoding: .utf8) {
+                return text
+            }
+        }
+        return nil
+    }
+
+    // MARK: 进程环境
+
+    /// 为子进程准备一份干净的环境：去掉会污染解释器启动的变量，
+    /// 固定 UTF-8 输出，关闭颜色/分页交互。
+    public static func sanitizedEnvironment(overrides: [String: String] = [:]) -> [String: String] {
+        var env = ProcessInfo.processInfo.environment
+        env.removeValue(forKey: "PYTHONSTARTUP")
+        env.removeValue(forKey: "PYTHONHOME")
+        env.removeValue(forKey: "PYTHONBREAKPOINT")
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUNBUFFERED"] = "1"
+        env["NO_COLOR"] = "1"
+        env["TERM"] = env["TERM"] ?? "dumb"
+        if env["LANG"] == nil { env["LANG"] = "en_US.UTF-8" }
+        for (key, value) in overrides { env[key] = value }
+        return env
+    }
+
+    // MARK: HTML / Markdown 文本化
+
+    /// SwiftSoup 提取网页可见正文：移除 script/style/noscript，按块级元素换行。
+    public static func htmlToText(_ html: String, maxChars: Int = maxParseChars) -> String {
+        let limited = String(html.prefix(maxChars))
+        guard let document = try? SwiftSoup.parse(limited) else {
+            return normalizeLines(stripTags(limited))
+        }
+        _ = try? document.select("script, style, noscript").remove()
+
+        var lines: [String] = []
+        var current = ""
+        if let body = document.body() {
+            collectHTMLText(body, lines: &lines, current: &current)
+        } else {
+            collectHTMLText(document, lines: &lines, current: &current)
+        }
+        flushHTMLText(&current, lines: &lines)
+
+        let text = normalizeLines(lines.joined(separator: "\n"))
+        if !text.isEmpty { return text }
+        return normalizeLines((try? document.text()) ?? stripTags(limited))
+    }
+
+    /// 列表页 / SPA 动态加载检测：提取正文过短且页面存在 AJAX/前端框架特征时，
+    /// 返回降级提示（分析数据接口直接调用 / webexec_js 浏览器渲染 / curl 诊断）。
+    /// 避免模型把「加载占位」误当有效内容或直接断定站点无信息。
+    /// 条件是「正文短 + 特征同时存在」，正常短页面不会误报。
+    /// 同时附上从页面里提取的数据源线索（候选接口、JS 引用、iframe），
+    /// 让模型少一轮摸索即可定位真正的数据来源。
+    static func dynamicLoadingHint(html: String, extracted: String) -> String {
+        let visible = extracted.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard visible.count < 300 else { return "" }
+
+        let lowered = html.lowercased()
+        var signals: [String] = []
+        // 前端框架挂载点：body 里只有挂载容器，正文必然是空壳。
+        if lowered.contains("id=\"root\"") || lowered.contains("id=\"app\"")
+            || lowered.contains("id=\"__next\"") || lowered.contains("data-reactroot")
+            || lowered.contains("__nuxt__") || lowered.contains("ng-app") {
+            signals.append("前端框架挂载点")
+        }
+        // 加载占位元素：数据由 AJAX 填充的典型标志。
+        if lowered.range(of: "class=\"[^\"]*(loader|loading|skeleton|spinner)",
+                         options: .regularExpression) != nil {
+            signals.append("加载占位元素（loader/skeleton/spinner）")
+        }
+        // 页面内 AJAX 调用代码。
+        if lowered.contains("xmlhttprequest") || lowered.contains("$.ajax")
+            || lowered.contains("axios") || lowered.contains("fetch(") {
+            signals.append("AJAX 请求代码")
+        }
+        // 正文为空但内容在 iframe 里（主文档只是壳）。
+        let iframes = extractIframeSources(html: html)
+        if signals.isEmpty && iframes.isEmpty { return "" }
+
+        var lines: [String] = []
+        let apiHints = extractAPIEndpointHints(html: html)
+        if !apiHints.isEmpty {
+            lines.append("候选数据接口：\(apiHints.joined(separator: ", "))")
+        }
+        let scripts = extractScriptSources(html: html)
+        if !scripts.isEmpty {
+            lines.append("页面 JS 引用：\(scripts.joined(separator: ", "))")
+        }
+        if !iframes.isEmpty {
+            lines.append("内嵌 iframe：\(iframes.joined(separator: ", "))")
+        }
+        var hint = "\n\n[web_scan 提示] 本页提取正文仅 \(visible.count) 字符，且检测到动态加载"
+            + "特征（\(signals.joined(separator: "、"))）——页面内容很可能由 JS 动态加载，"
+            + "web_scan 只能拿到加载占位。建议：1) 优先检查下面的数据源线索，用 "
+            + "shell_run/code_run 直接调用数据接口，通常能拿到结构化数据；"
+            + "2) 若需要交互（点击/填表/滚动加载），用 web_render 的 script 参数执行 JS；"
+            + "3) 或 webexec_js 经外部浏览器桥渲染（需配置 browser_endpoint）。"
+        if !lines.isEmpty {
+            hint += "\n已定位的数据源线索：\n" + lines.joined(separator: "\n")
+        }
+        return hint
+    }
+
+    /// 提取页面内 iframe 的 src（按出现顺序去重，含相对路径原文）。
+    static func extractIframeSources(html: String, limit: Int = 5) -> [String] {
+        guard let document = try? SwiftSoup.parse(html),
+              let frames = try? document.select("iframe[src]") else { return [] }
+        var seen = Set<String>()
+        var urls: [String] = []
+        for frame in frames.array() {
+            guard urls.count < limit else { break }
+            guard let src = try? frame.attr("src"), !src.isEmpty else { continue }
+            let trimmed = src.trimmingCharacters(in: .whitespaces)
+            if seen.insert(trimmed).inserted { urls.append(trimmed) }
+        }
+        return urls
+    }
+
+    /// 提取页面 script[src] 引用（按出现顺序去重），供降级提示定位数据加载逻辑。
+    static func extractScriptSources(html: String, limit: Int = 5) -> [String] {
+        guard let document = try? SwiftSoup.parse(html),
+              let scripts = try? document.select("script[src]") else { return [] }
+        var seen = Set<String>()
+        var urls: [String] = []
+        for script in scripts.array() {
+            guard urls.count < limit else { break }
+            guard let src = try? script.attr("src"), !src.isEmpty else { continue }
+            if seen.insert(src).inserted { urls.append(src) }
+        }
+        return urls
+    }
+
+    /// 从页面源码提取候选数据接口路径（含 api/ajax/ashx/asmx/search/query/json/graphql
+    /// 特征的站内 URL），供降级提示直接给出可调用的端点。
+    static func extractAPIEndpointHints(html: String, limit: Int = 5) -> [String] {
+        // 字符类含 ?=&%*,~：带查询参数的接口 URL（/api/x?k=v）不能被截断丢弃。
+        let pattern = "[\"'](/[A-Za-z0-9_./?=&%*,~-]*(?:api|ajax|ashx|asmx|search|query|json|graphql)[A-Za-z0-9_./?=&%*,~-]*)[\"']"
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return [] }
+        let range = NSRange(html.startIndex..., in: html)
+        var seen = Set<String>()
+        var hits: [String] = []
+        for match in regex.matches(in: html, range: range) {
+            guard hits.count < limit else { break }
+            guard let r = Range(match.range(at: 1), in: html) else { continue }
+            let url = String(html[r])
+            if seen.insert(url).inserted { hits.append(url) }
+        }
+        return hits
+    }
+
+    private static func collectHTMLText(_ node: Node,
+                                        lines: inout [String],
+                                        current: inout String) {
+        if let textNode = node as? TextNode {
+            current += textNode.text()
+            return
+        }
+        guard let element = node as? Element else { return }
+        let tag = element.tagName().lowercased()
+        if ["script", "style", "noscript"].contains(tag) { return }
+        if tag == "br" {
+            current += "\n"
+            return
+        }
+        let isBlock = htmlBlockTags.contains(tag)
+        if isBlock { flushHTMLText(&current, lines: &lines) }
+        for child in element.getChildNodes() {
+            collectHTMLText(child, lines: &lines, current: &current)
+        }
+        if isBlock { flushHTMLText(&current, lines: &lines) }
+    }
+
+    private static func flushHTMLText(_ current: inout String, lines: inout [String]) {
+        let collapsed = current.replacingOccurrences(of: #"[ \t\r\n]+"#,
+                                                     with: " ",
+                                                     options: .regularExpression)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        if !collapsed.isEmpty { lines.append(collapsed) }
+        current = ""
+    }
+
+    private static let htmlBlockTags: Set<String> = [
+        "p", "div", "section", "article", "header", "footer", "aside", "main",
+        "h1", "h2", "h3", "h4", "h5", "h6", "ul", "ol", "li", "dl", "dt", "dd",
+        "table", "thead", "tbody", "tfoot", "tr", "td", "th", "pre", "blockquote",
+        "figure", "figcaption", "form", "fieldset", "address",
+    ]
+
+    /// 极简标签剥离（SwiftSoup 解析失败时的兜底）。
+    private static func stripTags(_ html: String) -> String {
+        var text = html
+        for pattern in [#"<script.*?</script>"#, #"<style.*?</style>"#] {
+            text = text.replacingOccurrences(of: pattern, with: " ",
+                                             options: [.regularExpression, .caseInsensitive])
+        }
+        text = text.replacingOccurrences(of: #"<[^>]+>"#, with: " ",
+                                         options: .regularExpression)
+        return text
+    }
+
+    /// 去掉常见的 Markdown 语法标记，得到可直接阅读的纯文本。
+    public static func markdownToPlainText(_ markdown: String) -> String {
+        var text = markdown
+        text = text.replacingOccurrences(of: #"(?m)^#{1,6}\s+"#, with: "",
+                                         options: .regularExpression)
+        text = text.replacingOccurrences(of: #"!\[([^\]]*)\]\([^)]*\)"#, with: "$1",
+                                         options: .regularExpression)
+        text = text.replacingOccurrences(of: #"\[([^\]]+)\]\([^)]*\)"#, with: "$1",
+                                         options: .regularExpression)
+        text = text.replacingOccurrences(of: #"[*_]{1,3}([^*_\n]+)[*_]{1,3}"#, with: "$1",
+                                         options: .regularExpression)
+        text = text.replacingOccurrences(of: #"`([^`]+)`"#, with: "$1",
+                                         options: .regularExpression)
+        text = text.replacingOccurrences(of: "\n{3,}", with: "\n\n",
+                                         options: .regularExpression)
+        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+}
+
+// MARK: - 有界输出收集器
+
+/// 线程安全的有界输出收集器：保留头部与尾部，中间截断。
+/// `readabilityHandler` 在内部队列回调，多个数据块会并发进入。
+public final class BoundedOutputCollector: @unchecked Sendable {
+    private let lock = NSLock()
+    private let limit: Int
+    private let headBudget: Int
+    private let tailBudget: Int
+    private var head = ""
+    private var tail = ""
+    private var truncated = false
+
+    public init(limit: Int = ToolSupport.maxOutputChars, tailRatio: Double = 0.25) {
+        self.limit = limit
+        let tail = Int(Double(limit) * tailRatio)
+        self.tailBudget = tail
+        self.headBudget = max(0, limit - tail)
+    }
+
+    public func feed(_ text: String) {
+        guard !text.isEmpty else { return }
+        lock.lock()
+        defer { lock.unlock() }
+
+        if !truncated {
+            let room = headBudget - head.count
+            if text.count <= room {
+                head += text
+                return
+            }
+            if room > 0 {
+                head += String(text.prefix(room))
+                truncated = true
+                appendTail(String(text.dropFirst(room)))
+            } else {
+                truncated = true
+                appendTail(text)
+            }
+            return
+        }
+        appendTail(text)
+    }
+
+    private func appendTail(_ text: String) {
+        guard !text.isEmpty else { return }
+        tail += text
+        if tail.count > tailBudget {
+            tail = String(tail.suffix(tailBudget))
+        }
+    }
+
+    public func value() -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        var text = head
+        if truncated {
+            text += "\n… [输出超过 \(limit) 字符，中间已截断] …"
+        }
+        return text + tail
+    }
+}
+
+// MARK: - 受限进程执行
+
+/// 一次进程执行的结果。
+public struct ProcessOutcome: Sendable {
+    public var stdout: String
+    public var stderr: String
+    public var exitCode: Int32?
+    public var timedOut: Bool
+    public var cancelled: Bool
+    /// 进程未能启动时的错误文案；正常执行时为 nil。
+    public var launchError: String?
+
+    public init(stdout: String = "", stderr: String = "", exitCode: Int32? = nil,
+                timedOut: Bool = false, cancelled: Bool = false,
+                launchError: String? = nil) {
+        self.stdout = stdout
+        self.stderr = stderr
+        self.exitCode = exitCode
+        self.timedOut = timedOut
+        self.cancelled = cancelled
+        self.launchError = launchError
+    }
+}
+
+/// Foundation.Process 的封装：受限输出、超时/取消、优雅终止。
+///
+/// 说明：Foundation 的 `Process` 不暴露 `start_new_session`，因此这里对
+/// 子进程先发 SIGTERM、宽限期后 SIGKILL。只有在子进程组 id 等于自身 pid
+/// （即它是组长）时才发 `kill(-pid)`，避免误杀与父进程同组的其他进程。
+public enum ToolProcessRunner {
+
+    /// 在指定目录执行进程并等待结束。
+    public static func run(executable: String,
+                           arguments: [String],
+                           currentDirectory: String? = nil,
+                           environment: [String: String]? = nil,
+                           timeout: Double,
+                           shouldCancel: @escaping () -> Bool = { false }) async -> ProcessOutcome {
+        let outCollector = BoundedOutputCollector()
+        let errCollector = BoundedOutputCollector()
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        let drainGroup = DispatchGroup()
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executable)
+        process.arguments = arguments
+        if let currentDirectory {
+            process.currentDirectoryURL = URL(fileURLWithPath: currentDirectory)
+        }
+        process.environment = environment ?? ToolSupport.sanitizedEnvironment()
+        process.standardInput = FileHandle.nullDevice
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+
+        do {
+            try process.run()
+        } catch {
+            try? stdoutPipe.fileHandleForReading.close()
+            try? stderrPipe.fileHandleForReading.close()
+            return ProcessOutcome(launchError: "Failed to start \(executable): \(ToolSupport.errorText(error))")
+        }
+
+        // 启动成功后再挂读取回调：管道里已有的数据会在 handler 安装后立即到达。
+        drainGroup.enter()
+        drainGroup.enter()
+        attachReader(stdoutPipe.fileHandleForReading, collector: outCollector, group: drainGroup)
+        attachReader(stderrPipe.fileHandleForReading, collector: errCollector, group: drainGroup)
+
+        let deadline = Date().addingTimeInterval(timeout)
+        var timedOut = false
+        var cancelled = false
+
+        // 0.15s 粒度轮询：超时与 UI「终止对话」都要能及时打断。
+        while process.isRunning {
+            if Task.isCancelled || shouldCancel() {
+                cancelled = true
+                break
+            }
+            if Date() >= deadline {
+                timedOut = true
+                break
+            }
+            try? await Task.sleep(nanoseconds: 150_000_000)
+        }
+
+        if timedOut || cancelled {
+            await terminate(process)
+        }
+
+        // 等待回收（SIGKILL 后极端情况下仍需几百毫秒）。
+        let reapDeadline = Date().addingTimeInterval(5)
+        while process.isRunning && Date() < reapDeadline {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        if process.isRunning {
+            sendSignal(process.processIdentifier, SIGKILL)
+        }
+
+        // 给读线程留时间排空管道；孙进程持有写端时最多等 2 秒就放弃。
+        let drainDeadline = Date().addingTimeInterval(2)
+        while drainGroup.wait(timeout: .now()) != .success && Date() < drainDeadline {
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+
+        stdoutPipe.fileHandleForReading.readabilityHandler = nil
+        stderrPipe.fileHandleForReading.readabilityHandler = nil
+        try? stdoutPipe.fileHandleForReading.close()
+        try? stderrPipe.fileHandleForReading.close()
+
+        let exitCode: Int32? = process.isRunning ? nil : process.terminationStatus
+        return ProcessOutcome(stdout: outCollector.value(),
+                              stderr: errCollector.value(),
+                              exitCode: exitCode,
+                              timedOut: timedOut,
+                              cancelled: cancelled)
+    }
+
+    // MARK: 内部实现
+
+    private static func attachReader(_ handle: FileHandle,
+                                     collector: BoundedOutputCollector,
+                                     group: DispatchGroup) {
+        let eof = EOFGuard()
+        let decoder = UTF8StreamDecoder()
+        handle.readabilityHandler = { readable in
+            let data = readable.availableData
+            if data.isEmpty {
+                if eof.markDone() {
+                    readable.readabilityHandler = nil
+                    collector.feed(decoder.finish())
+                    group.leave()
+                }
+                return
+            }
+            collector.feed(decoder.decode(data))
+        }
+    }
+
+    /// SIGTERM → 3 秒宽限 → SIGKILL。先递归终止子进程，避免 npx/shell 留下孤儿。
+    private static func terminate(_ process: Process) async {
+        guard process.isRunning else { return }
+        let pid = process.processIdentifier
+        terminateProcessTree(pid: pid, signal: SIGTERM)
+        let deadline = Date().addingTimeInterval(3)
+        while process.isRunning && Date() < deadline {
+            try? await Task.sleep(nanoseconds: 50_000_000)
+        }
+        if process.isRunning {
+            terminateProcessTree(pid: pid, signal: SIGKILL)
+        }
+    }
+
+    /// 递归终止进程树（先子后父）。仅用于本进程启动的工具子进程。
+    public static func terminateProcessTree(pid: pid_t, signal: Int32) {
+        guard pid > 0 else { return }
+        for child in descendants(of: pid).reversed() {
+            sendSignal(child, signal)
+        }
+        sendSignal(pid, signal)
+    }
+
+    private static func descendants(of pid: pid_t) -> [pid_t] {
+        var result: [pid_t] = []
+        for child in childPIDs(of: pid) {
+            result.append(contentsOf: descendants(of: child))
+            result.append(child)
+        }
+        return result
+    }
+
+    private static func childPIDs(of pid: pid_t) -> [pid_t] {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/usr/bin/pgrep")
+        process.arguments = ["-P", String(pid)]
+        let pipe = Pipe()
+        process.standardOutput = pipe
+        process.standardError = FileHandle.nullDevice
+        do {
+            try process.run()
+        } catch {
+            return []
+        }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        process.waitUntilExit()
+        return String(decoding: data, as: UTF8.self)
+            .split(whereSeparator: \.isNewline)
+            .compactMap { pid_t($0.trimmingCharacters(in: .whitespaces)) }
+    }
+
+    /// 只对「自身即进程组长」的子进程发组信号，避免误杀父进程所在的组。
+    private static func sendSignal(_ pid: pid_t, _ signal: Int32) {
+        guard pid > 0 else { return }
+        let pgid = getpgid(pid)
+        if pgid == pid {
+            kill(-pid, signal)
+        } else {
+            kill(pid, signal)
+        }
+    }
+}
+
+/// 跨数据块的增量 UTF-8 解码器：管道读取可能把多字节字符切成两半，
+/// 逐块 `String(decoding:)` 会在切分处产生替换字符。
+private final class UTF8StreamDecoder: @unchecked Sendable {
+    private var pending = Data()
+    private var broken = false
+
+    func decode(_ data: Data) -> String {
+        guard !broken else { return String(decoding: data, as: UTF8.self) }
+
+        var combined = pending
+        combined.append(data)
+        if let text = String(data: combined, encoding: .utf8) {
+            pending = Data()
+            return text
+        }
+        // 末尾可能是不完整的多字节序列：最多回退 3 字节，余下留到下一块。
+        for drop in 1...min(3, combined.count) {
+            if let text = String(data: Data(combined.dropLast(drop)), encoding: .utf8) {
+                pending = Data(combined.suffix(drop))
+                return text
+            }
+        }
+        // 中间存在非法字节：降级为有损解码，后续不再尝试拼接。
+        broken = true
+        pending = Data()
+        return String(decoding: combined, as: UTF8.self)
+    }
+
+    func finish() -> String {
+        guard !pending.isEmpty else { return "" }
+        let text = String(decoding: pending, as: UTF8.self)
+        pending = Data()
+        return text
+    }
+}
+
+/// readabilityHandler 的 EOF 只处理一次（回调可能在内部队列重复触发）。
+private final class EOFGuard: @unchecked Sendable {
+    private let lock = NSLock()
+    private var done = false
+
+    func markDone() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if done { return false }
+        done = true
+        return true
+    }
+}

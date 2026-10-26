@@ -1,0 +1,13 @@
+# Swift / SPM 构建产物
+.build/
+*.o
+*.xcodeproj
+
+# 应用打包产物
+dist/
+
+# 本地模型权重（体量大，另行分发）
+models/
+
+# 系统文件
+.DS_Store

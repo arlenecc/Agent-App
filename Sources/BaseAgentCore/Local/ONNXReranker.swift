@@ -1,0 +1,227 @@
+import Foundation
+
+/// bge-reranker-v2-m3(-int8) 的 ONNX 交叉编码器实现。
+///
+/// 输入为 query/document pair，模型输出单个相关性 logit；
+/// 这里统一做数值稳定的 sigmoid，返回 `0...1` 的分数。
+public final class ONNXReranker: RerankProvider, @unchecked Sendable {
+    public let identifier: String
+    public let modelName: String
+    public let directory: URL
+
+    private let modelURL: URL?
+    private let preflightError: Error?
+    private let maxLength: Int
+    private let batchSize: Int
+    private let state = RerankerLoadState()
+
+    public init(directory: URL, modelName: String, batchSize: Int = 8) {
+        self.directory = directory
+        self.modelName = modelName
+        self.identifier = "local:onnx:\(modelName)"
+        // XLM-R 系 ONNX 图内自算 position id（cumsum + padding_idx=1），
+        // 有效长度是 tokenizer 声明的 model_max_length（如 base 为 512），
+        // 直接用 config 的 max_position_embeddings（514）会在长 pair 上 Gather 越界。
+        self.maxLength = min(
+            LocalModelRegistry.resolveMaxSequenceLength(directory: directory, defaultValue: 8192),
+            LocalModelRegistry.tokenizerModelMaxLength(directory: directory) ?? 8_192)
+        self.batchSize = max(1, batchSize)
+
+        var resolved: URL?
+        var loadError: Error?
+        do {
+            resolved = try LocalModelRegistry.resolveONNXModel(in: directory, kind: .reranker)
+        } catch {
+            loadError = error
+        }
+        self.modelURL = resolved
+        self.preflightError = loadError
+    }
+
+    // MARK: - RerankProvider
+
+    public func rerank(query: String, documents: [String]) async throws -> [Double] {
+        guard !documents.isEmpty else { return [] }
+        if let preflightError { throw preflightError }
+        guard let modelURL else {
+            throw LocalModelError.runtime("Reranker 模型路径未解析：\(directory.path)")
+        }
+
+        let (session, tokenizer) = try await state.handles(
+            modelURL: modelURL,
+            directory: directory
+        )
+        let outputName = preferredOutputName(in: session)
+        var scores: [Double] = []
+        scores.reserveCapacity(documents.count)
+
+        var start = 0
+        while start < documents.count {
+            try Task.checkCancellation()
+            let end = min(start + batchSize, documents.count)
+            let pairs = documents[start..<end].map {
+                tokenizer.encodePair(query: query, document: $0, maxLength: maxLength)
+            }
+            let encoded = tokenizer.pad(pairs)
+            let inputs = try makeInputs(encoded, inputNames: session.inputNames)
+            let outputs = try session.run(inputs: inputs, outputNames: [outputName])
+            guard let output = outputs[outputName] else {
+                throw ONNXRuntimeError.output("模型没有返回输出 \(outputName)")
+            }
+            let tensor = try output.floatTensor()
+            scores.append(contentsOf: try logitsToScores(tensor, batchSize: encoded.batchSize))
+            start = end
+        }
+        return scores
+    }
+
+    // MARK: - 推理
+
+    private func makeInputs(
+        _ encoded: TokenizedBatch,
+        inputNames: [String]
+    ) throws -> [String: OrtValue] {
+        let batch = encoded.batchSize
+        let length = encoded.sequenceLength
+        let inputIDs = encoded.inputIDs.flatMap { row in row.map(Int64.init) }
+        let mask = encoded.attentionMask.flatMap { row in row.map(Int64.init) }
+
+        var inputs: [String: OrtValue] = [:]
+        for name in inputNames {
+            switch name {
+            case "input_ids":
+                inputs[name] = try OrtValue(int64: inputIDs, shape: [batch, length])
+            case "attention_mask":
+                inputs[name] = try OrtValue(int64: mask, shape: [batch, length])
+            case "token_type_ids":
+                inputs[name] = try OrtValue(
+                    int64: Array(repeating: 0, count: batch * length),
+                    shape: [batch, length]
+                )
+            case "position_ids":
+                inputs[name] = try OrtValue(
+                    int64: Self.positionIDs(mask: encoded.attentionMask),
+                    shape: [batch, length]
+                )
+            default:
+                throw ONNXRuntimeError.input("Reranker 模型要求未知输入 `\(name)`，当前封装未实现")
+            }
+        }
+        return inputs
+    }
+
+    /// `[B,1]` / `[B]` / `[1,B]` logits → sigmoid。
+    private func logitsToScores(_ tensor: OrtTensor, batchSize: Int) throws -> [Double] {
+        let shape = tensor.shape
+        let values = tensor.values
+
+        if shape.count == 1 {
+            guard values.count >= batchSize else {
+                throw ONNXRuntimeError.shape("logits 数量 \(values.count) 小于 batch \(batchSize)")
+            }
+            return activate(values.prefix(batchSize).map { Double($0) })
+        }
+
+        guard shape.count == 2 else {
+            throw ONNXRuntimeError.shape("Reranker logits 维度应为 [B]、[B,1] 或 [1,B]，实际为 \(shape)")
+        }
+
+        let rows = shape[0]
+        let columns = shape[1]
+        if rows == batchSize {
+            // 常规 [B, num_labels]，num_labels 通常为 1，取第 0 列。
+            var result: [Double] = []
+            result.reserveCapacity(batchSize)
+            for row in 0..<batchSize {
+                result.append(Double(values[row * columns]))
+            }
+            return activate(result)
+        }
+        if rows == 1 && columns >= batchSize {
+            // 少数导出模型的 [1, B] 布局。
+            return activate(values.prefix(batchSize).map { Double($0) })
+        }
+        throw ONNXRuntimeError.shape("logits shape=\(shape) 与 batch=\(batchSize) 不匹配")
+    }
+
+    /// 有些导出模型直接输出概率，有些输出 logits。
+    /// 全部落在 [0,1] 时按概率保留，否则做 sigmoid，避免二次压缩破坏阈值语义。
+    private func activate(_ values: [Double]) -> [Double] {
+        guard !values.isEmpty else { return [] }
+        let looksProbability = values.allSatisfy { $0 >= 0 && $0 <= 1 }
+        return looksProbability ? values : values.map { Self.sigmoid(Float($0)) }
+    }
+
+    private func preferredOutputName(in session: OrtSession) -> String {
+        let preferred = ["logits", "scores", "output"]
+        for name in preferred where session.outputNames.contains(name) {
+            return name
+        }
+        return session.outputNames[0]
+    }
+
+    /// 数值稳定的 sigmoid，避免 exp 溢出。
+    private static func sigmoid(_ value: Float) -> Double {
+        let x = Double(value)
+        if x >= 0 {
+            return 1.0 / (1.0 + exp(-x))
+        }
+        let exponent = exp(x)
+        return exponent / (1.0 + exponent)
+    }
+
+    private static func positionIDs(mask: [[Int]]) -> [Int64] {
+        var result: [Int64] = []
+        result.reserveCapacity(mask.reduce(0) { $0 + $1.count })
+        for row in mask {
+            var position: Int64 = -1
+            for flag in row {
+                if flag != 0 {
+                    position += 1
+                    result.append(max(position, 0))
+                } else {
+                    result.append(0)
+                }
+            }
+        }
+        return result
+    }
+
+    /// 释放 ONNX session/tokenizer；provider 保留，下次 rerank 时按需重载。
+    public func unload() async {
+        await state.unload()
+    }
+}
+
+/// 会话与 tokenizer 只加载一次；失败缓存错误，便于定位模型缺失。
+private actor RerankerLoadState {
+    private var session: OrtSession?
+    private var tokenizer: LocalTokenizer?
+    private var failure: Error?
+
+    func handles(modelURL: URL, directory: URL) async throws -> (OrtSession, LocalTokenizer) {
+        if let session, let tokenizer {
+            return (session, tokenizer)
+        }
+        if let failure {
+            throw failure
+        }
+
+        do {
+            let session = try OrtSession(modelPath: modelURL.path, intraOpThreads: 4)
+            let tokenizer = try await LocalTokenizer.load(directory: directory)
+            self.session = session
+            self.tokenizer = tokenizer
+            return (session, tokenizer)
+        } catch {
+            self.failure = error
+            throw error
+        }
+    }
+
+    func unload() {
+        session = nil
+        tokenizer = nil
+        failure = nil
+    }
+}
