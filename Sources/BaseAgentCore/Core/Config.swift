@@ -119,20 +119,21 @@ public struct AgentConfig: Sendable {
     public var kernelMaxDigestLines: Int = 40
 
     // RAG
-    /// 切片大小（token，含 overlap）。默认 500：bge-small-zh 上下文 512 token，
-    /// 留出 [CLS]/[SEP] 与估算误差的余量。实测纯中文约 1 字 ≈ 1 token，
-    /// 中英混排约 1.8 字符/token（500 token ≈ 600-900 字）。
-    public var ragChunkSize: Int = 500
+    /// 切片大小（token，含 overlap）。默认 800：nomic-embed-text-v1.5 的
+    /// 有效窗口 8192，800 token 在保证语义完整的同时把切片数压到 bge 512
+    /// 窗口方案的三分之一左右（向量库体积与检索次数同步下降）。
+    public var ragChunkSize: Int = 800
     /// 默认 chunk_size 的 10%（token）。计入 chunk_size 总预算，
-    /// 正文按 `chunk_size - overlap` 切片，拼好后仍不超过 500 token。
-    public var ragChunkOverlap: Int = 50
+    /// 正文按 `chunk_size - overlap` 切片，拼好后仍不超过 800 token。
+    public var ragChunkOverlap: Int = 80
     /// 语义切片开关：开启时大段落在句间相似度低谷处断开（切片阶段需把
     /// 每个候选句嵌入一遍，显著慢于纯结构切片）；关闭时按标题结构 +
     /// 字符边界递归切片，速度快一个数量级，检索质量损失有限。
     public var ragSemanticChunking: Bool = true
-    /// 默认 bge-small-zh-v1.5（MLX fp16）：中文检索全面优于 nomic
-    /// （实测 Recall@1 9/10 vs 5/10、吞吐 8-10 倍），query 侧自动加官方检索指令。
-    public var ragEmbeddingModel: String = "bge-small-zh-v1.5-mlx"
+    /// 默认 nomic-embed-text-v1.5（MLX int8 权重，145MB）：768 维，
+    /// 支持 Matryoshka 截断（默认取前 512 维并重新归一化）与 8192 上下文。
+    /// 中文召回弱于 bge-small-zh，依赖混合检索 + Reranker 兜底。
+    public var ragEmbeddingModel: String = "nomic-embed-text-v1.5-mlx-int8"
     /// 默认 ONNX int8 版 jina reranker：CPU 推理吞吐约为 MLX mxfp8 的 2 倍，
     /// 1024 token 上下文。实测中文重排分数整体偏低（目标块 0.25-0.68），
     /// 需配合 ragRerankThreshold=0.45 使用（原 0.7 阈值会滤掉全部结果）。
@@ -228,6 +229,16 @@ public struct AgentConfig: Sendable {
     /// FTS5 召回 over-fetch 倍数。
     public var ragFTSOverfetch: Int = 4
 
+    // 向量落盘编码
+    /// 向量元素类型：int8（默认，512 维每行 512B）/ fp32 / bin。
+    /// fp16 仅为配置对齐保留——sqlite-vec 0.1.9 不支持，选择后会报错。
+    /// 改变类型会让已有向量失效，需要重建向量库。
+    public var ragVectorElementType: VectorElementType = .defaultValue
+    /// Matryoshka 截断策略（auto = 仅 nomic 等已知模型启用）。
+    public var ragMatryoshka: MatryoshkaMode = .auto
+    /// Matryoshka 截断维：128 / 256 / 512。
+    public var ragMatryoshkaDim: Int = 512
+
     // ANN 向量索引（分块 IVF，见 VectorStoreANN.swift）
     /// 检索是否走 ANN 索引。索引不可用（未构建/维度不符/尾块超预算）时
     /// 自动回退精确检索；关闭则始终精确检索（大库上会超时被跳过）。
@@ -274,12 +285,12 @@ public struct AgentConfig: Sendable {
     public var auxLocalLLMEnableThinking: Bool = false
 
     public var embeddingProvider: String = "local"
-    public var localEmbeddingModel: String = "bge-small-zh-v1.5-mlx"
+    public var localEmbeddingModel: String = "nomic-embed-text-v1.5-mlx-int8"
     /// 显式本地目录；非空时优先于模型名。
     /// 使用相对模型根目录的路径，由 LocalModelRegistry 统一解析。
-    public var localEmbeddingModelPath: String = "models/bge-small-zh-v1.5-mlx"
+    public var localEmbeddingModelPath: String = "models/nomic-embed-text-v1.5-mlx-int8"
     /// onnx / fastembed / mlx / gguf
-    /// Embedding 后端：mlx（Metal GPU，默认，使用本地 8bit 量化权重）
+    /// Embedding 后端：mlx（Metal GPU，默认，使用本地 int8 量化权重）
     /// / onnx（CPU int8）/ fastembed / gguf。
     public var localEmbeddingBackend: String = "mlx"
 
@@ -482,6 +493,15 @@ public struct AgentConfig: Sendable {
         if let v = int("rag_aux_summarize_max_chars") { ragAuxSummarizeMaxChars = v }
         if let v = int("rag_vector_overfetch") { ragVectorOverfetch = v }
         if let v = int("rag_fts_overfetch") { ragFTSOverfetch = v }
+        if let v = string("rag_vector_element_type"),
+           let parsed = VectorElementType(rawValue: v.lowercased()) {
+            ragVectorElementType = parsed
+        }
+        if let v = string("rag_matryoshka"),
+           let parsed = MatryoshkaMode(rawValue: v.lowercased()) {
+            ragMatryoshka = parsed
+        }
+        if let v = int("rag_matryoshka_dim") { ragMatryoshkaDim = v }
 
         if let v = string("llm_provider") { llmProvider = v }
         if let v = string("local_llm_model") { localLLMModel = v }
@@ -586,7 +606,6 @@ public struct AgentConfig: Sendable {
         let deprecatedEmbedding: Set<String> = [
             "all-MiniLM-L6-v2",
             "sentence-transformers/all-MiniLM-L6-v2",
-            "BAAI/bge-small-zh-v1.5",
             "BAAI/bge-large-zh-v1.5",
             "",
         ]
@@ -594,20 +613,36 @@ public struct AgentConfig: Sendable {
             ragEmbeddingModel == "nomic-ai/nomic-embed-text-v1.5" {
             ragEmbeddingModel = "nomic-ai/nomic-embed-text-v1.5-Q"
         }
-        // 旧 MLX fp16 embedding 名称/路径迁移到 8bit 量化版（167MB，实测与
-        // fp16 余弦相似度 >0.999）。迁移为目录名而非绝对路径，由
-        // LocalModelRegistry 在 workspace/models 下解析。
-        let legacyMLXEmbeddingName = "nomic-ai/nomic-embed-text-v1.5-mlx"
-        let mlx8bitName = "nomic-ai/nomic-embed-text-v1.5-mlx-8bit"
-        if ragEmbeddingModel == legacyMLXEmbeddingName {
-            ragEmbeddingModel = mlx8bitName
+        // 默认 embedding 迁回 nomic-embed-text-v1.5（MLX int8 权重）：
+        // 上一版默认是 bge-small-zh-v1.5-mlx，更早是 nomic mlx / mlx-8bit。
+        // 只迁移恰好等于旧默认名/路径的配置，用户显式选择的其他模型保持不变。
+        let defaultEmbeddingName = "nomic-embed-text-v1.5-mlx-int8"
+        let legacyEmbeddingNames: Set<String> = [
+            "bge-small-zh-v1.5-mlx",
+            "BAAI/bge-small-zh-v1.5",
+            "nomic-ai/nomic-embed-text-v1.5-mlx",
+            "nomic-ai/nomic-embed-text-v1.5-mlx-8bit",
+            "nomic-embed-text-v1.5-mlx-8bit",
+        ]
+        if legacyEmbeddingNames.contains(ragEmbeddingModel) {
+            ragEmbeddingModel = defaultEmbeddingName
         }
-        if localEmbeddingModel == legacyMLXEmbeddingName {
-            localEmbeddingModel = mlx8bitName
+        if legacyEmbeddingNames.contains(localEmbeddingModel) {
+            localEmbeddingModel = defaultEmbeddingName
         }
-        if localEmbeddingModelPath == "nomic-embed-text-v1.5-mlx"
-            || localEmbeddingModelPath.hasSuffix("/nomic-embed-text-v1.5-mlx") {
-            localEmbeddingModelPath = mlx8bitName
+        let legacyEmbeddingPaths: Set<String> = [
+            "bge-small-zh-v1.5-mlx",
+            "models/bge-small-zh-v1.5-mlx",
+            "nomic-embed-text-v1.5-mlx",
+            "models/nomic-embed-text-v1.5-mlx",
+            "nomic-embed-text-v1.5-mlx-8bit",
+            "models/nomic-embed-text-v1.5-mlx-8bit",
+        ]
+        if legacyEmbeddingPaths.contains(localEmbeddingModelPath)
+            || localEmbeddingModelPath.hasSuffix("/bge-small-zh-v1.5-mlx")
+            || localEmbeddingModelPath.hasSuffix("/nomic-embed-text-v1.5-mlx")
+            || localEmbeddingModelPath.hasSuffix("/nomic-embed-text-v1.5-mlx-8bit") {
+            localEmbeddingModelPath = "models/\(defaultEmbeddingName)"
         }
         // 旧 reranker 默认（HF 名）迁移到本地 MLX mxfp8 目录名。
         if ragRerankModel == "BAAI/bge-reranker-v2-m3"
@@ -630,29 +665,13 @@ public struct AgentConfig: Sendable {
                 ragRerankModel = "jina-reranker-v2-base-multilingual-onnx"
             }
         }
-        // 上一版默认（nomic 8bit）迁移到 bge-small-zh（MLX fp16）：中文检索
-        // 质量与速度全面占优。仅迁移恰好等于旧默认名/路径的配置。
-        let bgeName = "bge-small-zh-v1.5-mlx"
-        for legacy in ["nomic-embed-text-v1.5-mlx-8bit",
-                       "nomic-ai/nomic-embed-text-v1.5-mlx-8bit"] {
-            if ragEmbeddingModel == legacy { ragEmbeddingModel = bgeName }
-            if localEmbeddingModel == legacy { localEmbeddingModel = bgeName }
-        }
-        if localEmbeddingModelPath == "models/nomic-embed-text-v1.5-mlx-8bit"
-            || localEmbeddingModelPath == "nomic-embed-text-v1.5-mlx-8bit"
-            || localEmbeddingModelPath.hasSuffix("/nomic-embed-text-v1.5-mlx-8bit") {
-            localEmbeddingModelPath = "models/\(bgeName)"
-        }
         if maxTokens == 4096 { maxTokens = 32768 }
         if maxContextTokens < 8192 { maxContextTokens = maxTokens }
-        // 旧默认迁移到 500/50（10%）：800/40 是上一版默认，800/80 更早。
+        // 旧默认 500/50（bge 512 窗口）迁移到 800/80（nomic 8192 窗口）。
         // 只迁移「恰好等于旧默认值」的组合，用户自定义值保持不变。
-        if ragChunkSize == 800, ragChunkOverlap == 40 {
-            ragChunkSize = 500
-            ragChunkOverlap = 50
-        } else if ragChunkSize == 800, ragChunkOverlap == 80 {
-            ragChunkSize = 500
-            ragChunkOverlap = 50
+        if ragChunkSize == 500, ragChunkOverlap == 50 {
+            ragChunkSize = 800
+            ragChunkOverlap = 80
         }
         if ragChunkOverlap >= ragChunkSize {
             ragChunkOverlap = max(0, ragChunkSize / 10)
@@ -690,6 +709,11 @@ public struct AgentConfig: Sendable {
                                               min(0.5, ragEmbeddingThroughputTolerance))
         ragEmbeddingProbeBatches = max(1, min(16, ragEmbeddingProbeBatches))
         ragEmbeddingProbeSeconds = max(0.5, min(30, ragEmbeddingProbeSeconds))
+        // Matryoshka 截断维只允许 128 / 256 / 512，其它值回落到默认 512。
+        // 元素类型不做收口：fp16 保留在配置里，打开向量库时给出明确报错。
+        if ![128, 256, 512].contains(ragMatryoshkaDim) {
+            ragMatryoshkaDim = 512
+        }
     }
 
     /// 统一主/辅模型类型：mlx → mlx-lm；llama.cpp / llama_cpp → gguf。
@@ -800,6 +824,9 @@ public struct AgentConfig: Sendable {
             "rag_aux_summarize_max_chars": ragAuxSummarizeMaxChars,
             "rag_vector_overfetch": ragVectorOverfetch,
             "rag_fts_overfetch": ragFTSOverfetch,
+            "rag_vector_element_type": ragVectorElementType.rawValue,
+            "rag_matryoshka": ragMatryoshka.rawValue,
+            "rag_matryoshka_dim": ragMatryoshkaDim,
             "llm_provider": llmProvider,
             "local_llm_model": localLLMModel,
             "local_llm_backend": localLLMBackend,

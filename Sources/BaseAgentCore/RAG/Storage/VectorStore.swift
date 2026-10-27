@@ -24,9 +24,20 @@ public final class VectorStore: @unchecked Sendable {
     /// 当前向量维度。极少数模型（缺少 config.json）会在首次推理后才发现
     /// 真实维度；若库还是空的，允许自动按真实维度重建。
     public private(set) var dimension: Int
+    /// 落盘元素类型（fp32 / int8 / bin）。fp16 在 init 校验时直接报错。
+    public private(set) var elementType: VectorElementType
+    /// 索引指纹：embedding 标识 + 维度 + Matryoshka 截断维 + 元素类型。
+    /// 非空时与 meta 中的值比对，不一致即要求显式重建。
+    public let indexFingerprint: String
+    /// 非 nil 表示当前库与配置不匹配，需要显式重建后才能写入/向量检索。
+    /// 不清空旧数据：FTS 仍可检索，用户可以在重建前导出或确认。
+    public private(set) var rebuildReason: String?
     public private(set) var vectorEnabled: Bool = false
     /// 维度变化导致旧索引被清空；RAGEngine 据此同步失效 manifest。
     public private(set) var didResetForDimensionChange = false
+    /// sqlite-vec 扩展是否可用（与 `vectorEnabled` 区分：待重建时后者为 false，
+    /// 但清空/重建仍应优先建 vec0 表）。
+    private let sqliteVecAvailable: Bool
     /// 写入/删除/检索共用。ANN 实现（`VectorStoreANN.swift`）也在同一把锁内，
     /// 因此改为 internal。
     let lock = NSRecursiveLock()
@@ -39,21 +50,36 @@ public final class VectorStore: @unchecked Sendable {
     /// 旧库没有该键时用 `MAX(rowid)` 作为基线（O(1)，可能略高但不阻塞）。
     private var cachedChunkCount: Int?
     private static let chunkCountKey = "chunks_count"
+    private static let dimensionKey = "embedding_dim"
+    private static let elementTypeKey = "vector_element_type"
+    private static let fingerprintKey = "vector_index_fingerprint"
     /// ANN 簇心缓存（懒加载）。扩展无法新增存储属性，因此声明在这里，
     /// 由 `VectorStoreANN.swift` 读写。
     var annCentroidCache: ANNCentroidCache?
 
-    public init(dbPath: String, dimension: Int, enableSQLiteVec: Bool = true) throws {
-        self.dimension = max(1, dimension)
+    public init(dbPath: String, dimension: Int, enableSQLiteVec: Bool = true,
+                elementType: VectorElementType = .fp32,
+                indexFingerprint: String = "") throws {
+        let resolvedDimension = max(1, dimension)
+        // fp16 / 非法维度（如 bin 维度不是 8 的倍数）在打开库之前就报错，
+        // 避免先建出一张错误的表再回滚。
+        try elementType.validate(dimension: resolvedDimension)
+        self.dimension = resolvedDimension
+        self.elementType = elementType
+        self.indexFingerprint = indexFingerprint
         try FileManager.default.createDirectory(
             atPath: (dbPath as NSString).deletingLastPathComponent,
             withIntermediateDirectories: true
         )
         self.db = try SQLiteDatabase(path: dbPath)
-        var enabled = enableSQLiteVec && db.vectorExtensionLoaded
+        self.sqliteVecAvailable = enableSQLiteVec && db.vectorExtensionLoaded
         try createBaseSchema()
         self.cachedChunkCount = Self.readStoredCount(db, key: Self.chunkCountKey)
-        if enabled {
+        if rebuildReason != nil {
+            // 待重建：旧表保持原样（不删数据），但向量通道暂时关闭。
+            self.vectorEnabled = false
+        } else if sqliteVecAvailable {
+            var enabled = true
             do {
                 try ensureVectorTable(dimension: self.dimension, useVec0: true)
             } catch {
@@ -62,13 +88,16 @@ public final class VectorStore: @unchecked Sendable {
                 _ = try? db.execute("DROP TABLE IF EXISTS \(Self.vectorTable)")
                 try ensureVectorTable(dimension: self.dimension, useVec0: false)
             }
+            self.vectorEnabled = enabled
         } else {
             try ensureVectorTable(dimension: self.dimension, useVec0: false)
         }
-        self.vectorEnabled = enabled
     }
 
     public func close() { db.close() }
+
+    /// 当前库是否需要显式重建（配置与索引指纹/维度/元素类型不符）。
+    public var requiresRebuild: Bool { rebuildReason != nil }
 
     /// 在期限内执行只读查询：先限时获取切片锁（避免大批量写入把读路径无限期
     /// 挡住），再把剩余时间交给底层语句级期限。超时抛 `AgentError.timeout`，
@@ -127,27 +156,96 @@ public final class VectorStore: @unchecked Sendable {
         CREATE INDEX IF NOT EXISTS idx_documents_md_path ON documents(md_path);
         """)
 
-        let stored = try db.scalar("SELECT value FROM meta WHERE key = 'embedding_dim'").stringValue
-        if let stored, Int(stored) != dimension {
-            AgentLog.warning("向量维度从 \(stored) 变为 \(dimension)，清空旧索引以避免维度不匹配")
-            didResetForDimensionChange = true
-            try db.transaction {
-                try db.execute("DROP TABLE IF EXISTS \(Self.vectorTable)")
-                // 维度变化后 ANN 索引的码值/簇心全部失效，直接删表重建。
-                try db.execute("DROP TABLE IF EXISTS \(Self.annCellsTable)")
-                try db.execute("DROP TABLE IF EXISTS \(Self.annBlocksTable)")
-                try db.execute("DELETE FROM meta WHERE key GLOB 'ann_*'")
-                try db.execute("DELETE FROM \(Self.chunksTable)")
-                try db.execute("DELETE FROM \(Self.ftsTable)")
-                try db.execute("DELETE FROM \(Self.documentsTable)")
-                // 维度重建后切片清空，计数器同步归零，避免状态栏显示旧数量。
-                try db.execute(
-                    "INSERT INTO meta(key, value) VALUES('\(Self.chunkCountKey)', '0') "
-                    + "ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+        let stored = try db.scalar(
+            "SELECT value FROM meta WHERE key = ?", [.text(Self.dimensionKey)]).stringValue
+        let storedTypeRaw = try db.scalar(
+            "SELECT value FROM meta WHERE key = ?", [.text(Self.elementTypeKey)]).stringValue
+        let storedFingerprint = try db.scalar(
+            "SELECT value FROM meta WHERE key = ?", [.text(Self.fingerprintKey)]).stringValue
+        let existingSQL = try db.scalar(
+            "SELECT sql FROM sqlite_master WHERE type IN ('table','view') AND name = ?",
+            [.text(Self.vectorTable)]).stringValue
+        // 旧库没有元素类型 meta：从建表语句推断；普通 BLOB 表按 fp32 处理。
+        let storedType = storedTypeRaw.flatMap { VectorElementType(rawValue: $0) }
+            ?? existingSQL.flatMap { VectorElementType.infer(fromSchema: $0) }
+            ?? (existingSQL != nil ? .fp32 : nil)
+        let hasRows = (try? db.scalar("SELECT 1 FROM \(Self.chunksTable) LIMIT 1").intValue) != nil
+
+        var reason: String?
+        if let stored {
+            if Int(stored) != dimension {
+                reason = "向量维度 \(stored) → \(dimension)"
+            }
+        } else if hasRows {
+            reason = "向量库缺少维度元数据"
+        }
+        if reason == nil, let storedType, storedType != elementType {
+            reason = "向量元素类型 \(storedType.rawValue) → \(elementType.rawValue)"
+        }
+        if reason == nil, !indexFingerprint.isEmpty {
+            if let storedFingerprint, !storedFingerprint.isEmpty {
+                if storedFingerprint != indexFingerprint {
+                    reason = "embedding / 索引参数已变化"
+                }
+            } else if hasRows {
+                reason = "旧库缺少索引指纹"
             }
         }
-        try db.execute("INSERT INTO meta(key, value) VALUES('embedding_dim', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                       [.text(String(dimension))])
+
+        if let reason {
+            if hasRows {
+                rebuildReason = reason
+                AgentLog.warning("向量库需要重建：\(reason)（旧数据保留，重建前向量检索关闭）")
+            } else {
+                AgentLog.info("向量库配置变化（\(reason)），空库直接采用新配置")
+                try adoptCurrentConfigurationLocked()
+            }
+        }
+        // 仅在配置一致（或空库已采纳新配置）时补齐/刷新 meta 键。
+        // 待重建时必须保留旧 meta：否则下次打开会把新配置误当成已生效，
+        // 进而按新类型重建向量表，静默丢掉旧向量。
+        if rebuildReason == nil {
+            try writeVectorMetaLocked()
+        }
+    }
+
+    /// 空库直接采纳当前维度/类型/指纹：丢弃旧向量表与 ANN 索引（没有数据损失）。
+    private func adoptCurrentConfigurationLocked() throws {
+        didResetForDimensionChange = true
+        try db.transaction {
+            try db.execute("DROP TABLE IF EXISTS \(Self.vectorTable)")
+            try db.execute("DROP TABLE IF EXISTS \(Self.annCellsTable)")
+            try db.execute("DROP TABLE IF EXISTS \(Self.annBlocksTable)")
+            try db.execute("DELETE FROM meta WHERE key GLOB 'ann_*'")
+            try db.execute("DELETE FROM meta WHERE key IN (?, ?, ?)",
+                           [.text(Self.dimensionKey), .text(Self.elementTypeKey),
+                            .text(Self.fingerprintKey)])
+            // 空库也可能残留 documents/计数器（上次同步中断），一并归零。
+            try db.execute("DELETE FROM \(Self.chunksTable)")
+            try db.execute("DELETE FROM \(Self.ftsTable)")
+            try db.execute("DELETE FROM \(Self.documentsTable)")
+            try db.execute(
+                "INSERT INTO meta(key, value) VALUES('\(Self.chunkCountKey)', '0') "
+                + "ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+        }
+        annCentroidCache = nil
+    }
+
+    /// 写入当前配置的索引 meta。
+    private func writeVectorMetaLocked() throws {
+        var values: [(String, String)] = [
+            (Self.dimensionKey, String(dimension)),
+            (Self.elementTypeKey, elementType.rawValue),
+        ]
+        if !indexFingerprint.isEmpty {
+            values.append((Self.fingerprintKey, indexFingerprint))
+        }
+        for (key, value) in values {
+            try db.execute("""
+            INSERT INTO meta(key, value) VALUES(?, ?)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            """, [.text(key), .text(value)])
+        }
     }
 
     private func ensureVectorTable(dimension: Int, useVec0: Bool) throws {
@@ -159,9 +257,12 @@ public final class VectorStore: @unchecked Sendable {
         if let existingSQL, existingSQL.contains("USING vec0") != useVec0 {
             try db.execute("DROP TABLE IF EXISTS \(Self.vectorTable)")
         } else if let existingSQL, useVec0 {
-            // 维度已由 meta 校验；这里只确认表存在且是 vec0。
-            _ = existingSQL
-            return
+            // 维度与元素类型已由 meta 校验；列类型不符时说明是旧表，
+            // 调用方只有在空库/显式重建时才会走到这里，直接替换。
+            if VectorElementType.infer(fromSchema: existingSQL) == elementType {
+                return
+            }
+            try db.execute("DROP TABLE IF EXISTS \(Self.vectorTable)")
         } else if existingSQL != nil, !useVec0 {
             // 普通表已存在，确认列结构即可。
             return
@@ -170,7 +271,7 @@ public final class VectorStore: @unchecked Sendable {
         if useVec0 {
             try db.execute("""
             CREATE VIRTUAL TABLE IF NOT EXISTS \(Self.vectorTable)
-            USING vec0(embedding float[\(dimension)] distance_metric=cosine)
+            USING vec0(\(elementType.columnDefinition(dimension: dimension)))
             """)
         } else {
             try db.execScript("""
@@ -193,6 +294,10 @@ public final class VectorStore: @unchecked Sendable {
             throw AgentError.storage("chunks 与 vectors 数量不一致: \(chunks.count) vs \(vectors.count)")
         }
         lock.lock(); defer { lock.unlock() }
+        if let rebuildReason {
+            throw AgentError.storage(
+                "向量库需要重建（\(rebuildReason)）；请先在设置中执行「重建向量库」")
+        }
         // 先确定计数基线：旧库没有 meta 计数器时用 MAX(rowid) 兜底。
         ensureChunkCounterLocked()
 
@@ -201,8 +306,9 @@ public final class VectorStore: @unchecked Sendable {
         if let first = vectors.first, first.count != dimension {
             guard !hasChunks else {
                 throw AgentError.storage(
-                    "向量维度 \(first.count) != \(dimension)；请重建索引后再同步")
+                    "向量维度 \(first.count) != \(dimension)；请重建向量库后再同步")
             }
+            try elementType.validate(dimension: first.count)
             AgentLog.warning("VectorStore: 按实际输出维度 \(first.count) 重建空库（原 \(dimension)）")
             try rebuildDimensionLocked(first.count)
         }
@@ -263,15 +369,12 @@ public final class VectorStore: @unchecked Sendable {
     /// 仅在库为空时重建向量表（调用方已持锁）。
     private func rebuildDimensionLocked(_ newDimension: Int) throws {
         let resolved = max(1, newDimension)
+        try elementType.validate(dimension: resolved)
         try db.transaction {
             try db.execute("DROP TABLE IF EXISTS \(Self.vectorTable)")
             // 只在空库上重建，但旧维度的 ANN 索引同样必须丢弃。
             try? resetANNIndexLocked()
             try ensureVectorTable(dimension: resolved, useVec0: vectorEnabled)
-            try db.execute(
-                "INSERT INTO meta(key, value) VALUES('embedding_dim', ?) "
-                + "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                [.text(String(resolved))])
             // 只在空库上重建；计数器同步归零，避免自增 rowid 残留造成虚高。
             try db.execute(
                 "INSERT INTO meta(key, value) VALUES('\(Self.chunkCountKey)', '0') "
@@ -281,16 +384,22 @@ public final class VectorStore: @unchecked Sendable {
         dimension = resolved
         didResetForDimensionChange = true
         cachedChunkCount = 0
+        try writeVectorMetaLocked()
     }
 
     private func insertVector(rowID: Int64, vector: [Float]) throws {
-        let blob = VectorCodec.encode(vector)
+        let blob = VectorEncoder.encode(vector, as: elementType)
+        // int8/bit 必须包 vec_int8()/vec_bit()，否则 sqlite-vec 会把裸 blob
+        // 一律按 float32 解析；普通表不需要 subtype，直接存原始字节。
+        let expression = vectorEnabled ? elementType.bindExpression("?") : "?"
         if vectorEnabled {
-            try db.execute("INSERT INTO \(Self.vectorTable)(rowid, embedding) VALUES(?, ?)",
-                           [.int(rowID), .blob(blob)])
+            try db.execute(
+                "INSERT INTO \(Self.vectorTable)(rowid, embedding) VALUES(?, \(expression))",
+                [.int(rowID), .blob(blob)])
         } else {
-            try db.execute("INSERT OR REPLACE INTO \(Self.vectorTable)(rowid, embedding) VALUES(?, ?)",
-                           [.int(rowID), .blob(blob)])
+            try db.execute(
+                "INSERT OR REPLACE INTO \(Self.vectorTable)(rowid, embedding) VALUES(?, \(expression))",
+                [.int(rowID), .blob(blob)])
         }
     }
 
@@ -454,20 +563,77 @@ public final class VectorStore: @unchecked Sendable {
 
     /// 清空全部切片/向量/文档元数据（单事务）。ANN 索引同步清空：
     /// 索引里的 rowid 全部失效，留着只会误导状态展示。
+    /// 待重建的库在清空后会按当前配置重建向量表，清空即可视为已完成重建。
     public func clear() throws {
         lock.lock(); defer { lock.unlock() }
+        let needsRecreate = requiresRebuild
+        var enabled = vectorEnabled
         try withChunkCounterRollback {
             try db.transaction {
                 try db.execute("DELETE FROM \(Self.chunksTable)")
                 try db.execute("DELETE FROM \(Self.ftsTable)")
-                try db.execute("DELETE FROM \(Self.vectorTable)")
+                if !needsRecreate {
+                    try db.execute("DELETE FROM \(Self.vectorTable)")
+                }
                 try db.execute("DELETE FROM \(Self.documentsTable)")
                 // ANN 索引里的 rowid 与维度都失效，直接丢弃（表可能还没建）。
                 try? resetANNIndexLocked()
                 self.cachedChunkCount = 0
                 try persistChunkCounterLocked()
+                if needsRecreate {
+                    enabled = try recreateVectorTableLocked()
+                }
+                try writeVectorMetaLocked()
             }
         }
+        if needsRecreate { vectorEnabled = enabled }
+        rebuildReason = nil
+    }
+
+    /// 显式重建：按当前维度/元素类型/指纹重建向量表，并清空所有切片与文档记录。
+    /// 调用方负责随后重新 ingest（本方法只负责让存储层回到可写入状态）。
+    /// 返回被清空的切片数。
+    @discardableResult
+    public func rebuildForCurrentConfiguration() throws -> Int {
+        lock.lock(); defer { lock.unlock() }
+        try elementType.validate(dimension: dimension)
+        var removed = 0
+        var enabled = vectorEnabled
+        try withChunkCounterRollback {
+            try db.transaction {
+                removed = (try? db.scalar("SELECT COUNT(*) FROM \(Self.chunksTable)").intValue)
+                    .flatMap { Int($0) } ?? maxRowIDLocked
+                try db.execute("DELETE FROM \(Self.chunksTable)")
+                try db.execute("DELETE FROM \(Self.ftsTable)")
+                try db.execute("DELETE FROM \(Self.documentsTable)")
+                try? resetANNIndexLocked()
+                enabled = try recreateVectorTableLocked()
+                self.cachedChunkCount = 0
+                try persistChunkCounterLocked()
+                try writeVectorMetaLocked()
+            }
+        }
+        vectorEnabled = enabled
+        rebuildReason = nil
+        didResetForDimensionChange = true
+        AgentLog.info("VectorStore: 已按当前配置重建向量表（清空 \(removed) 个切片，待重新同步）")
+        return removed
+    }
+
+    /// 丢弃旧向量表并按当前配置重建。返回 sqlite-vec 是否可用。
+    private func recreateVectorTableLocked() throws -> Bool {
+        try db.execute("DROP TABLE IF EXISTS \(Self.vectorTable)")
+        if sqliteVecAvailable {
+            do {
+                try ensureVectorTable(dimension: dimension, useVec0: true)
+                return true
+            } catch {
+                AgentLog.warning("vec0 建表失败，退化为精确向量扫描: \(error.localizedDescription)")
+                _ = try? db.execute("DROP TABLE IF EXISTS \(Self.vectorTable)")
+            }
+        }
+        try ensureVectorTable(dimension: dimension, useVec0: false)
+        return false
     }
 
     // MARK: - Read / Search
@@ -570,6 +736,10 @@ public final class VectorStore: @unchecked Sendable {
         // 与写入/删除共用一把锁：两段式查询之间不能有事务提交，
         // 否则 KNN 拿到的 rowid 可能在 hydrate 时已被删掉。
         lock.lock(); defer { lock.unlock() }
+        if let rebuildReason {
+            AgentLog.info("向量库待重建（\(rebuildReason)），本次跳过向量检索")
+            return []
+        }
         guard hasChunks else { return [] }
         if let ann,
            let hits = try annSearchLocked(vector: vector, topK: topK, options: ann,
@@ -622,7 +792,8 @@ public final class VectorStore: @unchecked Sendable {
             for row in rows {
                 guard let rowID = row["rowid"]?.intValue,
                       let data = row["embedding"]?.dataValue else { continue }
-                output[rowID] = VectorCodec.decode(data)
+                output[rowID] = VectorEncoder.decode(data, as: elementType,
+                                                     dimension: dimension)
             }
             index += batch.count
         }
@@ -639,14 +810,17 @@ public final class VectorStore: @unchecked Sendable {
     }
 
     private func knnVec0(query: [Float], k: Int) throws -> [(Int64, Double)] {
+        // 查询侧与入库侧必须使用同一种编码（int8 / bit 都要包 subtype）。
+        let encoded = VectorEncoder.encode(query, as: elementType)
         let rows = try db.query(
-            "SELECT rowid, distance FROM \(Self.vectorTable) WHERE embedding MATCH ? AND k = ?",
-            [.blob(VectorCodec.encode(query)), .int(Int64(k))]
+            "SELECT rowid, distance FROM \(Self.vectorTable) "
+            + "WHERE embedding MATCH \(elementType.bindExpression("?")) AND k = ?",
+            [.blob(encoded), .int(Int64(k))]
         )
         return rows.compactMap { row in
             guard let rowID = row["rowid"]?.intValue else { return nil }
             let distance = row["distance"]?.doubleValue ?? 2.0
-            return (rowID, max(0, 1.0 - distance))
+            return (rowID, elementType.similarity(distance: distance, dimension: dimension))
         }
     }
 
@@ -665,11 +839,19 @@ public final class VectorStore: @unchecked Sendable {
         }
         var scored: [(Int64, Double)] = []
         scored.reserveCapacity(rows.count)
+        let queryBits = elementType.isBinary ? VectorEncoder.encodeBits(query) : Data()
         for row in rows {
             guard let rowID = row["rowid"]?.intValue,
                   let data = row["embedding"]?.dataValue else { continue }
-            let candidate = VectorCodec.decode(data)
-            scored.append((rowID, VectorCodec.cosine(query, candidate)))
+            if elementType.isBinary {
+                let distance = Double(VectorEncoder.hamming(data, queryBits))
+                scored.append((rowID, elementType.similarity(distance: distance,
+                                                             dimension: dimension)))
+            } else {
+                let candidate = VectorEncoder.decode(data, as: elementType,
+                                                     dimension: dimension)
+                scored.append((rowID, VectorCodec.cosine(query, candidate)))
+            }
         }
         return scored.sorted { $0.1 > $1.1 }
     }

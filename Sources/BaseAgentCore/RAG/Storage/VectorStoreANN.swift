@@ -94,48 +94,122 @@ struct ANNStoredMeta {
     var rows = 0
     var lastRowID: Int64 = 0
     var builtAt: Double = 0
+    /// 构建时向量表的元素类型；与当前配置不符时索引不可用。
+    var elementType: VectorElementType = .fp32
 }
 
-/// 构建时按 rowid 顺序攒下的一块切片（int8 码 + 每行尺度 + rowid）。
+/// 块内行布局：dense = int8 码 + 尺度；bits = 原始位图。
+enum ANNVectorLayout {
+    case dense
+    case bits
+}
+
+/// 构建时按 rowid 顺序攒下的一块切片。
+///
+/// - dense（fp32 / int8）：int8 码 + 每行尺度。int8 库直接复用入库码值
+///   （scale = 1），fp32 库按 max|x| 二次量化；打分统一 `dot × scale / 127`。
+/// - bits（bin）：保存 dim/8 字节位图，打分用汉明距离。
 struct ANNBlockBuffer {
+    private(set) var layout: ANNVectorLayout = .dense
     private(set) var rowids: [Int64] = []
     private(set) var codes: [Int8] = []
     private(set) var scales: [Float] = []
+    private(set) var bits: [UInt8] = []
+    private(set) var bitRowBytes = 0
     private(set) var lastRowID: Int64 = 0
 
     var count: Int { rowids.count }
 
-    mutating func reset(maxRows: Int, dim: Int) {
+    mutating func reset(maxRows: Int, dim: Int, elementType: VectorElementType) {
+        layout = elementType.isBinary ? .bits : .dense
+        bitRowBytes = elementType.isBinary ? elementType.blobSize(dimension: dim) : 0
         rowids.removeAll(keepingCapacity: true)
         codes.removeAll(keepingCapacity: true)
         scales.removeAll(keepingCapacity: true)
+        bits.removeAll(keepingCapacity: true)
         rowids.reserveCapacity(maxRows)
-        scales.reserveCapacity(maxRows)
-        codes.reserveCapacity(maxRows * dim)
+        if layout == .bits {
+            bits.reserveCapacity(maxRows * bitRowBytes)
+        } else {
+            scales.reserveCapacity(maxRows)
+            codes.reserveCapacity(maxRows * dim)
+        }
         lastRowID = 0
     }
 
-    /// 量化一行向量：`scale = max|v|`，码值 = round(v × 127 / scale) ∈ [-127,127]。
-    /// 打分时按 `dot(q, codes) × scale / 127` 还原（对归一化向量即余弦）。
-    mutating func append(rowID: Int64, floats: UnsafePointer<Float>, dim: Int,
-                         scratch: inout [Int8]) {
-        var maxAbs: Float = 0
-        for i in 0..<dim {
-            let value = abs(floats[i])
-            if value > maxAbs { maxAbs = value }
-        }
-        let scale: Float = maxAbs > 0 ? maxAbs : 1
-        let factor = 127 / scale
-        scratch.withUnsafeMutableBufferPointer { destination in
-            for i in 0..<dim {
-                let value = (floats[i] * factor).rounded()
-                destination[i] = Int8(max(-127, min(127, value)))
+    /// 追加一行。`pointer` 指向向量表里的原始落盘字节（int8 / bit）或
+    /// float32 指针（fp32）。
+    mutating func append(rowID: Int64, pointer: UnsafeRawPointer, dim: Int,
+                         elementType: VectorElementType, scratch: inout [Int8]) {
+        switch layout {
+        case .bits:
+            let bytes = pointer.assumingMemoryBound(to: UInt8.self)
+            bits.append(contentsOf: UnsafeBufferPointer(start: bytes, count: bitRowBytes))
+        case .dense:
+            if elementType == .int8 {
+                // 入库时已按单位向量 ×127 对称量化，ANN 直接复用码值。
+                let bytes = pointer.assumingMemoryBound(to: Int8.self)
+                codes.append(contentsOf: UnsafeBufferPointer(start: bytes, count: dim))
+                scales.append(1)
+            } else {
+                let floats = pointer.assumingMemoryBound(to: Float.self)
+                var maxAbs: Float = 0
+                for i in 0..<dim {
+                    let value = abs(floats[i])
+                    if value > maxAbs { maxAbs = value }
+                }
+                let scale: Float = maxAbs > 0 ? maxAbs : 1
+                let factor = 127 / scale
+                if scratch.count != dim { scratch = [Int8](repeating: 0, count: dim) }
+                scratch.withUnsafeMutableBufferPointer { destination in
+                    for i in 0..<dim {
+                        let value = (floats[i] * factor).rounded()
+                        destination[i] = Int8(max(-127, min(127, value)))
+                    }
+                }
+                scales.append(scale)
+                codes.append(contentsOf: scratch)
             }
         }
         rowids.append(rowID)
-        scales.append(scale)
-        codes.append(contentsOf: scratch)
         lastRowID = rowID
+    }
+
+    /// 还原一行到浮点（k-means 用）。bits 按 ±1/√dim 还原，与
+    /// `VectorEncoder.dequantizeBits` 口径一致。
+    func dequantize(row: Int, dim: Int, into output: inout [Float]) {
+        if output.count != dim { output = [Float](repeating: 0, count: dim) }
+        switch layout {
+        case .bits:
+            guard bitRowBytes > 0, row >= 0,
+                  (row + 1) * bitRowBytes <= bits.count else {
+                for i in 0..<dim { output[i] = 0 }
+                return
+            }
+            let magnitude = dim > 0 ? 1 / Float(dim).squareRoot() : 0
+            let offset = row * bitRowBytes
+            for i in 0..<dim {
+                let on = (bits[offset + i / 8] >> UInt8(i % 8)) & 1 == 1
+                output[i] = on ? magnitude : -magnitude
+            }
+        case .dense:
+            guard row >= 0, (row + 1) * dim <= codes.count else {
+                for i in 0..<dim { output[i] = 0 }
+                return
+            }
+            let scale = row < scales.count ? scales[row] / 127 : 1
+            codes.withUnsafeBufferPointer { source in
+                guard let sourceBase = source.baseAddress else { return }
+                output.withUnsafeMutableBufferPointer { destination in
+                    guard let destinationBase = destination.baseAddress else { return }
+                    vDSP_vflt8(sourceBase + row * dim, 1, destinationBase, 1,
+                               vDSP_Length(dim))
+                    var factor = scale
+                    vDSP_vsmul(destinationBase, 1, &factor, destinationBase, 1,
+                               vDSP_Length(dim))
+                }
+            }
+        }
     }
 }
 
@@ -272,7 +346,8 @@ private struct ANNShadowUnavailable: Error {
 ///   超过读取预算时由调用方触发重建。
 extension VectorStore {
 
-    static let annFormatVersion = 1
+    /// 2：块内行布局跟随向量元素类型（int8 / fp32 dense、bin 位图）。
+    static let annFormatVersion = 2
     /// 尾块精确补齐的读取预算：超出则不再用索引检索（回退精确路径并要求重建）。
     static let annTailScanByteBudget = 128 * 1024 * 1024
     static let annCellsTable = "ann_cells"
@@ -299,6 +374,8 @@ extension VectorStore {
         let cap = annTailScanRowCap(dim: meta.dim)
         let unindexed = max(0, tail - cap)
         let dimOK = meta.dim > 0 && meta.dim == dimension
+        let typeOK = meta.elementType == elementType
+        let versionOK = meta.version == Self.annFormatVersion
         status.clusters = meta.clusters
         status.blockRows = meta.blockRows
         status.blocks = meta.blocks
@@ -307,10 +384,19 @@ extension VectorStore {
         status.unindexedRows = unindexed
         status.dimension = meta.dim
         status.builtAt = meta.builtAt
-        status.isReady = meta.blocks > 0 && dimOK && tail == 0
-        status.isUsable = meta.blocks > 0 && dimOK && unindexed == 0
+        status.isReady = meta.blocks > 0 && dimOK && typeOK && versionOK && tail == 0
+        status.isUsable = meta.blocks > 0 && dimOK && typeOK && versionOK && unindexed == 0
         status.coverage = total > 0 ? min(1, Double(meta.rows) / Double(total)) : 0
         status.needsRebuild = meta.blocks > 0 && tail > annRebuildTailThreshold(dim: meta.dim)
+        if !versionOK {
+            status.summary = "ANN 索引格式版本 \(meta.version) 与当前 \(Self.annFormatVersion) 不符，需重建"
+            return status
+        }
+        if !typeOK {
+            status.summary = "ANN 索引元素类型 \(meta.elementType.rawValue) 与当前 "
+                + "\(elementType.rawValue) 不符，需重建"
+            return status
+        }
         status.summary = annSummaryLocked(status)
         return status
     }
@@ -318,7 +404,9 @@ extension VectorStore {
     /// 尾块精确补齐的行数上限（按读取字节预算折算）。
     func annTailScanRowCap(dim: Int) -> Int {
         guard dim > 0 else { return 0 }
-        return max(1024, Self.annTailScanByteBudget / (dim * 4))
+        let rowBytes = elementType.blobSize(dimension: dim)
+        guard rowBytes > 0 else { return 0 }
+        return max(1024, Self.annTailScanByteBudget / rowBytes)
     }
 
     /// 尾块大小：rowid 水位之后的切片数。
@@ -385,9 +473,10 @@ extension VectorStore {
         try ensureANNSchemaLocked()
         var meta = try annStoredMetaLocked()
         if meta.version != Self.annFormatVersion || meta.dim != dim
+            || meta.elementType != elementType
             || meta.clusters != clusterCount || meta.blockRows != blockRows {
             if meta.version != 0 {
-                AgentLog.info("ANN: 索引参数变化（\(meta.clusters) 簇 / \(meta.blockRows) 行/块 / dim \(meta.dim)），整体重建")
+                AgentLog.info("ANN: 索引参数变化（\(meta.elementType.rawValue) / \(meta.clusters) 簇 / \(meta.blockRows) 行/块 / dim \(meta.dim)），整体重建")
             }
             try resetANNIndexLocked()
             meta = ANNStoredMeta()
@@ -412,7 +501,8 @@ extension VectorStore {
 
         while true {
             var buffer = ANNBlockBuffer()
-            try gatherANNBlockLocked(after: watermark, dim: dim, maxRows: blockRows, into: &buffer)
+            try gatherANNBlockLocked(after: watermark, dim: dim, maxRows: blockRows,
+                                     elementType: elementType, into: &buffer)
             if buffer.count == 0 { break }
             if let isCancelled, isCancelled() {
                 result.cancelled = true
@@ -482,6 +572,8 @@ extension VectorStore {
                          sourceFilter: String?,
                          sourceContains: String?) throws -> [SearchHit]? {
         guard let meta = try? annStoredMetaLocked(), meta.blocks > 0,
+              meta.version == Self.annFormatVersion,
+              meta.elementType == elementType,
               meta.dim == dimension, meta.dim == vector.count else { return nil }
         let cap = annTailScanRowCap(dim: meta.dim)
         let tailRows = annTailRowCountLocked(after: meta.lastRowID, dim: meta.dim,
@@ -492,6 +584,9 @@ extension VectorStore {
         }
         do {
             let query = VectorCodec.normalize(vector)
+            let queryBits = elementType.isBinary
+                ? [UInt8](VectorEncoder.encodeBits(query))
+                : []
             let targeted = sourceFilter != nil || sourceContains != nil
             // 候选池必须留余量：索引里的 rowid 可能已被删除（同步是「先删后插」），
             // hydrate 会丢弃这些失效行；池子太小会让有效结果被挤空。
@@ -510,12 +605,14 @@ extension VectorStore {
                                                    nprobe: options.nprobe, scratch: &scratch)
                     for cluster in probes {
                         try scoreANNCellsLocked(block: block, cluster: cluster, dim: meta.dim,
-                                                query: queryBase, pool: &pool)
+                                                elementType: elementType, query: queryBase,
+                                                queryBits: queryBits, pool: &pool)
                     }
                 }
             }
             if tailRows > 0 {
                 try scanANNTailLocked(query: query, after: meta.lastRowID, dim: meta.dim,
+                                      elementType: elementType, queryBits: queryBits,
                                       rowLimit: tailRows, pool: &pool)
             }
             var candidates = pool.sortedItems()
@@ -540,13 +637,38 @@ extension VectorStore {
 
     /// 读取一个簇的打包行并打分。
     private func scoreANNCellsLocked(block: Int, cluster: Int, dim: Int,
+                                     elementType: VectorElementType,
                                      query: UnsafePointer<Float>,
+                                     queryBits: [UInt8],
                                      pool: inout ANNTopKCollector) throws {
         let rows = try db.query("""
         SELECT payload FROM \(Self.annCellsTable)
         WHERE block_id = ? AND cluster_id = ? ORDER BY seq
         """, [.int(Int64(block)), .int(Int64(cluster))])
         guard !rows.isEmpty else { return }
+        if elementType.isBinary {
+            let bitBytes = elementType.blobSize(dimension: dim)
+            let rowBytes = 8 + bitBytes
+            guard queryBits.count >= bitBytes else { return }
+            for row in rows {
+                guard let payload = row["payload"]?.dataValue else { continue }
+                let count = payload.count / rowBytes
+                guard count > 0 else { continue }
+                payload.withUnsafeBytes { raw in
+                    guard let base = raw.baseAddress else { return }
+                    for index in 0..<count {
+                        let offset = index * rowBytes
+                        let rowID = raw.loadUnaligned(fromByteOffset: offset, as: Int64.self)
+                        let hamming = VectorEncoder.hamming(
+                            pointer: UnsafeRawPointer(base.advanced(by: offset + 8)),
+                            bytes: queryBits, count: bitBytes)
+                        pool.offer(rowid: rowID,
+                                   score: 1 - Double(hamming) / Double(dim))
+                    }
+                }
+            }
+            return
+        }
         let rowBytes = 12 + dim
         var scratch = [Float](repeating: 0, count: dim)
         for row in rows {
@@ -571,15 +693,31 @@ extension VectorStore {
 
     /// 索引之外的新切片：按 rowid 顺序精确补齐（顺序读，实测 115MB/s）。
     private func scanANNTailLocked(query: [Float], after rowID: Int64, dim: Int,
+                                   elementType: VectorElementType, queryBits: [UInt8],
                                    rowLimit: Int, pool: inout ANNTopKCollector) throws {
         var scanned = 0
+        var scratch = [Float](repeating: 0, count: dim)
+        let rowBytes = elementType.blobSize(dimension: dim)
         try query.withUnsafeBufferPointer { queryPointer in
             guard let queryBase = queryPointer.baseAddress else { return }
-            try streamStoredVectors(from: rowID, dim: dim) { hitRowID, pointer in
-                let floats = pointer.assumingMemoryBound(to: Float.self)
-                var dot: Float = 0
-                vDSP_dotpr(floats, 1, queryBase, 1, &dot, vDSP_Length(dim))
-                pool.offer(rowid: hitRowID, score: Double(dot))
+            try streamStoredVectors(from: rowID, dim: dim, elementType: elementType) { hitRowID, pointer in
+                if elementType.isBinary {
+                    let hamming = VectorEncoder.hamming(pointer: pointer, bytes: queryBits,
+                                                        count: rowBytes)
+                    pool.offer(rowid: hitRowID,
+                               score: 1 - Double(hamming) / Double(dim))
+                } else if elementType == .int8 {
+                    let codes = pointer.assumingMemoryBound(to: Int8.self)
+                    vDSP_vflt8(codes, 1, &scratch, 1, vDSP_Length(dim))
+                    var dot: Float = 0
+                    vDSP_dotpr(scratch, 1, queryBase, 1, &dot, vDSP_Length(dim))
+                    pool.offer(rowid: hitRowID, score: Double(dot / 127))
+                } else {
+                    let floats = pointer.assumingMemoryBound(to: Float.self)
+                    var dot: Float = 0
+                    vDSP_dotpr(floats, 1, queryBase, 1, &dot, vDSP_Length(dim))
+                    pool.offer(rowid: hitRowID, score: Double(dot))
+                }
                 scanned += 1
                 return scanned < rowLimit
             }
@@ -637,13 +775,13 @@ extension VectorStore {
     /// 按 rowid 顺序攒下一块（最多 maxRows 行）。已建块通过水位跳过，
     /// 跳过时只顺序扫 `_rowids`（不读向量数据）。
     func gatherANNBlockLocked(after rowID: Int64, dim: Int, maxRows: Int,
+                              elementType: VectorElementType,
                               into buffer: inout ANNBlockBuffer) throws {
-        buffer.reset(maxRows: maxRows, dim: dim)
+        buffer.reset(maxRows: maxRows, dim: dim, elementType: elementType)
         var scratch = [Int8](repeating: 0, count: dim)
-        try streamStoredVectors(from: rowID, dim: dim) { hitRowID, pointer in
-            buffer.append(rowID: hitRowID,
-                          floats: pointer.assumingMemoryBound(to: Float.self),
-                          dim: dim, scratch: &scratch)
+        try streamStoredVectors(from: rowID, dim: dim, elementType: elementType) { hitRowID, pointer in
+            buffer.append(rowID: hitRowID, pointer: pointer, dim: dim,
+                          elementType: elementType, scratch: &scratch)
             return buffer.count < maxRows
         }
         // 兜底：官方 vec0 读取路径不保证 rowid 顺序，排序后再切块/记录水位。
@@ -661,17 +799,15 @@ extension VectorStore {
         let activeClusters = min(clusters, rows)
         var centroids = [Float](repeating: 0, count: clusters * dim)
         var counts = [Int32](repeating: 0, count: clusters)
-        if let seeds = annSeedCentroids(codes: buffer.codes, scales: buffer.scales, rows: rows,
-                                        dim: dim, clusters: activeClusters),
-           let trained = ANNClustering.train(codes: buffer.codes, scales: buffer.scales,
-                                             rows: rows, dim: dim, clusters: activeClusters,
+        if let seeds = annSeedCentroids(buffer: buffer, dim: dim, clusters: activeClusters),
+           let trained = ANNClustering.train(buffer: buffer, rows: rows, dim: dim,
+                                             clusters: activeClusters,
                                              iterations: iterations, seeds: seeds) {
             for i in 0..<(activeClusters * dim) { centroids[i] = trained.centroids[i] }
             for cluster in 0..<activeClusters { counts[cluster] = trained.counts[cluster] }
         }
-        let assignments = ANNClustering.assign(codes: buffer.codes, scales: buffer.scales,
-                                               rows: rows, dim: dim, clusters: activeClusters,
-                                               centroids: centroids)
+        let assignments = ANNClustering.assign(buffer: buffer, rows: rows, dim: dim,
+                                               clusters: activeClusters, centroids: centroids)
         // 计数排序：簇内保持 rowid 顺序，按簇顺序写盘 → 检索时顺序读。
         var offsets = [Int](repeating: 0, count: activeClusters + 1)
         for assignment in assignments { offsets[Int(assignment) + 1] += 1 }
@@ -689,8 +825,7 @@ extension VectorStore {
                 let start = offsets[cluster]
                 let end = offsets[cluster + 1]
                 guard end > start else { continue }
-                let payload = ANNPacking.packCell(rowids: buffer.rowids, codes: buffer.codes,
-                                                  scales: buffer.scales, order: order,
+                let payload = ANNPacking.packCell(buffer: buffer, order: order,
                                                   range: start..<end, dim: dim)
                 try db.execute("""
                 INSERT OR REPLACE INTO \(Self.annCellsTable)
@@ -709,7 +844,8 @@ extension VectorStore {
             try writeANNMetaLocked(ANNStoredMeta(
                 version: Self.annFormatVersion, clusters: clusters, blockRows: blockRows,
                 dim: dim, blocks: blockID + 1, rows: rows,
-                lastRowID: buffer.lastRowID, builtAt: Date().timeIntervalSince1970))
+                lastRowID: buffer.lastRowID, builtAt: Date().timeIntervalSince1970,
+                elementType: elementType))
         }
         annCentroidCache = nil
     }
@@ -724,6 +860,7 @@ extension VectorStore {
             ("ann_clusters", String(meta.clusters)),
             ("ann_block_rows", String(meta.blockRows)),
             ("ann_dim", String(meta.dim)),
+            ("ann_element_type", meta.elementType.rawValue),
             ("ann_blocks", String(meta.blocks)),
             ("ann_rows", String(rows)),
             ("ann_last_rowid", String(meta.lastRowID)),
@@ -738,8 +875,9 @@ extension VectorStore {
     }
 
     /// 初始簇心：块内均匀采样若干行（k-means 起点）。
-    private func annSeedCentroids(codes: [Int8], scales: [Float], rows: Int, dim: Int,
+    private func annSeedCentroids(buffer: ANNBlockBuffer, dim: Int,
                                   clusters: Int) -> [Float]? {
+        let rows = buffer.count
         guard rows > 0, clusters > 0 else { return nil }
         let sampleCount = min(rows, max(clusters * 4, 1024))
         var seeds = [Float](repeating: 0, count: clusters * dim)
@@ -758,7 +896,7 @@ extension VectorStore {
             let source = sampleCount >= rows
                 ? min(pick, rows - 1)
                 : min(Int(Double(pick) * Double(rows) / Double(sampleCount)), rows - 1)
-            ANNClustering.dequantize(codes: codes, scales: scales, row: source, dim: dim, into: &row)
+            buffer.dequantize(row: source, dim: dim, into: &row)
             VectorCodec.normalizeInPlace(&row)
             for i in 0..<dim { seeds[cluster * dim + i] = row[i] }
         }
@@ -803,6 +941,8 @@ extension VectorStore {
         meta.rows = Int(values["ann_rows"] ?? "") ?? 0
         meta.lastRowID = Int64(values["ann_last_rowid"] ?? "") ?? 0
         meta.builtAt = Double(values["ann_built_at"] ?? "") ?? 0
+        meta.elementType = values["ann_element_type"]
+            .flatMap { VectorElementType(rawValue: $0) } ?? .fp32
         return meta
     }
 
@@ -838,16 +978,18 @@ extension VectorStore {
     /// 10MB/s（每行都要从打包块里解出独立 blob）。影子表缺失或布局校验
     /// 失败时回退官方路径。
     func streamStoredVectors(from rowID: Int64, dim: Int,
+                             elementType: VectorElementType,
                              _ body: (Int64, UnsafeRawPointer) throws -> Bool) throws {
         if vectorEnabled, let shadow = try annShadowTablesLocked() {
             do {
-                try streamShadowVectors(shadow, from: rowID, dim: dim, body)
+                try streamShadowVectors(shadow, from: rowID, dim: dim,
+                                        elementType: elementType, body)
                 return
             } catch let error as ANNShadowUnavailable {
                 AgentLog.warning("ANN: vec0 影子表快速通道不可用（\(error.reason)），改用官方读取路径")
             }
         }
-        try streamDirectVectors(from: rowID, dim: dim, body)
+        try streamDirectVectors(from: rowID, dim: dim, elementType: elementType, body)
     }
 
     /// vec0 影子表：`<table>_rowids` 与 `<table>_vector_chunks*`。
@@ -865,7 +1007,10 @@ extension VectorStore {
 
     private func streamShadowVectors(_ shadow: (rowids: String, chunks: String),
                                      from rowID: Int64, dim: Int,
+                                     elementType: VectorElementType,
                                      _ body: (Int64, UnsafeRawPointer) throws -> Bool) throws {
+        let rowBytes = elementType.blobSize(dimension: dim)
+        guard rowBytes > 0 else { throw ANNShadowUnavailable(reason: "行宽无效") }
         // 先做一次布局校验（第一行）：不合预期就直接回退，避免投递半截数据。
         if let probe = try db.query("""
             SELECT rowid, chunk_id, chunk_offset FROM \(shadow.rowids)
@@ -877,15 +1022,15 @@ extension VectorStore {
            let chunkData = try db.scalar(
             "SELECT vectors FROM \(shadow.chunks) WHERE rowid = ?",
             [.int(probeChunk)]).dataValue {
-            let byteOffset = Int(probeOffset) * dim * 4
-            guard byteOffset >= 0, byteOffset + dim * 4 <= chunkData.count else {
+            let byteOffset = Int(probeOffset) * rowBytes
+            guard byteOffset >= 0, byteOffset + rowBytes <= chunkData.count else {
                 throw ANNShadowUnavailable(reason: "chunk 偏移越界")
             }
             let valid = chunkData.withUnsafeBytes { raw -> Bool in
                 guard let base = raw.baseAddress else { return false }
                 return validateShadowVector(rowID: probeRowID,
                                             pointer: UnsafeRawPointer(base.advanced(by: byteOffset)),
-                                            dim: dim)
+                                            dim: dim, elementType: elementType)
             }
             guard valid else { throw ANNShadowUnavailable(reason: "影子表向量与点查结果不一致") }
         }
@@ -893,7 +1038,6 @@ extension VectorStore {
         var chunkID: Int64 = -1
         var chunkData = Data()
         var bodyError: Error?
-        let rowBytes = dim * 4
         let sql = "SELECT rowid, chunk_id, chunk_offset FROM \(shadow.rowids) "
             + "WHERE rowid > ? ORDER BY rowid"
         try db.stream(sql, [.int(rowID)]) { row in
@@ -931,35 +1075,25 @@ extension VectorStore {
         if let bodyError { throw bodyError }
     }
 
-    /// 校验影子打包 blob 的布局假设（`chunk_offset × dim × 4` 处的向量应与
+    /// 校验影子打包 blob 的布局假设（`chunk_offset × rowBytes` 处的字节应与
     /// 点查一致）。每块只做一次，代价可忽略。
     private func validateShadowVector(rowID: Int64, pointer: UnsafeRawPointer,
-                                      dim: Int) -> Bool {
+                                      dim: Int, elementType: VectorElementType) -> Bool {
         guard let data = try? db.scalar(
             "SELECT embedding FROM \(Self.vectorTable) WHERE rowid = ?",
             [.int(rowID)]).dataValue else { return false }
-        let direct = VectorCodec.decode(data)
-        guard direct.count == dim else { return false }
-        let shadow = UnsafeBufferPointer(start: pointer.assumingMemoryBound(to: Float.self),
-                                         count: dim)
-        var dot: Float = 0
-        var shadowNorm: Float = 0
-        var directNorm: Float = 0
-        direct.withUnsafeBufferPointer { reference in
-            guard let base = reference.baseAddress else { return }
-            vDSP_dotpr(shadow.baseAddress!, 1, base, 1, &dot, vDSP_Length(dim))
-            vDSP_svesq(shadow.baseAddress!, 1, &shadowNorm, vDSP_Length(dim))
-            vDSP_svesq(base, 1, &directNorm, vDSP_Length(dim))
-        }
-        let denominator = sqrt(shadowNorm) * sqrt(directNorm)
-        guard denominator > 0 else { return true }
-        return Double(dot / denominator) > 0.999
+        let rowBytes = elementType.blobSize(dimension: dim)
+        guard data.count == rowBytes else { return false }
+        return Data(bytes: pointer, count: rowBytes) == data
     }
 
     /// 官方读取路径：vec0 全表扫（约束只在 SQLite 侧后置过滤）或普通表顺序读。
     private func streamDirectVectors(from rowID: Int64, dim: Int,
+                                     elementType: VectorElementType,
                                      _ body: (Int64, UnsafeRawPointer) throws -> Bool) throws {
         let order = vectorEnabled ? "" : " ORDER BY rowid"
+        let rowBytes = elementType.blobSize(dimension: dim)
+        guard rowBytes > 0 else { return }
         var previous = Int64.min
         var outOfOrder = 0
         try db.stream("SELECT rowid, embedding FROM \(Self.vectorTable) WHERE rowid > ?\(order)",
@@ -967,7 +1101,7 @@ extension VectorStore {
             let hitRowID = row.int(0)
             if hitRowID < previous { outOfOrder += 1 }
             previous = hitRowID
-            guard let blob = row.blob(1), blob.count >= dim * 4 else { return true }
+            guard let blob = row.blob(1), blob.count >= rowBytes else { return true }
             return try body(hitRowID, blob.pointer)
         }
         if outOfOrder > 0 {
@@ -987,22 +1121,36 @@ extension ANNBlockBuffer {
 
     mutating func sortByRowID() {
         let rows = rowids.count
-        let dim = rows > 0 ? codes.count / rows : 0
-        guard rows > 1, dim > 0 else { return }
+        guard rows > 1 else { return }
         let order = (0..<rows).sorted { rowids[$0] < rowids[$1] }
         var newRowids = [Int64](repeating: 0, count: rows)
-        var newScales = [Float](repeating: 0, count: rows)
-        var newCodes = [Int8](repeating: 0, count: rows * dim)
-        for (target, source) in order.enumerated() {
-            newRowids[target] = rowids[source]
-            newScales[target] = scales[source]
-            let from = source * dim
-            let to = target * dim
-            for i in 0..<dim { newCodes[to + i] = codes[from + i] }
+        switch layout {
+        case .bits:
+            guard bitRowBytes > 0, bits.count >= rows * bitRowBytes else { return }
+            var newBits = [UInt8](repeating: 0, count: rows * bitRowBytes)
+            for (target, source) in order.enumerated() {
+                newRowids[target] = rowids[source]
+                let from = source * bitRowBytes
+                let to = target * bitRowBytes
+                for i in 0..<bitRowBytes { newBits[to + i] = bits[from + i] }
+            }
+            bits = newBits
+        case .dense:
+            let dim = rows > 0 ? codes.count / rows : 0
+            guard dim > 0 else { return }
+            var newScales = [Float](repeating: 0, count: rows)
+            var newCodes = [Int8](repeating: 0, count: rows * dim)
+            for (target, source) in order.enumerated() {
+                newRowids[target] = rowids[source]
+                newScales[target] = scales[source]
+                let from = source * dim
+                let to = target * dim
+                for i in 0..<dim { newCodes[to + i] = codes[from + i] }
+            }
+            scales = newScales
+            codes = newCodes
         }
         rowids = newRowids
-        scales = newScales
-        codes = newCodes
         lastRowID = newRowids[rows - 1]
     }
 }
@@ -1010,28 +1158,59 @@ extension ANNBlockBuffer {
 // MARK: - 打包与聚类
 
 enum ANNPacking {
-    /// 一个簇的打包行：`[rowid Int64][scale Float32][int8 × dim]`。
-    static func packCell(rowids: [Int64], codes: [Int8], scales: [Float],
-                         order: [Int32], range: Range<Int>, dim: Int) -> Data {
-        let rowBytes = 12 + dim
-        let count = range.count
-        var bytes = [UInt8](repeating: 0, count: count * rowBytes)
-        bytes.withUnsafeMutableBytes { raw in
-            guard let base = raw.baseAddress else { return }
-            codes.withUnsafeBufferPointer { codePointer in
-                guard let codeBase = codePointer.baseAddress else { return }
-                var offset = 0
-                for slot in range {
-                    let index = Int(order[slot])
-                    raw.storeBytes(of: rowids[index], toByteOffset: offset, as: Int64.self)
-                    raw.storeBytes(of: scales[index], toByteOffset: offset + 8, as: Float.self)
-                    base.advanced(by: offset + 12)
-                        .copyMemory(from: UnsafeRawPointer(codeBase + index * dim), byteCount: dim)
-                    offset += rowBytes
+    /// 一个簇的打包行：
+    /// - dense：`[rowid Int64][scale Float32][int8 × dim]`
+    /// - bits：`[rowid Int64][位图 dim/8]`
+    static func packCell(buffer: ANNBlockBuffer, order: [Int32],
+                         range: Range<Int>, dim: Int) -> Data {
+        switch buffer.layout {
+        case .bits:
+            let bitBytes = buffer.bitRowBytes
+            let rowBytes = 8 + bitBytes
+            let count = range.count
+            guard bitBytes > 0 else { return Data() }
+            var bytes = [UInt8](repeating: 0, count: count * rowBytes)
+            bytes.withUnsafeMutableBytes { raw in
+                guard let base = raw.baseAddress else { return }
+                buffer.bits.withUnsafeBufferPointer { bitPointer in
+                    guard let bitBase = bitPointer.baseAddress else { return }
+                    var offset = 0
+                    for slot in range {
+                        let index = Int(order[slot])
+                        raw.storeBytes(of: buffer.rowids[index], toByteOffset: offset,
+                                       as: Int64.self)
+                        base.advanced(by: offset + 8)
+                            .copyMemory(from: UnsafeRawPointer(bitBase + index * bitBytes),
+                                        byteCount: bitBytes)
+                        offset += rowBytes
+                    }
                 }
             }
+            return Data(bytes)
+        case .dense:
+            let rowBytes = 12 + dim
+            let count = range.count
+            var bytes = [UInt8](repeating: 0, count: count * rowBytes)
+            bytes.withUnsafeMutableBytes { raw in
+                guard let base = raw.baseAddress else { return }
+                buffer.codes.withUnsafeBufferPointer { codePointer in
+                    guard let codeBase = codePointer.baseAddress else { return }
+                    var offset = 0
+                    for slot in range {
+                        let index = Int(order[slot])
+                        raw.storeBytes(of: buffer.rowids[index], toByteOffset: offset,
+                                       as: Int64.self)
+                        raw.storeBytes(of: buffer.scales[index], toByteOffset: offset + 8,
+                                       as: Float.self)
+                        base.advanced(by: offset + 12)
+                            .copyMemory(from: UnsafeRawPointer(codeBase + index * dim),
+                                        byteCount: dim)
+                        offset += rowBytes
+                    }
+                }
+            }
+            return Data(bytes)
         }
-        return Data(bytes)
     }
 
     /// 块头：magic + 簇数 + 维度；随后每簇 `[count UInt32][scale Float32][int8 × dim]`。
@@ -1074,24 +1253,9 @@ enum ANNClustering {
         var counts: [Int32]
     }
 
-    /// 从 int8 码还原一行（乘回量化尺度）。
-    static func dequantize(codes: [Int8], scales: [Float], row: Int, dim: Int,
-                           into output: inout [Float]) {
-        if output.count != dim { output = [Float](repeating: 0, count: dim) }
-        let scale = (row >= 0 && row < scales.count) ? scales[row] / 127 : 1
-        codes.withUnsafeBufferPointer { source in
-            guard let sourceBase = source.baseAddress else { return }
-            output.withUnsafeMutableBufferPointer { destination in
-                guard let destinationBase = destination.baseAddress else { return }
-                vDSP_vflt8(sourceBase + row * dim, 1, destinationBase, 1, vDSP_Length(dim))
-                var factor = scale
-                vDSP_vsmul(destinationBase, 1, &factor, destinationBase, 1, vDSP_Length(dim))
-            }
-        }
-    }
-
     /// 块内 k-means（余弦口径：向量与簇心都归一化，点积即余弦）。
-    static func train(codes: [Int8], scales: [Float], rows: Int, dim: Int,
+    /// 支持 dense（int8/fp32）与 bits 两种块内布局。
+    static func train(buffer: ANNBlockBuffer, rows: Int, dim: Int,
                       clusters: Int, iterations: Int, seeds: [Float]) -> Result? {
         guard rows > 0, clusters > 0, dim > 0, seeds.count >= clusters * dim else { return nil }
         // 训练样本最多 8192 行，均匀取样覆盖整块（避免只学到块首的内容）。
@@ -1102,7 +1266,7 @@ enum ANNClustering {
             let source = sampleRows >= rows
                 ? min(index, rows - 1)
                 : min(Int(Double(index) * Double(rows) / Double(sampleRows)), rows - 1)
-            dequantize(codes: codes, scales: scales, row: source, dim: dim, into: &row)
+            buffer.dequantize(row: source, dim: dim, into: &row)
             for i in 0..<dim { sample[index * dim + i] = row[i] }
         }
         var centroids = Array(seeds[0..<(clusters * dim)])
@@ -1135,12 +1299,12 @@ enum ANNClustering {
         return Result(centroids: centroids, counts: counts)
     }
 
-    /// 全量分配：分批评分（Accelerate sgemm），返回每行最近簇。
-    static func assign(codes: [Int8], scales: [Float], rows: Int, dim: Int,
+    /// 全量分配：分批评分（Accelerate 矩阵乘），返回每行最近簇。
+    static func assign(buffer: ANNBlockBuffer, rows: Int, dim: Int,
                        clusters: Int, centroids: [Float]) -> [Int32] {
         var output = [Int32](repeating: 0, count: rows)
         guard rows > 0, clusters > 0, dim > 0 else { return output }
-        // 每批控制在几十 MB（SGERA 工作集），8192 档位兼顾 sgemm 效率。
+        // 每批控制在几十 MB，8192 档位兼顾矩阵乘效率。
         let batch = max(1, min(rows, min(8192, max(256, 4_000_000 / max(1, dim + clusters)))))
         var matrix = [Float](repeating: 0, count: batch * dim)
         var scratch = [Int32](repeating: 0, count: batch)
@@ -1149,7 +1313,7 @@ enum ANNClustering {
         while start < rows {
             let count = min(batch, rows - start)
             for index in 0..<count {
-                dequantize(codes: codes, scales: scales, row: start + index, dim: dim, into: &row)
+                buffer.dequantize(row: start + index, dim: dim, into: &row)
                 for i in 0..<dim { matrix[index * dim + i] = row[i] }
             }
             if scratch.count != count { scratch = [Int32](repeating: 0, count: count) }

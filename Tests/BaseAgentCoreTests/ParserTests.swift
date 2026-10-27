@@ -631,27 +631,27 @@ final class ParserTests: XCTestCase {
 
     func testConfigMigratesOldChunkDefaults() throws {
         let path = directory.appendingPathComponent("config-chunks.json")
-        try #"{"rag_chunk_size":800,"rag_chunk_overlap":40}"#
+        try #"{"rag_chunk_size":500,"rag_chunk_overlap":50}"#
             .write(to: path, atomically: true, encoding: .utf8)
         let config = AgentConfig.load(path.path)
-        // 旧默认 800/40（5%）迁移到 500/50（10%，适配 bge 512 token 上下文）。
-        XCTAssertEqual(config.ragChunkSize, 500)
-        XCTAssertEqual(config.ragChunkOverlap, 50)
+        // 旧默认 500/50（bge 512 窗口）迁移到 800/80（nomic 8192 窗口）。
+        XCTAssertEqual(config.ragChunkSize, 800)
+        XCTAssertEqual(config.ragChunkOverlap, 80)
     }
 
-    /// 新默认值：bge embedding、500/50 切片、检索 5 条与辅助模型精简区间。
+    /// 新默认值：nomic embedding、800/80 切片、检索 5 条与辅助模型精简区间。
     func testConfigNewRAGDefaults() throws {
         let config = AgentConfig()
-        XCTAssertEqual(config.ragEmbeddingModel, "bge-small-zh-v1.5-mlx")
-        XCTAssertEqual(config.localEmbeddingModelPath, "models/bge-small-zh-v1.5-mlx")
-        XCTAssertEqual(config.ragChunkSize, 500)
-        XCTAssertEqual(config.ragChunkOverlap, 50)
+        XCTAssertEqual(config.ragEmbeddingModel, "nomic-embed-text-v1.5-mlx-int8")
+        XCTAssertEqual(config.localEmbeddingModelPath, "models/nomic-embed-text-v1.5-mlx-int8")
+        XCTAssertEqual(config.ragChunkSize, 800)
+        XCTAssertEqual(config.ragChunkOverlap, 80)
         XCTAssertEqual(config.ragSearchMaxTotalChars, 12_000)
         XCTAssertEqual(config.ragAuxSummarizeMinChars, 4_000)
         XCTAssertEqual(config.ragAuxSummarizeMaxChars, 12_000)
         let options = ChunkingOptions(config: config)
-        XCTAssertEqual(options.chunkSizeTokens, 500, "切片预算按 token 计，含 overlap")
-        XCTAssertEqual(options.overlapTokens, 50, "overlap 占 10%，计入 500 token 总预算")
+        XCTAssertEqual(options.chunkSizeTokens, 800, "切片预算按 token 计，含 overlap")
+        XCTAssertEqual(options.overlapTokens, 80, "overlap 占 10%，计入 800 token 总预算")
 
         // 阈值可持久化并回读（用户后续可直接改配置文件调参）。
         let path = directory.appendingPathComponent("config-rag-thresholds.json")
@@ -887,10 +887,9 @@ final class ParserTests: XCTestCase {
         XCTAssertEqual(config.auxLocalLLMBackend, "mlx-lm")
         XCTAssertEqual(config.auxLocalLLMModel, "models/Qwen3.5-2B-MLX-4bit")
         XCTAssertEqual(config.localEmbeddingBackend, "mlx")
-        // 旧 fp16 MLX 路径先迁 8bit 量化名，再被新默认迁移链带到
-        // bge-small-zh（中文检索全面占优）。
+        // 旧 fp16 MLX 路径统一迁移到新的默认 nomic int8 模型。
         XCTAssertEqual(config.localEmbeddingModelPath,
-                       "models/bge-small-zh-v1.5-mlx")
+                       "models/nomic-embed-text-v1.5-mlx-int8")
         XCTAssertEqual(config.localRerankerBackend, "mlx")
         XCTAssertEqual(config.localRerankerModelPath,
                        "models/bge-reranker-v2-m3-mlx-mxfp8")

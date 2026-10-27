@@ -273,7 +273,14 @@ public final class RAGEngine {
         self.manifestStore = ManifestStore(
             path: (self.ragDir as NSString).appendingPathComponent("manifest.json")
         )
-        self.embedding = embedding ?? LocalModelFactory.shared.makeEmbedding(config: config)
+        // Matryoshka：nomic 等支持俄罗斯套娃的模型先截断、再重新归一化。
+        // 入库与查询必须共用同一实例，保证两侧变换完全一致。
+        let baseEmbedding = embedding ?? LocalModelFactory.shared.makeEmbedding(config: config)
+        self.embedding = baseEmbedding.map {
+            MatryoshkaEmbedding.wrap($0,
+                                     mode: config.ragMatryoshka,
+                                     dimension: config.ragMatryoshkaDim)
+        }
         self.reranker = reranker ?? LocalModelFactory.shared.makeReranker(config: config)
         self.parserRegistry = parserRegistry ?? DocumentParserRegistry.makeDefault(config: config)
         try? FileManager.default.createDirectory(atPath: self.markdownDir,
@@ -356,6 +363,26 @@ public final class RAGEngine {
 
     // MARK: Store
 
+    /// 当前生效的 Matryoshka 截断维（未启用时为 0）。
+    public var effectiveMatryoshkaDimension: Int {
+        (embedding as? MatryoshkaEmbedding)?.truncateDimension ?? 0
+    }
+
+    /// 索引指纹：向量语义 + 落盘布局（`embedding.identifier | dimension |
+    /// matryoshkaDim | elementType`）。任一字段变化都必须显式重建。
+    ///
+    /// Matryoshka 未实际截断时记 0：只切换 `auto`/`on` 而实际行为不变时，
+    /// 不应被误判成需要重建。
+    public var vectorIndexFingerprint: String {
+        guard let embedding else { return "" }
+        return [
+            embedding.identifier,
+            "dimension=\(embedding.dimension)",
+            "matryoshka=\(effectiveMatryoshkaDimension)",
+            "element=\(config.ragVectorElementType.rawValue)",
+        ].joined(separator: "|")
+    }
+
     private func ensureStore() throws -> VectorStore {
         storeLock.lock(); defer { storeLock.unlock() }
         if let store { return store }
@@ -364,12 +391,20 @@ public final class RAGEngine {
         }
         let newStore = try VectorStore(dbPath: self.indexDBPath,
                                        dimension: embedding.dimension,
-                                       enableSQLiteVec: config.ragSQLiteVecEnabled)
+                                       enableSQLiteVec: config.ragSQLiteVecEnabled,
+                                       elementType: config.ragVectorElementType,
+                                       indexFingerprint: vectorIndexFingerprint)
         if newStore.didResetForDimensionChange {
-            // 维度变化时 VectorStore 已清空 chunks/documents；缓存的 manifest
-            // 若不同步失效，下一次同步会把所有文件当成「未变化」而全部跳过。
+            // 空库按新维度/类型采纳配置后，缓存的 manifest 若不同步失效，
+            // 下一次同步会把所有文件当成「未变化」而全部跳过。
             manifestStore.clear()
-            AgentLog.warning("RAG: 向量维度变化，已清空 manifest，下次同步将全量重建")
+            AgentLog.warning("RAG: 向量库为空且配置已变化，旧索引已重置，"
+                + "已清空 manifest，下次同步将全量重建")
+        }
+        if let reason = newStore.rebuildReason {
+            // 不静默删数据：旧切片与文档保留，FTS 仍可检索，向量通道暂时关闭。
+            AgentLog.warning("RAG: 向量库与当前配置不匹配，需显式重建（\(reason)）；"
+                + "向量检索暂停，全文检索仍可用")
         }
         store = newStore
         return newStore
@@ -611,6 +646,14 @@ public final class RAGEngine {
             return stats
         }
         let existingChunkCount = store.count
+        // B 方案闸门：配置与索引指纹不符时不静默删数据，但也不能继续写入
+        // （新向量与旧向量语义/类型不同，混在一个库里检索结果不可信）。
+        if let reason = store.rebuildReason {
+            stats.errors.append("向量库需要重建（\(reason)）；"
+                + "请先在设置中执行「重建向量库」再同步")
+            logFn("RAG: 向量库待重建（\(reason)），已拒绝本次同步；全文检索仍可用")
+            return stats
+        }
         logFn("RAG: 索引库就绪（现有 \(existingChunkCount) 切片）")
 
         var manifest = manifestStore.load()
@@ -816,6 +859,10 @@ public final class RAGEngine {
                 config.localEmbeddingBackend)),
             ("embedding_path", config.localEmbeddingModelPath),
             ("embedding_model", embeddingModel),
+            // 落盘元素类型与 Matryoshka 截断维都会改变向量本身（量化/截断），
+            // 旧切片必须按新配置重算；未实际截断时记 0，避免无谓重建。
+            ("vector_element_type", config.ragVectorElementType.rawValue),
+            ("matryoshka_dim", String(effectiveMatryoshkaDimension)),
         ]
         return fields.map { "\($0.0)=\($0.1)" }.joined(separator: "\n")
     }
@@ -1545,6 +1592,11 @@ public final class RAGEngine {
     public func status(sourceLimit: Int = 256,
                        maxAge: TimeInterval = 600,
                        timeout: Double? = nil) -> [String: JSONValue] {
+        // fp16 等 sqlite-vec 不支持的类型：打开库会直接失败，优先给出配置原因，
+        // 否则调用方只能看到笼统的「向量库不可用」。
+        if let unsupported = config.ragVectorElementType.unsupportedReason {
+            return unsupportedVectorTypeSnapshot(unsupported)
+        }
         if let cached = cachedStatus(maxAge: maxAge) { return cached }
         // `maxAge <= 0` 表示调用方要绕过缓存（诊断/刚同步完），此时也不复用
         // 「上次超时」的跳过快照，直接重试。
@@ -1581,6 +1633,12 @@ public final class RAGEngine {
                 "ann_index": .string(ann.summary),
                 "ann_usable": .bool(ann.isUsable),
                 "ann_needs_rebuild": .bool(ann.needsRebuild || ann.unindexedRows > 0),
+                // 向量落盘类型 / Matryoshka 截断维 / 待重建闸门。
+                "vector_element_type": .string(store.elementType.rawValue),
+                "matryoshka_dim": .int(effectiveMatryoshkaDimension),
+                "vector_index_fingerprint": .string(store.indexFingerprint),
+                "vector_rebuild_required": .bool(store.requiresRebuild),
+                "rebuild_reason": store.rebuildReason.map { .string($0) } ?? .null,
             ]
         }
         guard let snapshot else {
@@ -1619,6 +1677,25 @@ public final class RAGEngine {
         return statusSkipSnapshot
     }
 
+    /// sqlite-vec 不支持当前元素类型时的状态快照：保留上次统计，
+    /// 但明确标出配置错误与待重建原因，供设置面板直接展示。
+    private func unsupportedVectorTypeSnapshot(_ reason: String) -> [String: JSONValue] {
+        statusLock.lock(); defer { statusLock.unlock() }
+        var snapshot = statusSnapshot ?? [
+            "knowledge_base": .string(knowledgeBase),
+            "rag_dir": .string(ragDir),
+            "chunks_stored": .int(0),
+            "source_count": .int(0),
+            "sources": .array([]),
+        ]
+        snapshot["vector_element_type"] = .string(config.ragVectorElementType.rawValue)
+        snapshot["matryoshka_dim"] = .int(effectiveMatryoshkaDimension)
+        snapshot["vector_rebuild_required"] = .bool(true)
+        snapshot["rebuild_reason"] = .string(reason)
+        snapshot["error"] = .string(reason)
+        return snapshot
+    }
+
     /// 超时/不可用时给出的提示快照：保留上一次已知统计，附加可读原因。
     private func skipSnapshot(limit: Double) -> [String: JSONValue] {
         let reason = limit > 0
@@ -1632,6 +1709,9 @@ public final class RAGEngine {
             "chunks_stored": .int(0),
             "source_count": .int(0),
             "sources": .array([]),
+            "vector_element_type": .string(config.ragVectorElementType.rawValue),
+            "matryoshka_dim": .int(effectiveMatryoshkaDimension),
+            "vector_rebuild_required": .bool(false),
         ]
         snapshot["error"] = .string(reason)
         statusSkipSnapshot = snapshot
@@ -1655,6 +1735,78 @@ public final class RAGEngine {
         statusSkipUntil = 0
         statusGeneration &+= 1
         statusLock.unlock()
+    }
+
+    // MARK: 显式重建
+
+    /// 显式重建向量库的结果。
+    public struct VectorRebuildResult: Sendable {
+        /// 被清空的旧切片数。
+        public var removedChunks: Int = 0
+        /// 重建后的全量同步统计；未要求重同步时为 nil。
+        public var ingest: IngestStats?
+
+        public init(removedChunks: Int = 0, ingest: IngestStats? = nil) {
+            self.removedChunks = removedChunks
+            self.ingest = ingest
+        }
+
+        public var summary: String {
+            var text = "已清空 \(removedChunks) 个旧切片并按当前配置重建向量表"
+            if let ingest { text += "；\(ingest.summary)" }
+            return text
+        }
+    }
+
+    /// 按当前配置显式重建向量库：重建向量表（新维度/元素类型/指纹），
+    /// 清空旧切片、文档缓存、ANN 索引、manifest 与 markdown 缓存；
+    /// 默认随后立即执行一次全量同步。
+    ///
+    /// 返回 nil 表示被拒绝（另一个同步/维护正在进行）或重建失败，原因已写入日志。
+    @discardableResult
+    public func rebuildVectorIndex(resync: Bool = true,
+                                   progress: ((Int, Int, String) -> Void)? = nil,
+                                   log: ((String) -> Void)? = nil) async -> VectorRebuildResult? {
+        let logFn: (String) -> Void = { message in
+            if let log { log(message) } else { AgentLog.info(message) }
+        }
+        guard tryBeginIngest() else {
+            logFn("RAG: 另一次同步/维护正在进行，已忽略本次向量库重建")
+            return nil
+        }
+        var removed = 0
+        var failure: Error?
+        do {
+            try withStore { store in
+                removed = try store.rebuildForCurrentConfiguration()
+            }
+        } catch {
+            failure = error
+        }
+        invalidateStatusCache()
+        releaseIngestFlag()
+        closeIfPending()
+        if let failure {
+            logFn("RAG: 重建向量库失败：\(failure.localizedDescription)")
+            AgentLog.warning("RAG: 重建向量库失败: \(failure.localizedDescription)")
+            return nil
+        }
+        // 旧向量已全部失效：manifest 与 markdown 缓存一并清掉，强制全量重算。
+        // 不删知识库原始文件；之后仍可中断续跑。
+        manifestStore.clear()
+        try? FileManager.default.removeItem(atPath: markdownDir)
+        try? FileManager.default.createDirectory(atPath: markdownDir,
+                                                 withIntermediateDirectories: true)
+        logFn("RAG: 向量库已按当前配置重建（清空 \(removed) 个切片）"
+            + (resync ? "，开始全量重新同步…" : "，请手动执行同步"))
+
+        // 用户可能在清空旧表期间点了「停止同步」：Task 取消或引擎取消标志
+        // 任一成立都不再启动全量同步，避免停止请求被 ingest 的初始化重置。
+        let shouldResync = resync && !Task.isCancelled && !isCancelled
+        let ingestStats = shouldResync
+            ? await ingest(force: true, progress: progress, log: log)
+            : nil
+        return VectorRebuildResult(removedChunks: removed, ingest: ingestStats)
     }
 
     public func clear() throws {

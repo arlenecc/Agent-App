@@ -121,7 +121,7 @@ OvisOCR2 的 MLX 权重使用 `model_type=qwen3_5`（Qwen3.5-0.8B 后训练）�
 3. 递归回退：段落 → 换行 → 句号 → 空格 → token 窗口，严格遵守 token 预算；
 4. 块间按 token 数添加 overlap（计入总预算）。
 
-默认 `chunk_size=500 token`、`overlap=50 token`（10%，含在 500 内）。同步时优先用模型自带 `tokenizer.json` 做精确计数（不含特殊 token），分词器不可用时退回标定过的保守估算器（`EmbeddingTokenEstimator`）：以 bge 实测，纯中文约 1 字 ≈ 1 token，中英混排约 1.8 字符/token，英文约 3.5 字符/token；因此 500 token 大致对应 500 字中文或 600–900 字混排。正文预算先扣除 overlap 与分隔符，最终块连同 overlap 不超过 500，加上 `[CLS]/[SEP]` 为 502，不会被 bge-small-zh 的 512 token 窗口截断；若把切片大小调到超过模型窗口，同步时会自动压到窗口上限（bge 为 510），overlap 同步压到上限的 10%，设置面板会显示「实际生效：N token」。所有切分路径都在句子结束处断开；旧配置里的默认值 800/40 或 800/80 会在加载时自动迁移到 500/50，自定义组合保持不变。
+默认 `chunk_size=800 token`、`overlap=80 token`（10%，含在 800 内）。同步时优先用模型自带 `tokenizer.json` 做精确计数（不含特殊 token），分词器不可用时退回标定过的保守估算器（`EmbeddingTokenEstimator`）：纯中文约 1 字 ≈ 1 token，中英混排约 1.8 字符/token，英文约 3.5 字符/token；因此 800 token 大致对应 800 字中文或 1000–1400 字混排。默认 nomic-embed-text-v1.5 的有效窗口为 8192 token，800 token 不会被截断；若把切片大小调到超过当前模型窗口（如改用 bge 等 512 窗口模型），同步时会自动压到窗口上限，overlap 同步压到上限的 10%，设置面板会显示「实际生效：N token」。所有切分路径都在句子结束处断开；旧配置里的默认 500/50 会在加载时自动迁移到 800/80，自定义组合保持不变。
 
 切片参数（大小 / overlap / 语义切片开关）只有设置面板一个来源，控件就排在「知识同步配置」的 Embedding 行里（模型类型 / 本地路径之后、「应用配置」之前）：切片环节统一读 `RAGEngine.resolvedChunkingOptions`，检索呈现的单条上限取 `max(配置值, 切片 token × 1.5 + 64)`（不再固定 1500 字符截短），而切片参数、embedding 后端与目录都进 manifest 的 ingest 签名，改任一项都会逐文件重建；「加载主/辅助模型」按钮在白名单（仅 LLM 参数）之外的配置有变化时会走完整 `applyConfig` 重建 Agent 与 RAGEngine，不会出现面板改了切片、运行时仍按旧快照切片。中途停止后已完成的文件保留，下次从剩余文件继续。
 
@@ -139,9 +139,11 @@ OvisOCR2 的 MLX 权重使用 `model_type=qwen3_5`（Qwen3.5-0.8B 后训练）�
 - **两段式 KNN**：先查 `chunk_vectors` 拿 rowid，再回 `chunks` 按 rowid 取正文，绝不 JOIN 虚拟表；
 - **过滤**：不依赖虚拟表过滤，统一 over-fetch 后在第二阶段过滤；定向检索自动放大召回；
 - **混合检索**：FTS5（预分词，含 CJK bigram） + 向量，RRF 融合；
+- **向量元素类型**：`rag_vector_element_type` 支持 int8（默认，512 维 512B/行）/ fp32 / bin（512 维 64B/行，汉明距离）；fp16 因 sqlite-vec 0.1.9 不支持，会在打开向量库时明确报错。int8 用对称量化 `round(x×127)`，入库与查询都包 `vec_int8(?)`；bin 用符号位 + LSB-first 位图，查询包 `vec_bit(?)`；
+- **nomic Matryoshka**：默认 `rag_matryoshka=auto`（仅 nomic 启用）、`rag_matryoshka_dim=512`；先截断到前 N 维，**强制重新归一化**，再按元素类型量化入库；查询侧执行完全相同的变换；
 - sqlite-vec 静态编入进程（`SQLITE_CORE` 模式），无需安装扩展；若初始化失败则显式退化为精确余弦扫描，并在 `rag_status` 中标注。
 
-向量维度写入 `meta`；维度变化时自动清空旧索引并同步清空 manifest，避免 vec0 维度不匹配或「全部跳过」导致知识库为空。若向量库被删除但 manifest 残留，同步会自动识别并全量重建。空库遇到首次推理才发现的真实维度时会按实际输出维度重建。
+向量维度、元素类型与索引指纹（`embedding.identifier | dimension | matryoshkaDim | elementType`）写入 `meta`。配置变化时不再自动清空旧索引：非空库标记待重建，向量检索暂停、同步拒绝写入、全文检索仍可用，用户在设置面板执行「重建向量库」后才清空并按当前配置全量重新同步；空库直接采纳新配置。若向量库被删除但 manifest 残留，同步会自动识别并全量重建。空库遇到首次推理才发现的真实维度时会按实际输出维度重建。
 
 检索与写入/删除共用同一把锁，两段式查询之间不会插入提交；FTS 与向量两路各自 over-fetch。解析引擎、OCR 模型、切片参数或 embedding 模型变化会按文件写入 ingest 签名：下一次同步只重建签名不一致的文件，已完成的文件不会重复解析。每个文件入库后立即落盘 manifest，用户中途「停止同步」或进程退出后，下次同步直接从剩余未完成文件继续。单个文件变更后解析失败会清掉它的旧索引并在下次重试。
 
@@ -196,8 +198,13 @@ PDF Ovis 引擎按 `rag_ocr_model_path` / `rag_ocr_model_name` 加载，不受 `
   "aux_max_context_tokens": 32768,
   "embedding_provider": "local",
   "local_embedding_backend": "mlx",
-  "local_embedding_model": "bge-small-zh-v1.5-mlx",
-  "local_embedding_model_path": "models/bge-small-zh-v1.5-mlx",
+  "local_embedding_model": "nomic-embed-text-v1.5-mlx-int8",
+  "local_embedding_model_path": "models/nomic-embed-text-v1.5-mlx-int8",
+  "rag_chunk_size": 800,
+  "rag_chunk_overlap": 80,
+  "rag_vector_element_type": "int8",
+  "rag_matryoshka": "auto",
+  "rag_matryoshka_dim": 512,
   "reranker_provider": "local",
   "local_reranker_backend": "onnx",
   "local_reranker_model": "jina-reranker-v2-base-multilingual-onnx",

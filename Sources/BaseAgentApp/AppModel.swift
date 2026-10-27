@@ -180,6 +180,11 @@ final class AppViewModel: ObservableObject {
     @Published var isBuildingANN = false
     /// ANN 索引摘要（设置窗口显示，来自 RAG status 快照）。
     @Published var annStatusText = "ANN 索引未构建"
+    /// 向量落盘类型 / Matryoshka 截断维摘要（设置窗口显示）。
+    @Published var vectorStatusText = "向量库未就绪"
+    /// 当前索引与配置不匹配，需要用户显式重建。
+    @Published var vectorRebuildRequired = false
+    @Published var vectorRebuildReason = ""
     @Published var isModelLoading = false
     /// 主模型加载完成后的 KV 预热阶段；期间禁止发送消息，避免和 prefill 争夺模型。
     @Published var isWarmingUp = false
@@ -1203,6 +1208,67 @@ final class AppViewModel: ObservableObject {
         alert.runModal()
     }
 
+    // MARK: 向量库重建
+
+    /// 点击「重建向量库」：按当前元素类型/Matryoshka 配置重建向量表，
+    /// 清空旧切片与 ANN 索引后立即全量重新同步。
+    func requestVectorRebuild() {
+        guard let agent else {
+            showInfoAlert(title: "重建向量库",
+                          message: "RAG 尚未就绪，请先在知识同步配置中应用配置。")
+            return
+        }
+        if isSyncing {
+            showInfoAlert(title: "暂不能重建向量库",
+                          message: "知识同步/重建正在进行，请等结束后再试。")
+            return
+        }
+        if isDeduplicating || isBuildingANN {
+            showInfoAlert(title: "暂不能重建向量库",
+                          message: "向量去重或 ANN 索引维护正在进行，请稍后再试。")
+            return
+        }
+        if isModelLoading || isWarmingUp {
+            showInfoAlert(title: "暂不能重建向量库", message: "模型正在加载或预热，请稍后再试。")
+            return
+        }
+        if isRunning {
+            showInfoAlert(title: "暂不能重建向量库", message: "对话正在生成，请等本轮结束后再试。")
+            return
+        }
+        guard confirmVectorRebuild() else { return }
+        cancelIdleUnload()
+        isSyncing = true
+        isStoppingSync = false
+        syncGeneration += 1
+        statusText = "正在重建向量库…"
+        appendLog("[rag] 用户确认重建向量库：元素类型 \(config.ragVectorElementType.rawValue)"
+            + "，Matryoshka \(config.ragMatryoshka.rawValue) \(config.ragMatryoshkaDim) 维")
+        startIngest(agent: agent, force: true, restore: nil,
+                    generation: syncGeneration, rebuildVector: true)
+    }
+
+    private func confirmVectorRebuild() -> Bool {
+        let type = config.ragVectorElementType
+        let mrl = config.ragMatryoshka == .off
+            ? "关闭"
+            : "\(config.ragMatryoshkaDim) 维（\(config.ragMatryoshka.rawValue)）"
+        let alert = NSAlert()
+        alert.messageText = "确认重建向量库"
+        alert.informativeText = """
+        将按当前配置重建向量表：元素类型 \(type.rawValue)，Matryoshka \(mrl)。
+        旧切片、全文索引、文档缓存与 ANN 索引会被清空，随后全量重新解析并 embedding；
+        千万级切片的大库可能耗时数小时，可随时点「停止同步」中断，下次从头继续。
+        知识库原始文件不会被删除。
+        """
+        alert.alertStyle = .warning
+        // 默认按钮是「取消」，避免误触长时间占用。
+        alert.addButton(withTitle: "取消")
+        alert.addButton(withTitle: "重建")
+        NSApp.activate(ignoringOtherApps: true)
+        return alert.runModal() == .alertSecondButtonReturn
+    }
+
     func syncKnowledgeBase(force: Bool) {
         let restore = pendingSyncRestore
         pendingSyncRestore = nil
@@ -1268,18 +1334,24 @@ final class AppViewModel: ObservableObject {
     }
 
     /// 已处于同步态（isSyncing == true）：卸载本地模型并启动 ingest 任务。
+    /// `rebuildVector` 为 true 时先按当前配置重建向量表，再执行全量同步。
     private func startIngest(agent: Agent, force: Bool,
-                             restore: (main: Bool, aux: Bool)?, generation: Int) {
+                             restore: (main: Bool, aux: Bool)?, generation: Int,
+                             rebuildVector: Bool = false) {
         // applyConfig 后的同步：模型尚未加载，按应用配置前的状态在同步结束后恢复。
         let wasMain = restore?.main ?? mainModelLoaded
         // 同步结束后的恢复也必须看当前开关：关闭时即使旧状态是已加载也不恢复。
         let wasAux = (restore?.aux ?? auxModelLoaded) && config.auxEnabled
         let modelNote = config.auxEnabled ? "主/辅助模型" : "主模型（辅助模型未启用）"
-        appendLog("[rag] 同步开始：先卸载\(modelNote)，结束后重新加载并预热主模型")
+        if rebuildVector {
+            appendLog("[rag] 重建向量库：先卸载\(modelNote)，按当前元素类型/Matryoshka 配置重建后全量同步")
+        } else {
+            appendLog("[rag] 同步开始：先卸载\(modelNote)，结束后重新加载并预热主模型")
+        }
         // 同步期间卸载已加载的主/辅模型，释放权重与 KV cache。
         suspendModelsForSync()
 
-        statusText = force ? "强制同步知识库…" : "同步知识库…"
+        statusText = rebuildVector ? "正在重建向量库…" : (force ? "强制同步知识库…" : "同步知识库…")
         let syncGen = generation
         syncTask = Task.detached(priority: .userInitiated) { [weak self, weak agent] in
             guard let agent else {
@@ -1294,13 +1366,34 @@ final class AppViewModel: ObservableObject {
             // 给 MLX/GGUF 的异步卸载一点收尾时间，避免刚释放的权重与
             // RAG 的 embedding 模型抢内存。GGUF 是同步释放，这里几乎无感知。
             try? await Task.sleep(nanoseconds: 200_000_000)
-            let stats = await agent.ragEngine.ingest(force: force) { current, total, file in
-                Task { @MainActor [weak self] in
-                    guard let self, self.syncGeneration == syncGen else { return }
-                    self.statusText = "同步 \(current)/\(total) \(file)"
+            let stats: IngestStats
+            var rebuildSummary: String?
+            if rebuildVector {
+                let result = await agent.ragEngine.rebuildVectorIndex { current, total, file in
+                    Task { @MainActor [weak self] in
+                        guard let self, self.syncGeneration == syncGen else { return }
+                        self.statusText = "重建后同步 \(current)/\(total) \(file)"
+                    }
+                } log: { line in
+                    Task { @MainActor [weak self] in self?.appendLog(line) }
                 }
-            } log: { line in
-                Task { @MainActor [weak self] in self?.appendLog(line) }
+                if let result {
+                    rebuildSummary = result.summary
+                    stats = result.ingest ?? IngestStats()
+                } else {
+                    var failed = IngestStats()
+                    failed.errors.append("向量库重建未执行或被中断，详情见日志")
+                    stats = failed
+                }
+            } else {
+                stats = await agent.ragEngine.ingest(force: force) { current, total, file in
+                    Task { @MainActor [weak self] in
+                        guard let self, self.syncGeneration == syncGen else { return }
+                        self.statusText = "同步 \(current)/\(total) \(file)"
+                    }
+                } log: { line in
+                    Task { @MainActor [weak self] in self?.appendLog(line) }
+                }
             }
             // 只重载实际执行同步的引擎：配置切换后 self.agent 可能已经是新实例，
             // 绝不能把旧同步的结果作用到新 agent 上。
@@ -1310,6 +1403,9 @@ final class AppViewModel: ObservableObject {
                 self.isSyncing = false
                 self.isStoppingSync = false
                 self.syncTask = nil
+                if let rebuildSummary {
+                    self.appendLog("RAG: \(rebuildSummary)")
+                }
                 self.appendLog("RAG: \(stats.summary)")
                 for error in stats.errors.prefix(20) {
                     self.appendLog("RAG 错误: \(error)")
@@ -1411,6 +1507,13 @@ final class AppViewModel: ObservableObject {
             let sources = status["source_count"]?.intValue
                 ?? status["sources"]?.arrayValue?.count ?? 0
             let ann = status["ann_index"]?.stringValue ?? ""
+            let elementType = status["vector_element_type"]?.stringValue ?? ""
+            let mrlDim = status["matryoshka_dim"]?.intValue ?? 0
+            let rebuildRequired = status["vector_rebuild_required"]?.boolValue ?? false
+            let rebuildReason = status["rebuild_reason"]?.stringValue ?? ""
+            let vectorText = elementType.isEmpty
+                ? ""
+                : "\(elementType)" + (mrlDim > 0 ? " · Matryoshka \(mrlDim) 维" : "")
             // 超时/不可用时 status 带 error：状态栏给可读提示，不显示误导性的 0 切片。
             let text: String
             if let reason = status["error"]?.stringValue {
@@ -1425,6 +1528,9 @@ final class AppViewModel: ObservableObject {
                    ObjectIdentifier(current) == targetID {
                     self.ragStatusText = text
                     if !ann.isEmpty { self.annStatusText = ann }
+                    if !vectorText.isEmpty { self.vectorStatusText = vectorText }
+                    self.vectorRebuildRequired = rebuildRequired
+                    self.vectorRebuildReason = rebuildReason
                 } else {
                     // agent 已切换：丢弃旧结果，重新为新实例取一次状态。
                     self.refreshRAGStatus()

@@ -147,13 +147,13 @@ public final class LocalModelFactory: @unchecked Sendable {
         let name = config.localEmbeddingModel.isEmpty
             ? config.ragEmbeddingModel
             : config.localEmbeddingModel
-        // MLX 后端默认用独立的 MLX 权重目录名（bge-small-zh-v1.5，中文检索
-        // 全面优于 nomic），与 ONNX 量化名区分；显式配置了
-        // local_embedding_model / _path 时以用户配置为准。
+        // MLX 后端默认用独立的 MLX 权重目录名（nomic-embed-text-v1.5 int8，
+        // 768 维、8192 窗口、支持 Matryoshka 截断），与 ONNX 量化名区分；
+        // 显式配置了 local_embedding_model / _path 时以用户配置为准。
         let effectiveName = (backend == "mlx"
                              && config.localEmbeddingModel.isEmpty
                              && config.localEmbeddingModelPath.isEmpty)
-            ? "bge-small-zh-v1.5-mlx"
+            ? "nomic-embed-text-v1.5-mlx-int8"
             : name
         let value = config.localEmbeddingModelPath.isEmpty
             ? effectiveName

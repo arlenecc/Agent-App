@@ -158,12 +158,24 @@ public final class RagStatusTool: AgentTool {
         let sources = status["sources"]?.arrayValue?.compactMap(\.stringValue) ?? []
         let sourceCount = status["source_count"]?.intValue ?? sources.count
         let annIndex = status["ann_index"]?.stringValue ?? ""
+        let elementType = status["vector_element_type"]?.stringValue ?? ""
+        let matryoshkaDim = status["matryoshka_dim"]?.intValue ?? 0
+        let rebuildRequired = status["vector_rebuild_required"]?.boolValue ?? false
+        let rebuildReason = status["rebuild_reason"]?.stringValue ?? ""
 
         var lines: [String] = ["知识库状态:"]
         lines.append("  知识库目录: \(knowledgeBase.isEmpty ? "（未设置）" : knowledgeBase)")
         lines.append("  RAG 目录: \(ragDir)")
         lines.append("  已存储切片数: \(chunks)")
         if !backend.isEmpty { lines.append("  向量后端: \(backend)") }
+        if !elementType.isEmpty {
+            lines.append("  向量元素类型: \(elementType)"
+                + (matryoshkaDim > 0 ? "，Matryoshka 截断 \(matryoshkaDim) 维" : ""))
+        }
+        if rebuildRequired {
+            lines.append("  向量库待重建: \(rebuildReason.isEmpty ? "配置已变化" : rebuildReason)")
+            lines.append("    提示: 向量检索暂停（全文检索仍可用），请在设置中执行「重建向量库」")
+        }
         if !annIndex.isEmpty { lines.append("  ANN 索引: \(annIndex)") }
         lines.append("  已索引文件数: \(sourceCount)")
         if !sources.isEmpty {

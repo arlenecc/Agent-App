@@ -287,7 +287,9 @@ final class RAGEngineTests: XCTestCase {
 
         // 模拟历史遗留/外部写入：乙文档已被写入与甲文档完全相同的切片。
         let store = try VectorStore(dbPath: config.dbPath, dimension: 8,
-                                    enableSQLiteVec: config.ragSQLiteVecEnabled)
+                                    enableSQLiteVec: config.ragSQLiteVecEnabled,
+                                    elementType: config.ragVectorElementType,
+                                    indexFingerprint: engine.vectorIndexFingerprint)
         let sources = store.listSources()
         guard let sourceA = sources.first(where: { $0.hasSuffix("/a.md") }),
               let sourceB = sources.first(where: { $0.hasSuffix("/b.md") }) else {
@@ -371,7 +373,9 @@ final class RAGEngineTests: XCTestCase {
 
         // 模拟「manifest 说完成、库里却没有切片」：外部清理/上次写入中断。
         let store = try VectorStore(dbPath: config.dbPath, dimension: 8,
-                                    enableSQLiteVec: config.ragSQLiteVecEnabled)
+                                    enableSQLiteVec: config.ragSQLiteVecEnabled,
+                                    elementType: config.ragVectorElementType,
+                                    indexFingerprint: first.vectorIndexFingerprint)
         guard let doc1Source = store.listSources().first(where: {
             $0.hasSuffix("/doc1.md")
         }) else {

@@ -75,8 +75,12 @@ struct SettingsView: View {
     @State private var vlmBackend = "mlx"
     @State private var ocrPreprocess = true
     @State private var ocrBinarize = true
-    @State private var chunkSize = 500
-    @State private var chunkOverlap = 50
+    @State private var chunkSize = 800
+    @State private var chunkOverlap = 80
+    /// 向量落盘元素类型与 Matryoshka 截断策略。
+    @State private var vectorElementType: VectorElementType = .int8
+    @State private var matryoshkaMode: MatryoshkaMode = .auto
+    @State private var matryoshkaDim = 512
     @State private var rerankEnabled = true
     @State private var rerankTopN = 5
     @State private var semanticChunking = true
@@ -496,6 +500,32 @@ struct SettingsView: View {
                     }
                 }
 
+                // 向量存储行：元素类型 / Matryoshka / 显式重建。
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 8) {
+                        vectorStorageControls
+                        Spacer(minLength: 8)
+                        vectorRebuildButtons()
+                    }
+                    VStack(alignment: .leading, spacing: 6) {
+                        vectorStorageControls
+                        HStack(spacing: 8) {
+                            Spacer(minLength: 8)
+                            vectorRebuildButtons()
+                        }
+                    }
+                }
+                if model.vectorRebuildRequired {
+                    HStack(alignment: .firstTextBaseline, spacing: 6) {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                        Text("向量库需重建：\(model.vectorRebuildReason)。"
+                            + "旧切片仍保留，全文检索可用；重建会按当前配置清空并全量重新同步。")
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
+                    .font(.caption2)
+                    .foregroundStyle(.red)
+                }
+
                 DisclosureGroup("高级 RAG / OCR 设置", isExpanded: $showAdvanced) {
                     VStack(alignment: .leading, spacing: 10) {
                         HStack(spacing: 8) {
@@ -740,6 +770,64 @@ struct SettingsView: View {
                 || model.isRunning)
     }
 
+    // MARK: - 向量存储 / Matryoshka
+
+    /// 向量落盘元素类型 + Matryoshka 模式/截断维 + 当前生效摘要。
+    @ViewBuilder
+    private var vectorStorageControls: some View {
+        Text("向量库").font(.caption)
+        Picker("", selection: $vectorElementType) {
+            ForEach(VectorElementType.allCases, id: \.rawValue) { type in
+                Text(vectorElementLabel(type)).tag(type)
+            }
+        }
+        .labelsHidden()
+        .frame(width: 120)
+        .help("向量落盘元素类型：int8 体积是 fp32 的 1/4（默认）；bin 体积最小但只有汉明排序。"
+            + "fp16 在 sqlite-vec 0.1.9 中不可用，选择后应用配置会直接报错。")
+        Text("Matryoshka").font(.caption)
+        Picker("", selection: $matryoshkaMode) {
+            ForEach(MatryoshkaMode.allCases, id: \.rawValue) { mode in
+                Text(mode.displayName).tag(mode)
+            }
+        }
+        .labelsHidden()
+        .frame(width: 135)
+        .help("截断向量后强制重新归一化，入库与查询使用同一套变换。"
+            + "自动模式只对 nomic 等已知支持该特性的模型启用。")
+        Picker("", selection: $matryoshkaDim) {
+            Text("128 维").tag(128)
+            Text("256 维").tag(256)
+            Text("512 维").tag(512)
+        }
+        .labelsHidden()
+        .frame(width: 90)
+        .disabled(matryoshkaMode == .off)
+        .help("Matryoshka 截断维：越小向量库越小、召回精度越低；默认 512。")
+        Text(model.vectorStatusText)
+            .font(.caption2)
+            .foregroundStyle(model.vectorRebuildRequired ? .red : .secondary)
+            .lineLimit(1)
+    }
+
+    @ViewBuilder
+    private func vectorRebuildButtons() -> some View {
+        Button("重建向量库") { model.requestVectorRebuild() }
+            .help("按当前元素类型/Matryoshka 配置重建向量表：清空旧切片、全文索引与 ANN 索引后"
+                + "全量重新同步；可中断，知识库原始文件不受影响")
+            .disabled(model.isSyncing || model.isDeduplicating || model.isBuildingANN
+                || model.isModelLoading || model.isWarmingUp || model.isRunning)
+    }
+
+    private func vectorElementLabel(_ type: VectorElementType) -> String {
+        switch type {
+        case .fp32: return "FP32"
+        case .int8: return "INT8（推荐）"
+        case .fp16: return "FP16（不支持）"
+        case .bin: return "BIN（最小）"
+        }
+    }
+
     // MARK: - 参数控件
 
     /// 参数区：优先把数字字段与开关放在同一行；窗口较窄时拆成「数字字段」
@@ -931,6 +1019,9 @@ struct SettingsView: View {
         ocrBinarize = config.ragOCRBinarize
         chunkSize = config.ragChunkSize
         chunkOverlap = config.ragChunkOverlap
+        vectorElementType = config.ragVectorElementType
+        matryoshkaMode = config.ragMatryoshka
+        matryoshkaDim = config.ragMatryoshkaDim
         rerankEnabled = config.ragRerankEnabled
         rerankTopN = config.ragRerankTopN
         semanticChunking = config.ragSemanticChunking
@@ -1130,6 +1221,11 @@ struct SettingsView: View {
             statusMessage = "Embedding 类型 \(embeddingBackend) 当前版本尚未接入，请选择 ONNX / FastEmbed / MLX / GGUF"
             return nil
         }
+        // fp16：sqlite-vec 0.1.9 没有该元素类型，直接拒绝应用并给出明确提示。
+        if let reason = vectorElementType.unsupportedReason {
+            statusMessage = reason
+            return nil
+        }
         let rb = AgentConfig.normalizeEmbeddingBackend(rerankerBackend)
         if rerankEnabled, rb != "onnx", rb != "fastembed", rb != "mlx", rb != "gguf" {
             statusMessage = "Reranker 类型 \(rerankerBackend) 当前版本尚未接入，请选择 ONNX / FastEmbed / MLX / GGUF"
@@ -1223,6 +1319,9 @@ struct SettingsView: View {
         config.ragRerankTopN = min(max(1, rerankTopN), 20)
         config.ragSemanticChunking = semanticChunking
         config.ragAutoIngest = autoIngest
+        config.ragVectorElementType = vectorElementType
+        config.ragMatryoshka = matryoshkaMode
+        config.ragMatryoshkaDim = [128, 256, 512].contains(matryoshkaDim) ? matryoshkaDim : 512
         config.ragEmbeddingMaxBatch = min(max(2, embeddingMaxBatch), 256)
         config.ragEmbeddingMinBatch = min(max(2, embeddingMinBatch), 64)
         config.ragEmbeddingMinBatch = min(config.ragEmbeddingMinBatch,
