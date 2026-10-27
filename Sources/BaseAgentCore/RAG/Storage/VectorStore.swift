@@ -27,7 +27,9 @@ public final class VectorStore: @unchecked Sendable {
     public private(set) var vectorEnabled: Bool = false
     /// 维度变化导致旧索引被清空；RAGEngine 据此同步失效 manifest。
     public private(set) var didResetForDimensionChange = false
-    private let lock = NSRecursiveLock()
+    /// 写入/删除/检索共用。ANN 实现（`VectorStoreANN.swift`）也在同一把锁内，
+    /// 因此改为 internal。
+    let lock = NSRecursiveLock()
     private let deleteBatchSize = 400
     private let insertBatchSize = 200
     /// sqlite-vec 的 KNN k 上限为 4096；分批/过滤不能越过该值。
@@ -37,6 +39,9 @@ public final class VectorStore: @unchecked Sendable {
     /// 旧库没有该键时用 `MAX(rowid)` 作为基线（O(1)，可能略高但不阻塞）。
     private var cachedChunkCount: Int?
     private static let chunkCountKey = "chunks_count"
+    /// ANN 簇心缓存（懒加载）。扩展无法新增存储属性，因此声明在这里，
+    /// 由 `VectorStoreANN.swift` 读写。
+    var annCentroidCache: ANNCentroidCache?
 
     public init(dbPath: String, dimension: Int, enableSQLiteVec: Bool = true) throws {
         self.dimension = max(1, dimension)
@@ -128,6 +133,10 @@ public final class VectorStore: @unchecked Sendable {
             didResetForDimensionChange = true
             try db.transaction {
                 try db.execute("DROP TABLE IF EXISTS \(Self.vectorTable)")
+                // 维度变化后 ANN 索引的码值/簇心全部失效，直接删表重建。
+                try db.execute("DROP TABLE IF EXISTS \(Self.annCellsTable)")
+                try db.execute("DROP TABLE IF EXISTS \(Self.annBlocksTable)")
+                try db.execute("DELETE FROM meta WHERE key GLOB 'ann_*'")
                 try db.execute("DELETE FROM \(Self.chunksTable)")
                 try db.execute("DELETE FROM \(Self.ftsTable)")
                 try db.execute("DELETE FROM \(Self.documentsTable)")
@@ -256,6 +265,8 @@ public final class VectorStore: @unchecked Sendable {
         let resolved = max(1, newDimension)
         try db.transaction {
             try db.execute("DROP TABLE IF EXISTS \(Self.vectorTable)")
+            // 只在空库上重建，但旧维度的 ANN 索引同样必须丢弃。
+            try? resetANNIndexLocked()
             try ensureVectorTable(dimension: resolved, useVec0: vectorEnabled)
             try db.execute(
                 "INSERT INTO meta(key, value) VALUES('embedding_dim', ?) "
@@ -441,7 +452,8 @@ public final class VectorStore: @unchecked Sendable {
         return result
     }
 
-    /// 清空全部切片/向量/文档元数据（单事务）。
+    /// 清空全部切片/向量/文档元数据（单事务）。ANN 索引同步清空：
+    /// 索引里的 rowid 全部失效，留着只会误导状态展示。
     public func clear() throws {
         lock.lock(); defer { lock.unlock() }
         try withChunkCounterRollback {
@@ -450,6 +462,8 @@ public final class VectorStore: @unchecked Sendable {
                 try db.execute("DELETE FROM \(Self.ftsTable)")
                 try db.execute("DELETE FROM \(Self.vectorTable)")
                 try db.execute("DELETE FROM \(Self.documentsTable)")
+                // ANN 索引里的 rowid 与维度都失效，直接丢弃（表可能还没建）。
+                try? resetANNIndexLocked()
                 self.cachedChunkCount = 0
                 try persistChunkCounterLocked()
             }
@@ -543,8 +557,12 @@ public final class VectorStore: @unchecked Sendable {
     /// 两段式向量 KNN：
     /// 1) 向量表 KNN 取 rowid（over-fetch）；
     /// 2) 主表按 rowid 批量取正文（无 JOIN）。
+    ///
+    /// `ann` 非空时优先走分块 IVF 向量索引；索引不可用（未构建/维度不符/
+    /// 尾块超出可扫描范围）时自动回退到精确路径，调用方无需判断。
     public func search(vector: [Float], topK: Int, sourceFilter: String? = nil,
-                       sourceContains: String? = nil) throws -> [SearchHit] {
+                       sourceContains: String? = nil,
+                       ann: ANNQueryOptions? = nil) throws -> [SearchHit] {
         guard topK > 0 else { return [] }
         guard vector.count == dimension else {
             throw AgentError.storage("查询向量维度 \(vector.count) != \(dimension)")
@@ -553,6 +571,20 @@ public final class VectorStore: @unchecked Sendable {
         // 否则 KNN 拿到的 rowid 可能在 hydrate 时已被删掉。
         lock.lock(); defer { lock.unlock() }
         guard hasChunks else { return [] }
+        if let ann,
+           let hits = try annSearchLocked(vector: vector, topK: topK, options: ann,
+                                          sourceFilter: sourceFilter,
+                                          sourceContains: sourceContains) {
+            return hits
+        }
+        return try bruteSearchLocked(vector: vector, topK: topK,
+                                     sourceFilter: sourceFilter,
+                                     sourceContains: sourceContains)
+    }
+
+    /// 精确检索（vec0 KNN 或全表扫描）。调用方需已持有 `lock` 且确认库非空。
+    func bruteSearchLocked(vector: [Float], topK: Int, sourceFilter: String?,
+                           sourceContains: String?) throws -> [SearchHit] {
         let query = VectorCodec.normalize(vector)
         let targeted = sourceFilter != nil || sourceContains != nil
 
@@ -573,6 +605,37 @@ public final class VectorStore: @unchecked Sendable {
             return try hydrate(candidates: candidates, sourceFilter: sourceFilter,
                                sourceContains: sourceContains, limit: topK)
         }
+    }
+
+    /// vec0 点查精确向量（供 ANN 重打分使用）；非 vec0 库走普通表的按 rowid 查询。
+    func exactVectorsLocked(rowIDs: [Int64]) throws -> [Int64: [Float]] {
+        guard !rowIDs.isEmpty else { return [:] }
+        var output: [Int64: [Float]] = [:]
+        output.reserveCapacity(rowIDs.count)
+        var index = 0
+        while index < rowIDs.count {
+            let batch = Array(rowIDs[index..<min(index + deleteBatchSize, rowIDs.count)])
+            let placeholders = Array(repeating: "?", count: batch.count).joined(separator: ",")
+            let rows = try db.query(
+                "SELECT rowid, embedding FROM \(Self.vectorTable) WHERE rowid IN (\(placeholders))",
+                batch.map { SQLValue.int($0) })
+            for row in rows {
+                guard let rowID = row["rowid"]?.intValue,
+                      let data = row["embedding"]?.dataValue else { continue }
+                output[rowID] = VectorCodec.decode(data)
+            }
+            index += batch.count
+        }
+        return output
+    }
+
+    /// 某个来源的全部切片 rowid（按 chunk_index 升序）。走 (source_hash,
+    /// chunk_index) 索引，不做全表扫描。
+    public func rowIDs(source: String) throws -> [Int64] {
+        let rows = try db.query("""
+        SELECT rowid FROM \(Self.chunksTable) WHERE source_hash = ? ORDER BY chunk_index ASC
+        """, [.text(Self.hashSource(source))])
+        return rows.compactMap { $0["rowid"]?.intValue }
     }
 
     private func knnVec0(query: [Float], k: Int) throws -> [(Int64, Double)] {
@@ -611,8 +674,9 @@ public final class VectorStore: @unchecked Sendable {
         return scored.sorted { $0.1 > $1.1 }
     }
 
-    private func hydrate(candidates: [(Int64, Double)], sourceFilter: String?,
-                         sourceContains: String? = nil, limit: Int) throws -> [SearchHit] {
+    /// 二段式收尾：按 rowid 批量取正文并过滤（精确路径与 ANN 路径共用）。
+    func hydrate(candidates: [(Int64, Double)], sourceFilter: String?,
+                 sourceContains: String? = nil, limit: Int) throws -> [SearchHit] {
         guard !candidates.isEmpty else { return [] }
         var result: [SearchHit] = []
         result.reserveCapacity(min(limit, candidates.count))
@@ -741,14 +805,17 @@ public final class VectorStore: @unchecked Sendable {
     /// 混合检索：FTS5 + 向量 → RRF 融合。
     /// - 两路各自 over-fetch（`topK * overfetch`）；
     /// - 定向检索时向量通道自动放大召回；
-    /// - 融合只按 rowid，不 JOIN 虚拟表。
+    /// - 融合只按 rowid，不 JOIN 虚拟表；
+    /// - `ann` 非空且索引可用时，向量通道走 ANN（失败自动回退精确路径）。
     public func hybridSearch(vector: [Float], query: String, topK: Int,
                              sourceFilter: String? = nil,
                              sourceContains: String? = nil,
-                             rrfK: Int = 60, overfetch: Int = 4) throws -> [SearchHit] {
+                             rrfK: Int = 60, overfetch: Int = 4,
+                             ann: ANNQueryOptions? = nil) throws -> [SearchHit] {
         let candidateCount = max(topK * max(1, overfetch) * 4, 20)
         let vectorHits = try search(vector: vector, topK: candidateCount,
-                                    sourceFilter: sourceFilter, sourceContains: sourceContains)
+                                    sourceFilter: sourceFilter, sourceContains: sourceContains,
+                                    ann: ann)
         let ftsHits = try searchFTS(query: query, topK: candidateCount,
                                     sourceFilter: sourceFilter, sourceContains: sourceContains)
 

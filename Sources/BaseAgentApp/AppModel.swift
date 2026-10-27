@@ -176,6 +176,10 @@ final class AppViewModel: ObservableObject {
     @Published var isStoppingSync = false
     /// 正在手动清理向量库内的重复切片。
     @Published var isDeduplicating = false
+    /// 正在构建/续建向量库的 ANN 索引（构建期间检索会按超时跳过）。
+    @Published var isBuildingANN = false
+    /// ANN 索引摘要（设置窗口显示，来自 RAG status 快照）。
+    @Published var annStatusText = "ANN 索引未构建"
     @Published var isModelLoading = false
     /// 主模型加载完成后的 KV 预热阶段；期间禁止发送消息，避免和 prefill 争夺模型。
     @Published var isWarmingUp = false
@@ -360,9 +364,9 @@ final class AppViewModel: ObservableObject {
     /// 不能只替换 LLM —— Agent 与 RAGEngine 都持有配置快照，必须整体重建，
     /// 否则会出现「面板设了长切片、运行时仍按短切片处理」这类不同步。
     private func reloadModel(_ slot: ModelSlot, config newConfig: AgentConfig) {
-        guard !isSyncing, !isDeduplicating else {
+        guard !isSyncing, !isDeduplicating, !isBuildingANN else {
             isModelLoading = false
-            appendLog("[model] 知识同步进行中，暂不加载模型")
+            appendLog("[model] 知识同步/索引构建进行中，暂不加载模型")
             return
         }
         let allowed = slot == .main
@@ -391,9 +395,9 @@ final class AppViewModel: ObservableObject {
 
     /// 重建 Agent 会同时关闭主/辅模型；这里只替换目标槽位，另一个模型保持常驻。
     private func swapModel(_ slot: ModelSlot, config newConfig: AgentConfig) {
-        guard !isSyncing, !isDeduplicating else {
+        guard !isSyncing, !isDeduplicating, !isBuildingANN else {
             isModelLoading = false
-            appendLog("[model] 知识同步进行中，暂不加载模型")
+            appendLog("[model] 知识同步/索引构建进行中，暂不加载模型")
             return
         }
         let oldTask = runTask
@@ -685,7 +689,7 @@ final class AppViewModel: ObservableObject {
     func send(_ input: String) {
         let text = input.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty, !isRunning, !isModelLoading, !isWarmingUp,
-              !isSyncing, !isDeduplicating, let agent else { return }
+              !isSyncing, !isDeduplicating, !isBuildingANN, let agent else { return }
         cancelIdleUnload()
         runGeneration += 1
         let generation = runGeneration
@@ -753,7 +757,7 @@ final class AppViewModel: ObservableObject {
             try? await Task.sleep(nanoseconds: 180_000_000_000)
             guard let self, !Task.isCancelled else { return }
             guard !self.isRunning, !self.isModelLoading, !self.isWarmingUp,
-                  !self.isSyncing, !self.isDeduplicating,
+                  !self.isSyncing, !self.isDeduplicating, !self.isBuildingANN,
                   (self.agent?.isBackgroundIdle() ?? true) else { return }
             // 主模型 / 辅助模型 / Reranker 常驻；只回收按需使用的 Embedding 与 OCR。
             await LocalModelFactory.shared.unloadIdleRAGModelWeights()
@@ -1013,6 +1017,183 @@ final class AppViewModel: ObservableObject {
         return alert.runModal() == .alertSecondButtonReturn
     }
 
+    // MARK: ANN 索引
+
+    /// 点击「构建 ANN 索引」：先取一次索引状态，已有索引时确认重建，再启动构建。
+    ///
+    /// 构建期间 store 被构建线程独占，检索会按只读超时跳过（知识库暂时「不可检索」），
+    /// 因此只允许在空闲时启动；已在跑的同步/去重/对话都要先结束。
+    func requestANNIndexBuild() {
+        guard let agent else {
+            showInfoAlert(title: "ANN 索引", message: "RAG 尚未就绪，请先在知识同步配置中应用配置。")
+            return
+        }
+        if isSyncing {
+            showInfoAlert(title: "暂不能构建 ANN 索引", message: "知识同步正在进行，请等同步结束后再试。")
+            return
+        }
+        if isDeduplicating {
+            showInfoAlert(title: "暂不能构建 ANN 索引", message: "向量去重正在进行，请稍后再试。")
+            return
+        }
+        if isBuildingANN {
+            showInfoAlert(title: "ANN 索引构建中",
+                          message: "正在构建 ANN 索引。可点「停止构建」中断，已写完的块会保留，下次从断点续建。")
+            return
+        }
+        if isModelLoading || isWarmingUp {
+            showInfoAlert(title: "暂不能构建 ANN 索引", message: "模型正在加载或预热，请稍后再试。")
+            return
+        }
+        if isRunning {
+            showInfoAlert(title: "暂不能构建 ANN 索引", message: "对话正在生成，请等本轮结束后再试。")
+            return
+        }
+        cancelIdleUnload()
+        isBuildingANN = true
+        statusText = "正在读取 ANN 索引状态…"
+        let target = ObjectIdentifier(agent)
+        Task.detached(priority: .utility) {
+            let status = agent.ragEngine.annIndexStatus()
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                guard let current = self.agent, ObjectIdentifier(current) == target else {
+                    self.isBuildingANN = false
+                    self.statusText = "就绪"
+                    self.scheduleIdleUnload()
+                    return
+                }
+                if let status {
+                    self.annStatusText = status.summary
+                    // 已有索引：重建要丢弃现有索引并整库重跑，先确认。
+                    if status.blocks > 0, !self.confirmANNIndexRebuild(status) {
+                        self.isBuildingANN = false
+                        self.statusText = "就绪"
+                        self.appendLog("[rag] 已取消 ANN 索引构建")
+                        self.scheduleIdleUnload()
+                        return
+                    }
+                }
+                self.performANNIndexBuild(agent: agent, target: target)
+            }
+        }
+    }
+
+    /// 用户确认后真正启动构建：进度写状态栏，逐块日志由引擎按 10s 限流输出。
+    private func performANNIndexBuild(agent: Agent, target: ObjectIdentifier) {
+        guard !isSyncing, !isDeduplicating, !isModelLoading, !isRunning, !isWarmingUp else {
+            isBuildingANN = false
+            showInfoAlert(title: "暂不能构建 ANN 索引", message: "当前有任务正在进行，请稍后再试。")
+            return
+        }
+        cancelIdleUnload()
+        isBuildingANN = true
+        statusText = "正在构建 ANN 索引…"
+        appendLog("[rag] 开始构建 ANN 索引：分块 IVF，块内 k-means + int8 量化；"
+            + "构建期间知识检索会被只读超时跳过")
+        Task.detached(priority: .utility) {
+            let result = agent.ragEngine.buildANNIndex { update in
+                Task { @MainActor [weak self] in
+                    guard let self, self.isBuildingANN else { return }
+                    self.statusText = update.message
+                }
+            } log: { line in
+                Task { @MainActor [weak self] in self?.appendLog(line) }
+            }
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.isBuildingANN = false
+                if let current = self.agent, ObjectIdentifier(current) == target {
+                    self.refreshRAGStatus()
+                }
+                switch result {
+                case .none:
+                    self.appendLog("RAG: ANN 索引构建未执行（被拒绝或失败，详见日志）")
+                    self.statusText = "ANN 索引构建失败"
+                    self.showInfoAlert(
+                        title: "ANN 索引构建失败",
+                        message: "构建未执行或被中断，详情见日志。已写完的块会保留，可再次构建从断点续建。")
+                case .some(let build):
+                    self.appendLog("RAG: ANN 索引构建结束 — \(build.summary)")
+                    self.statusText = build.cancelled ? "ANN 索引构建已停止" : "ANN 索引构建完成"
+                    self.showInfoAlert(
+                        title: build.cancelled ? "ANN 索引构建已停止" : "ANN 索引构建完成",
+                        message: build.summary + (build.cancelled ? "。已写完的块会保留，可再次构建续建。" : "。"))
+                }
+                self.scheduleIdleUnload()
+            }
+        }
+    }
+
+    /// 停止 ANN 索引构建。已写完的块保留，下次构建从断点（rowid 水位）继续。
+    func stopANNIndexBuild() {
+        guard isBuildingANN else { return }
+        statusText = "正在停止 ANN 索引构建…"
+        appendLog("用户请求停止 ANN 索引构建")
+        // 引擎在每个块之间检查取消标志，块内不中断，保证已落盘数据一致。
+        agent?.ragEngine.cancel()
+    }
+
+    private func confirmANNIndexRebuild(_ status: ANNIndexStatus) -> Bool {
+        let alert = NSAlert()
+        alert.messageText = "确认重建 ANN 索引"
+        alert.informativeText = """
+        当前索引：\(status.summary)。
+        重建会先删除现有索引（含 \(status.indexedRows) 个已索引切片），再整库重新聚类写入；
+        大库上这一步可能耗时数十分钟，期间知识检索会按超时跳过。
+        """
+        alert.alertStyle = .warning
+        // 默认按钮是「取消」，避免误触长时间占用。
+        alert.addButton(withTitle: "取消")
+        alert.addButton(withTitle: "重建")
+        NSApp.activate(ignoringOtherApps: true)
+        return alert.runModal() == .alertSecondButtonReturn
+    }
+
+    /// 删除现有 ANN 索引，回到精确检索（不重跑构建）。
+    func requestDropANNIndex() {
+        guard let agent else {
+            showInfoAlert(title: "ANN 索引", message: "RAG 尚未就绪，请先在知识同步配置中应用配置。")
+            return
+        }
+        guard !isSyncing, !isBuildingANN, !isDeduplicating, !isRunning,
+              !isModelLoading, !isWarmingUp else {
+            showInfoAlert(title: "暂不能删除 ANN 索引", message: "当前有任务正在进行，请稍后再试。")
+            return
+        }
+        let target = ObjectIdentifier(agent)
+        isBuildingANN = true
+        statusText = "正在删除 ANN 索引…"
+        appendLog("[rag] 开始删除 ANN 索引（删除后检索回退精确扫描）")
+        Task.detached(priority: .utility) {
+            let result: Result<Void, Error>
+            do {
+                try agent.ragEngine.dropANNIndex()
+                result = .success(())
+            } catch {
+                result = .failure(error)
+            }
+            await MainActor.run { [weak self] in
+                guard let self else { return }
+                self.isBuildingANN = false
+                if let current = self.agent, ObjectIdentifier(current) == target {
+                    self.refreshRAGStatus()
+                }
+                switch result {
+                case .success:
+                    self.appendLog("RAG: ANN 索引已删除")
+                    self.statusText = "ANN 索引已删除"
+                case .failure(let error):
+                    self.appendLog("RAG: 删除 ANN 索引失败 — \(error.localizedDescription)")
+                    self.statusText = "删除 ANN 索引失败"
+                    self.showInfoAlert(title: "删除 ANN 索引失败",
+                                       message: error.localizedDescription)
+                }
+                self.scheduleIdleUnload()
+            }
+        }
+    }
+
     private func showInfoAlert(title: String, message: String) {
         let alert = NSAlert()
         alert.messageText = title
@@ -1025,7 +1206,7 @@ final class AppViewModel: ObservableObject {
     func syncKnowledgeBase(force: Bool) {
         let restore = pendingSyncRestore
         pendingSyncRestore = nil
-        guard let agent, !isSyncing, !isDeduplicating else { return }
+        guard let agent, !isSyncing, !isDeduplicating, !isBuildingANN else { return }
         cancelIdleUnload()
         if isRunning {
             appendLog("[rag] 对话进行中，跳过本次同步")
@@ -1229,6 +1410,7 @@ final class AppViewModel: ObservableObject {
             let backend = status["vector_backend"]?.stringValue ?? "sqlite"
             let sources = status["source_count"]?.intValue
                 ?? status["sources"]?.arrayValue?.count ?? 0
+            let ann = status["ann_index"]?.stringValue ?? ""
             // 超时/不可用时 status 带 error：状态栏给可读提示，不显示误导性的 0 切片。
             let text: String
             if let reason = status["error"]?.stringValue {
@@ -1242,6 +1424,7 @@ final class AppViewModel: ObservableObject {
                 if let current = self.agent,
                    ObjectIdentifier(current) == targetID {
                     self.ragStatusText = text
+                    if !ann.isEmpty { self.annStatusText = ann }
                 } else {
                     // agent 已切换：丢弃旧结果，重新为新实例取一次状态。
                     self.refreshRAGStatus()

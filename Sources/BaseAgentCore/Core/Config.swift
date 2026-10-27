@@ -228,6 +228,24 @@ public struct AgentConfig: Sendable {
     /// FTS5 召回 over-fetch 倍数。
     public var ragFTSOverfetch: Int = 4
 
+    // ANN 向量索引（分块 IVF，见 VectorStoreANN.swift）
+    /// 检索是否走 ANN 索引。索引不可用（未构建/维度不符/尾块超预算）时
+    /// 自动回退精确检索；关闭则始终精确检索（大库上会超时被跳过）。
+    public var ragANNEnabled: Bool = true
+    /// 每块簇数。块越大召回越稳、内存峰值越高（块 = 簇数 × 每簇行数）。
+    public var ragANNClusters: Int = 256
+    /// 每簇行数。簇越小越省读放大、召回越依赖 nprobe。
+    public var ragANNClusterSize: Int = 512
+    /// 每块探测的簇数（1 = 最快，召回随探测数上升）。
+    public var ragANNProbe: Int = 1
+    /// 用精确向量重打分的候选数（0 = 关闭）。int8 量化排序有微小误差，
+    /// 重打分只对少量候选做点查，成本可忽略。
+    public var ragANNRescore: Int = 32
+    /// 自动构建的切片数下限：小库上精确扫描足够快，不值得建索引。
+    public var ragANNMinChunks: Int = 20_000
+    /// 同步结束后自动构建/续建 ANN 索引（索引已就绪且尾块不多时跳过）。
+    public var ragANNAutoBuild: Bool = true
+
     // 本地模型 provider
     // 模型类型统一使用 mlx-lm / mlx-vlm / onnx / gguf；旧值 mlx 迁移为 mlx-lm。
     public var llmProvider: String = "local"
@@ -430,6 +448,13 @@ public struct AgentConfig: Sendable {
         if let v = bool("rag_rerank_enabled") { ragRerankEnabled = v }
         if let v = int("rag_rerank_top_n") { ragRerankTopN = v }
         if let v = double("rag_query_timeout_seconds"), v >= 0 { ragQueryTimeoutSeconds = v }
+        if let v = bool("rag_ann_enabled") { ragANNEnabled = v }
+        if let v = int("rag_ann_clusters") { ragANNClusters = v }
+        if let v = int("rag_ann_cluster_size") { ragANNClusterSize = v }
+        if let v = int("rag_ann_nprobe") { ragANNProbe = v }
+        if let v = int("rag_ann_rescore") { ragANNRescore = v }
+        if let v = int("rag_ann_min_chunks") { ragANNMinChunks = v }
+        if let v = bool("rag_ann_auto_build") { ragANNAutoBuild = v }
         if let v = bool("rag_auto_ingest") { ragAutoIngest = v }
         if let v = string("rag_pdf_engine") { ragPDFEngine = PDFEngine(stored: v) }
         if let v = string("rag_epub_ocr_engine") { ragEPUBOCREngine = PDFEngine(stored: v) }
@@ -742,6 +767,13 @@ public struct AgentConfig: Sendable {
             "rag_rerank_enabled": ragRerankEnabled,
             "rag_rerank_top_n": ragRerankTopN,
             "rag_query_timeout_seconds": ragQueryTimeoutSeconds,
+            "rag_ann_enabled": ragANNEnabled,
+            "rag_ann_clusters": ragANNClusters,
+            "rag_ann_cluster_size": ragANNClusterSize,
+            "rag_ann_nprobe": ragANNProbe,
+            "rag_ann_rescore": ragANNRescore,
+            "rag_ann_min_chunks": ragANNMinChunks,
+            "rag_ann_auto_build": ragANNAutoBuild,
             "rag_auto_ingest": ragAutoIngest,
             "rag_pdf_engine": ragPDFEngine.rawValue,
             "rag_epub_ocr_engine": ragEPUBOCREngine.rawValue,

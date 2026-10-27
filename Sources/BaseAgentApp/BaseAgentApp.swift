@@ -65,14 +65,19 @@ struct BaseAgentDesktopApp: App {
                     .disabled(!model.isRunning)
                 Button("同步知识库") { model.syncKnowledgeBase(force: false) }
                     .disabled(model.isRunning || model.isModelLoading
-                        || model.isWarmingUp || model.isSyncing)
+                        || model.isWarmingUp || model.isSyncing || model.isBuildingANN)
                 Button("强制全量同步") { model.syncKnowledgeBase(force: true) }
                     .disabled(model.isRunning || model.isModelLoading
-                        || model.isWarmingUp || model.isSyncing)
+                        || model.isWarmingUp || model.isSyncing || model.isBuildingANN)
                 Button(model.isStoppingSync ? "正在停止同步…" : "停止知识库同步") {
                     model.stopSync()
                 }
                 .disabled(!model.isSyncing || model.isStoppingSync)
+                Button("构建 ANN 索引") { model.requestANNIndexBuild() }
+                    .disabled(model.isRunning || model.isModelLoading || model.isWarmingUp
+                        || model.isSyncing || model.isBuildingANN)
+                Button("停止 ANN 索引构建") { model.stopANNIndexBuild() }
+                    .disabled(!model.isBuildingANN)
             }
         }
 
@@ -350,7 +355,7 @@ struct MainView: View {
                     .help(modelLabel)
                 Spacer(minLength: 4)
                 if model.isRunning || model.isModelLoading
-                    || model.isWarmingUp || model.isSyncing {
+                    || model.isWarmingUp || model.isSyncing || model.isBuildingANN {
                     ProgressView().controlSize(.mini)
                 }
                 Text(model.statusText)
@@ -373,7 +378,7 @@ struct MainView: View {
                 }
                 .buttonStyle(.borderless)
                 .disabled(model.isRunning || model.isModelLoading
-                    || model.isWarmingUp || model.isSyncing)
+                    || model.isWarmingUp || model.isSyncing || model.isBuildingANN)
                 .help("增量同步知识库")
                 Button {
                     model.syncKnowledgeBase(force: true)
@@ -383,7 +388,7 @@ struct MainView: View {
                 }
                 .buttonStyle(.borderless)
                 .disabled(model.isRunning || model.isModelLoading
-                    || model.isWarmingUp || model.isSyncing)
+                    || model.isWarmingUp || model.isSyncing || model.isBuildingANN)
                 .help("强制全量同步（忽略增量缓存，全部重新解析入库）")
                 if model.isSyncing {
                     Button {
@@ -396,6 +401,15 @@ struct MainView: View {
                     .buttonStyle(.borderless)
                     .disabled(model.isStoppingSync)
                     .help(model.isStoppingSync ? "正在停止同步…" : "停止知识库同步")
+                }
+                if model.isBuildingANN {
+                    Button {
+                        model.stopANNIndexBuild()
+                    } label: {
+                        Image(systemName: "stop.circle").font(.caption)
+                    }
+                    .buttonStyle(.borderless)
+                    .help("停止 ANN 索引构建（已写完的块会保留，可再次构建续建）")
                 }
             }
         }
@@ -468,7 +482,8 @@ struct MainView: View {
                             return .ignored
                         }
                         guard !model.isRunning, !model.isModelLoading,
-                              !model.isWarmingUp, !model.isSyncing else {
+                              !model.isWarmingUp, !model.isSyncing,
+                              !model.isBuildingANN else {
                             return .handled
                         }
                         send()
@@ -499,11 +514,12 @@ struct MainView: View {
         }
     }
 
-    /// 发送按钮不可用：正在加载/预热/同步，或输入为空。
+    /// 发送按钮不可用：正在加载/预热/同步/构建索引，或输入为空。
     private var sendBlocked: Bool {
         !model.isRunning
             && (input.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-                || model.isModelLoading || model.isWarmingUp || model.isSyncing)
+                || model.isModelLoading || model.isWarmingUp || model.isSyncing
+                || model.isBuildingANN)
     }
 
     private var tokenSummary: String {

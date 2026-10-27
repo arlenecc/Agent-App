@@ -222,6 +222,58 @@ public final class SQLiteDatabase {
         try query(sql, bindings).first?.values.first ?? .null
     }
 
+    // MARK: Streaming
+
+    /// 流式读取的轻量行视图：按列序号直接取值，不在 Swift 侧构造字典
+    /// 或整行数组。`blob` 返回的是 SQLite 内部缓冲区指针，**只在本次回调
+    /// 内有效**（下一次 step/finalize 后失效），调用方不得持有。
+    public struct StreamRow {
+        let stmt: OpaquePointer?
+
+        public var columnCount: Int { Int(sqlite3_column_count(stmt)) }
+        public func isNull(_ index: Int32) -> Bool { sqlite3_column_type(stmt, index) == SQLITE_NULL }
+        public func int(_ index: Int32) -> Int64 { sqlite3_column_int64(stmt, index) }
+        public func double(_ index: Int32) -> Double { sqlite3_column_double(stmt, index) }
+
+        public func text(_ index: Int32) -> String? {
+            guard let cString = sqlite3_column_text(stmt, index) else { return nil }
+            return String(cString: cString)
+        }
+
+        /// blob 的原始指针与字节数；指针只在回调内有效。
+        public func blob(_ index: Int32) -> (pointer: UnsafeRawPointer, count: Int)? {
+            guard let bytes = sqlite3_column_blob(stmt, index) else { return nil }
+            return (UnsafeRawPointer(bytes), Int(sqlite3_column_bytes(stmt, index)))
+        }
+    }
+
+    /// 逐行流式执行查询，`row` 返回 false 时提前结束。
+    ///
+    /// 用于千万级切片的顺序扫描（构建 ANN 索引）：`query` 会把每一行都
+    /// 变成 `[String: SQLValue]`，2100 万行时仅字典分配就要数分钟、内存
+    /// 也放不下。回调内可以再调用本对象的其它方法（同一线程递归加锁）。
+    public func stream(_ sql: String, _ bindings: [SQLValue] = [],
+                       row: (StreamRow) throws -> Bool) throws {
+        lock.lock(); defer { lock.unlock() }
+        guard let handle else { throw AgentError.storage("数据库已关闭") }
+        try checkDeadline()
+        var stmt: OpaquePointer?
+        let rc = sqlite3_prepare_v2(handle, sql, -1, &stmt, nil)
+        guard rc == SQLITE_OK else {
+            throw statementError(handle, stage: "SQL 准备失败", sql: sql)
+        }
+        defer { sqlite3_finalize(stmt) }
+        try bind(stmt, bindings)
+        while true {
+            let step = sqlite3_step(stmt)
+            if step == SQLITE_DONE { break }
+            guard step == SQLITE_ROW else {
+                throw statementError(handle, stage: "SQL 查询失败", sql: sql)
+            }
+            if try !row(StreamRow(stmt: stmt)) { break }
+        }
+    }
+
     @discardableResult
     public func execScript(_ sql: String) throws -> Int {
         lock.lock(); defer { lock.unlock() }

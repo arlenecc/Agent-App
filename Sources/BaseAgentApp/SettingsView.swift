@@ -199,11 +199,13 @@ struct SettingsView: View {
                                 .buttonStyle(.borderedProminent)
                                 .tint(.green)
                                 .disabled(model.isModelLoading || model.isRunning
-                                    || model.isWarmingUp || model.isSyncing)
+                                    || model.isWarmingUp || model.isSyncing
+                                    || model.isBuildingANN)
                         } else {
                             Button("加载模型") { loadMainModel() }
                                 .disabled(model.isModelLoading || model.isRunning
-                                    || model.isWarmingUp || model.isSyncing)
+                                    || model.isWarmingUp || model.isSyncing
+                                    || model.isBuildingANN)
                         }
                         Button("卸载") { model.unloadMainModel() }
                             .disabled(model.isModelLoading || model.isRunning
@@ -257,7 +259,7 @@ struct SettingsView: View {
                 Spacer(minLength: 4)
                 Button("应用配置") { applyAPIConfig() }
                     .keyboardShortcut(.defaultAction)
-                    .disabled(model.isSyncing || model.isDeduplicating)
+                    .disabled(model.isSyncing || model.isDeduplicating || model.isBuildingANN)
             }
         }
     }
@@ -294,11 +296,13 @@ struct SettingsView: View {
                             .buttonStyle(.borderedProminent)
                             .tint(.green)
                             .disabled(!auxEnabled || model.isModelLoading || model.isRunning
-                                || model.isWarmingUp || model.isSyncing)
+                                || model.isWarmingUp || model.isSyncing
+                                || model.isBuildingANN)
                     } else {
                         Button("加载模型") { loadAuxModel() }
                             .disabled(!auxEnabled || model.isModelLoading || model.isRunning
-                                || model.isWarmingUp || model.isSyncing)
+                                || model.isWarmingUp || model.isSyncing
+                                || model.isBuildingANN)
                     }
                     Button("卸载") { model.unloadAuxModel() }
                         .disabled(model.isModelLoading || model.isRunning
@@ -476,6 +480,22 @@ struct SettingsView: View {
                     }
                 }
 
+                // 向量索引行：ANN 索引摘要 + 构建/停止/删除。
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 8) {
+                        annStatusLabel
+                        Spacer(minLength: 8)
+                        annButtons()
+                    }
+                    VStack(alignment: .leading, spacing: 6) {
+                        annStatusLabel
+                        HStack(spacing: 8) {
+                            Spacer(minLength: 8)
+                            annButtons()
+                        }
+                    }
+                }
+
                 DisclosureGroup("高级 RAG / OCR 设置", isExpanded: $showAdvanced) {
                     VStack(alignment: .leading, spacing: 10) {
                         HStack(spacing: 8) {
@@ -497,10 +517,12 @@ struct SettingsView: View {
                                 }
                             }
                             Button("保存设置") { saveAdvancedSettings() }
-                                .disabled(model.isSyncing || model.isDeduplicating)
+                                .disabled(model.isSyncing || model.isDeduplicating
+                                    || model.isBuildingANN)
                                 .help("保存并应用高级 RAG / OCR 设置")
                             Button("识别测试") { openOCRLab() }
-                                .disabled(model.isSyncing || model.isDeduplicating)
+                                .disabled(model.isSyncing || model.isDeduplicating
+                                    || model.isBuildingANN)
                                 .help("打开 OCR 识别测试窗口，用指定模型识别图片或 PDF 并对比结果")
                         }
                         if vlmBackend == "gguf" {
@@ -667,11 +689,12 @@ struct SettingsView: View {
     @ViewBuilder
     private func knowledgeButtons() -> some View {
         Button("应用配置") { applyKnowledgeConfig() }
-            .disabled(model.isSyncing || model.isDeduplicating
+            .disabled(model.isSyncing || model.isDeduplicating || model.isBuildingANN
                 || model.isModelLoading || model.isRunning || model.isWarmingUp)
         Button("同步知识") { applyAndSync() }
             .help("同步期间会自动等待模型加载/预热结束")
-            .disabled(model.isSyncing || model.isDeduplicating || model.isRunning)
+            .disabled(model.isSyncing || model.isDeduplicating || model.isBuildingANN
+                || model.isRunning)
     }
 
     @ViewBuilder
@@ -680,9 +703,41 @@ struct SettingsView: View {
             model.requestVectorDedupe()
         }
         .help("排查并清理向量库内重复的向量，保留入库时间最早的一份")
-        .disabled(model.isDeduplicating)
+        .disabled(model.isDeduplicating || model.isBuildingANN)
         Button("停止同步") { model.stopSync() }
             .disabled(!model.isSyncing)
+    }
+
+    /// ANN 索引状态：分块 IVF 摘要（未构建 / 已索引切片数 / 尾块 / 需重建）。
+    @ViewBuilder
+    private var annStatusLabel: some View {
+        HStack(spacing: 6) {
+            Text("ANN 索引").font(.caption)
+            Text(model.annStatusText)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .lineLimit(2)
+                .help("分块 IVF 索引：块内 k-means 聚类 + int8 量化按簇落盘，检索只读命中的簇，"
+                    + "避免在大库上全表扫描；索引水位之后的新切片按 rowid 顺序精确补齐。"
+                    + "库内切片较少时精确扫描更快，可先不构建")
+        }
+    }
+
+    @ViewBuilder
+    private func annButtons() -> some View {
+        Button(model.isBuildingANN ? "索引维护中…" : "构建 ANN 索引") {
+            model.requestANNIndexBuild()
+        }
+        .help("构建/续建向量库的分块 IVF 索引（可中断，已写完的块保留）；"
+            + "构建期间知识检索会按只读超时跳过，建议在空闲时执行")
+        .disabled(model.isBuildingANN || model.isSyncing || model.isDeduplicating
+            || model.isModelLoading || model.isWarmingUp || model.isRunning)
+        Button("停止构建") { model.stopANNIndexBuild() }
+            .disabled(!model.isBuildingANN)
+        Button("删除索引") { model.requestDropANNIndex() }
+            .help("删除 ANN 索引，检索回退到精确扫描（2100 万切片级别的大库上会明显变慢）")
+            .disabled(model.isBuildingANN || model.isSyncing || model.isDeduplicating
+                || model.isRunning)
     }
 
     // MARK: - 参数控件
@@ -918,8 +973,8 @@ struct SettingsView: View {
     }
 
     private func loadMainModel() {
-        guard !model.isSyncing, !model.isDeduplicating else {
-            statusMessage = "知识同步/向量去重进行中，暂不能加载模型"
+        guard !model.isSyncing, !model.isDeduplicating, !model.isBuildingANN else {
+            statusMessage = "知识同步/索引构建/向量去重进行中，暂不能加载模型"
             return
         }
         guard let config = buildConfig() else { return }
@@ -928,8 +983,8 @@ struct SettingsView: View {
     }
 
     private func loadAuxModel() {
-        guard !model.isSyncing, !model.isDeduplicating else {
-            statusMessage = "知识同步/向量去重进行中，暂不能加载模型"
+        guard !model.isSyncing, !model.isDeduplicating, !model.isBuildingANN else {
+            statusMessage = "知识同步/索引构建/向量去重进行中，暂不能加载模型"
             return
         }
         guard let config = buildConfig() else { return }
@@ -944,8 +999,8 @@ struct SettingsView: View {
     }
 
     private func applyKnowledgeConfig() {
-        guard !model.isSyncing, !model.isDeduplicating else {
-            statusMessage = "知识同步/向量去重进行中，暂不能应用配置"
+        guard !model.isSyncing, !model.isDeduplicating, !model.isBuildingANN else {
+            statusMessage = "知识同步/索引构建/向量去重进行中，暂不能应用配置"
             return
         }
         guard let config = buildConfig() else { return }
@@ -990,8 +1045,8 @@ struct SettingsView: View {
 
     /// 保存并应用高级 RAG / OCR 设置（包含自定义 OCR 模型、PDF/EPUB OCR 引擎等）。
     private func saveAdvancedSettings() {
-        guard !model.isSyncing, !model.isDeduplicating else {
-            statusMessage = "知识同步/向量去重进行中，暂不能保存设置"
+        guard !model.isSyncing, !model.isDeduplicating, !model.isBuildingANN else {
+            statusMessage = "知识同步/索引构建/向量去重进行中，暂不能保存设置"
             return
         }
         if !customOCRAvailable {

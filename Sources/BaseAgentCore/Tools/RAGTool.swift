@@ -157,12 +157,14 @@ public final class RagStatusTool: AgentTool {
         let backend = status["vector_backend"]?.stringValue ?? ""
         let sources = status["sources"]?.arrayValue?.compactMap(\.stringValue) ?? []
         let sourceCount = status["source_count"]?.intValue ?? sources.count
+        let annIndex = status["ann_index"]?.stringValue ?? ""
 
         var lines: [String] = ["知识库状态:"]
         lines.append("  知识库目录: \(knowledgeBase.isEmpty ? "（未设置）" : knowledgeBase)")
         lines.append("  RAG 目录: \(ragDir)")
         lines.append("  已存储切片数: \(chunks)")
         if !backend.isEmpty { lines.append("  向量后端: \(backend)") }
+        if !annIndex.isEmpty { lines.append("  ANN 索引: \(annIndex)") }
         lines.append("  已索引文件数: \(sourceCount)")
         if !sources.isEmpty {
             lines.append("  已索引文件:")

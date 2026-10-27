@@ -782,6 +782,9 @@ public final class RAGEngine {
         } else {
             progress?(total, total, "")
             logFn("RAG: 同步完成 — \(stats.summary)")
+            // 同步成功后按需构建/续建 ANN 索引：大库上精确检索会超时跳过，
+            // 建好索引后 rag_search 才能稳定在超时预算内返回。
+            autoBuildANNIndexIfNeeded(log: logFn)
         }
         return stats
     }
@@ -1284,6 +1287,118 @@ public final class RAGEngine {
         return max(200, max(configured, estimated))
     }
 
+    // MARK: ANN 索引
+
+    /// 当前生效的 ANN 检索参数；开关关闭时返回 nil（检索走精确路径）。
+    var annQueryOptions: ANNQueryOptions? {
+        guard config.ragANNEnabled else { return nil }
+        return ANNQueryOptions(nprobe: max(1, config.ragANNProbe),
+                               rescore: max(0, config.ragANNRescore))
+    }
+
+    /// ANN 索引状态。走带超时的只读入口：sqlite-vec 全表扫描在这类大库上
+    /// 可能数分钟，状态查询超时就返回 nil，不阻塞界面。
+    public func annIndexStatus(timeout: Double? = nil) -> ANNIndexStatus? {
+        try? withStoreBounded(timeout: resolvedTimeout(timeout)) { $0.annIndexStatus() }
+    }
+
+    /// 构建（或从断点续建）ANN 索引。与同步/清空串行，可被 `cancel()` 中断
+    /// （已写完的块保留，下次接着建）。返回 nil 表示被拒绝或失败。
+    @discardableResult
+    public func buildANNIndex(progress: ((ANNBuildProgress) -> Void)? = nil,
+                              log: ((String) -> Void)? = nil) -> ANNBuildResult? {
+        let logFn: (String) -> Void = { message in
+            if let log { log(message) } else { AgentLog.info(message) }
+        }
+        guard tryBeginIngest() else {
+            logFn("RAG: 另一次同步/维护正在进行，已忽略本次 ANN 索引构建")
+            return nil
+        }
+        defer {
+            invalidateStatusCache()
+            releaseIngestFlag()
+            closeIfPending()
+        }
+        cancelLock.lock(); cancelRequested = false; cancelLock.unlock()
+        return performANNBuild(progress: progress, log: logFn)
+    }
+
+    /// 实际的构建流程。调用方必须已持有 ingest 标志：公开入口自己取，
+    /// 同步收尾（`autoBuildANNIndexIfNeeded`）复用同步已持有的标志，避免
+    /// 在同步内部把自己挡在门外。
+    @discardableResult
+    private func performANNBuild(progress: ((ANNBuildProgress) -> Void)?,
+                                 log logFn: @escaping (String) -> Void) -> ANNBuildResult? {
+        var lastLog = Date.distantPast
+        let clusters = max(2, config.ragANNClusters)
+        let clusterSize = max(1, config.ragANNClusterSize)
+        do {
+            let result = try withStore { store -> ANNBuildResult in
+                try store.buildANNIndex(
+                    clusters: clusters,
+                    clusterSize: clusterSize,
+                    progress: { update in
+                        progress?(update)
+                        // 每块日志限流：块粒度是 6 位数的切片量，逐块打印会刷屏。
+                        guard Date().timeIntervalSince(lastLog) >= 10,
+                              update.stage == "blocks" else { return }
+                        lastLog = Date()
+                        logFn("RAG: \(update.message)")
+                    },
+                    isCancelled: { [weak self] in self?.isCancelled ?? true })
+            }
+            logFn("RAG: \(result.summary)")
+            invalidateStatusCache()
+            return result
+        } catch {
+            logFn("RAG: ANN 索引构建失败：\(error.localizedDescription)")
+            AgentLog.warning("RAG: ANN 索引构建失败: \(error.localizedDescription)")
+            return nil
+        }
+    }
+
+    /// 删除 ANN 索引（回到精确检索）。与同步/清空串行，失败原样抛出。
+    public func dropANNIndex() throws {
+        guard tryBeginIngest() else {
+            throw AgentError.storage("另一个知识库任务正在进行，请稍后重试")
+        }
+        defer {
+            invalidateStatusCache()
+            releaseIngestFlag()
+            closeIfPending()
+        }
+        let store = try ensureStore()
+        try store.dropANNIndex()
+        AgentLog.info("RAG: ANN 索引已删除，检索回退精确扫描")
+    }
+
+    /// 同步结束后按需自动构建/续建 ANN 索引。
+    ///
+    /// 只在「值得建」时动手：小库上精确扫描足够快；索引就绪且尾块不大时
+    /// 交给尾块精确补齐（顺序读，成本远低于重建一块）。真正需要重建的
+    /// 情形（尾块超预算）由状态里的 `needsRebuild` 提示用户手动重建。
+    private func autoBuildANNIndexIfNeeded(log logFn: @escaping (String) -> Void) {
+        guard config.ragANNEnabled, config.ragANNAutoBuild else { return }
+        let clusters = max(2, config.ragANNClusters)
+        let clusterSize = max(1, config.ragANNClusterSize)
+        let blockRows = clusters * clusterSize
+        let overview: (chunks: Int, status: ANNIndexStatus)? = try? withStore { store in
+            (store.count, store.annIndexStatus())
+        }
+        guard let overview, overview.chunks >= config.ragANNMinChunks else { return }
+        let status = overview.status
+        let threshold = max(config.ragANNMinChunks / 2, blockRows / 4)
+        if status.blocks == 0 {
+            logFn("RAG: 自动构建 ANN 索引（\(overview.chunks) 切片，\(clusters) 簇 × \(clusterSize) 行/块）")
+        } else if status.unindexedRows > 0 || status.tailRows >= threshold {
+            logFn("RAG: 自动续建 ANN 索引（尾块 \(status.tailRows) 切片）")
+        } else {
+            return
+        }
+        // 复用同步已持有的 ingest 标志（不能走公开入口，否则会被自己挡住）。
+        _ = performANNBuild(progress: nil, log: logFn)
+    }
+
     // MARK: Search
 
     public func search(query: String, topK: Int = 3,
@@ -1309,7 +1424,10 @@ public final class RAGEngine {
             return try store.hybridSearch(
                 vector: queryVector, query: query, topK: candidateCount,
                 sourceContains: source, rrfK: config.ragRRFK,
-                overfetch: config.ragVectorOverfetch
+                overfetch: config.ragVectorOverfetch,
+                // ANN 索引就绪时向量通道走分块 IVF；不可用（未构建/尾块超预算/
+                // 维度不符）时 VectorStore 内部自动回退精确路径。
+                ann: annQueryOptions
             )
         }
         guard var hits = fetched else {
@@ -1449,6 +1567,7 @@ public final class RAGEngine {
             let sources = manifestSources.isEmpty
                 ? store.listSources(limit: sourceLimit)
                 : manifestSources
+            let ann = store.annIndexStatus()
             return [
                 "knowledge_base": .string(knowledgeBase),
                 "rag_dir": .string(ragDir),
@@ -1458,6 +1577,10 @@ public final class RAGEngine {
                 "source_count": .int(indexedSources > 0 ? indexedSources : sources.count),
                 "sources": .array(sources.map { .string($0) }),
                 "vector_backend": .string(store.vectorEnabled ? "sqlite-vec" : "sqlite-exact"),
+                // ANN 索引：检索是否走索引、能否用、是否该重建。
+                "ann_index": .string(ann.summary),
+                "ann_usable": .bool(ann.isUsable),
+                "ann_needs_rebuild": .bool(ann.needsRebuild || ann.unindexedRows > 0),
             ]
         }
         guard let snapshot else {
