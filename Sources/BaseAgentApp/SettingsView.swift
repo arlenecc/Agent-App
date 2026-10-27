@@ -52,6 +52,8 @@ struct SettingsView: View {
     @State private var auxTimeout = 120.0
     @State private var auxPromptBatch = 512
     @State private var auxThinking = false
+    @State private var auxKVReuse = false
+    @State private var auxKVInt8Enabled = true
 
     // MARK: 知识同步
 
@@ -186,7 +188,9 @@ struct SettingsView: View {
                     topK: $mainTopK,
                     repetitionPenalty: $mainRepetitionPenalty,
                     promptBatch: $mainPromptBatch,
-                    thinking: $mainThinking
+                    thinking: $mainThinking,
+                    kvReuse: $mainKVReuse,
+                    kvInt8: $kvInt8Enabled
                 ) {
                     HStack(spacing: 8) {
                         if model.mainModelLoaded {
@@ -203,15 +207,6 @@ struct SettingsView: View {
                         Button("卸载") { model.unloadMainModel() }
                             .disabled(model.isModelLoading || model.isRunning
                                 || model.isWarmingUp || model.isSyncing)
-                    }
-                }
-                if kvTogglesVisible {
-                    HStack(spacing: 16) {
-                        Toggle("KV复用", isOn: $mainKVReuse)
-                            .font(.caption)
-                        Toggle("KV量化", isOn: $kvInt8Enabled)
-                            .font(.caption)
-                            .help("KV cache int8 量化：KV 内存约减半，质量几乎无损（主/辅助模型共用）")
                     }
                 }
             } else {
@@ -288,7 +283,9 @@ struct SettingsView: View {
                 topK: $auxTopK,
                 repetitionPenalty: $auxRepetitionPenalty,
                 promptBatch: $auxPromptBatch,
-                thinking: $auxThinking
+                thinking: $auxThinking,
+                kvReuse: $auxKVReuse,
+                kvInt8: $auxKVInt8Enabled
             ) {
                 HStack(spacing: 8) {
                     if model.auxModelLoaded {
@@ -325,6 +322,8 @@ struct SettingsView: View {
         repetitionPenalty: Binding<Double>,
         promptBatch: Binding<Int>,
         thinking: Binding<Bool>,
+        kvReuse: Binding<Bool>,
+        kvInt8: Binding<Bool>,
         @ViewBuilder actions: () -> some View
     ) -> some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -355,20 +354,47 @@ struct SettingsView: View {
                 }
             }
 
-            HStack(alignment: .center, spacing: 6) {
-                parameterFields(
-                    context: context,
-                    kvCap: kvCap,
-                    temperature: temperature,
-                    topP: topP,
-                    minP: minP,
-                    topK: topK,
-                    repetitionPenalty: repetitionPenalty,
-                    promptBatch: backend.wrappedValue == "mlx-lm" ? promptBatch : nil,
-                    thinking: thinking
-                )
-                Spacer(minLength: 4)
-                actions()
+            // 参数行（含「思考 / KV复用 / KV量化」开关）尽量与操作按钮同行；
+            // 窗口较窄放不下时按钮自动落到下一行右端，参数行不会被挤压变形。
+            ViewThatFits(in: .horizontal) {
+                HStack(alignment: .center, spacing: 6) {
+                    parameterFields(
+                        context: context,
+                        kvCap: kvCap,
+                        temperature: temperature,
+                        topP: topP,
+                        minP: minP,
+                        topK: topK,
+                        repetitionPenalty: repetitionPenalty,
+                        promptBatch: backend.wrappedValue == "mlx-lm" ? promptBatch : nil,
+                        thinking: thinking,
+                        // ONNX 自动复用 past_key_values、MLX-VLM 每轮重建 prompt，
+                        // 都不消费这两个开关，故仅在支持的后端上显示。
+                        kvReuse: supportsKVToggles(backend.wrappedValue) ? kvReuse : nil,
+                        kvInt8: supportsKVToggles(backend.wrappedValue) ? kvInt8 : nil
+                    )
+                    Spacer(minLength: 4)
+                    actions()
+                }
+                VStack(alignment: .leading, spacing: 6) {
+                    parameterFields(
+                        context: context,
+                        kvCap: kvCap,
+                        temperature: temperature,
+                        topP: topP,
+                        minP: minP,
+                        topK: topK,
+                        repetitionPenalty: repetitionPenalty,
+                        promptBatch: backend.wrappedValue == "mlx-lm" ? promptBatch : nil,
+                        thinking: thinking,
+                        kvReuse: supportsKVToggles(backend.wrappedValue) ? kvReuse : nil,
+                        kvInt8: supportsKVToggles(backend.wrappedValue) ? kvInt8 : nil
+                    )
+                    HStack(spacing: 6) {
+                        Spacer(minLength: 4)
+                        actions()
+                    }
+                }
             }
         }
     }
@@ -569,6 +595,8 @@ struct SettingsView: View {
 
     // MARK: - 参数控件
 
+    /// 参数区：优先把数字字段与开关放在同一行；窗口较窄时拆成「数字字段」
+    /// +「思考 / KV复用 / KV量化」两行，开关始终紧挨在一起且不会被裁剪。
     @ViewBuilder
     private func parameterFields(
         context: Binding<Int>,
@@ -579,7 +607,40 @@ struct SettingsView: View {
         topK: Binding<Int>,
         repetitionPenalty: Binding<Double>,
         promptBatch: Binding<Int>? = nil,
-        thinking: Binding<Bool>? = nil
+        thinking: Binding<Bool>? = nil,
+        kvReuse: Binding<Bool>? = nil,
+        kvInt8: Binding<Bool>? = nil
+    ) -> some View {
+        ViewThatFits(in: .horizontal) {
+            HStack(alignment: .center, spacing: 6) {
+                numberFields(
+                    context: context, kvCap: kvCap, temperature: temperature,
+                    topP: topP, minP: minP, topK: topK,
+                    repetitionPenalty: repetitionPenalty, promptBatch: promptBatch
+                )
+                parameterToggles(thinking: thinking, kvReuse: kvReuse, kvInt8: kvInt8)
+            }
+            VStack(alignment: .leading, spacing: 3) {
+                numberFields(
+                    context: context, kvCap: kvCap, temperature: temperature,
+                    topP: topP, minP: minP, topK: topK,
+                    repetitionPenalty: repetitionPenalty, promptBatch: promptBatch
+                )
+                parameterToggles(thinking: thinking, kvReuse: kvReuse, kvInt8: kvInt8)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func numberFields(
+        context: Binding<Int>,
+        kvCap: Binding<Int>?,
+        temperature: Binding<Double>,
+        topP: Binding<Double>,
+        minP: Binding<Double>,
+        topK: Binding<Int>,
+        repetitionPenalty: Binding<Double>,
+        promptBatch: Binding<Int>?
     ) -> some View {
         HStack(alignment: .center, spacing: 3) {
             numberField("Context", value: context, width: 60)
@@ -594,11 +655,38 @@ struct SettingsView: View {
             if let promptBatch {
                 numberField("batch", value: promptBatch, width: 52)
             }
-            if let thinking {
-                Toggle("思考", isOn: thinking)
-                    .toggleStyle(.checkbox)
-                    .font(.caption2)
-                    .fixedSize()
+        }
+    }
+
+    /// 「思考 / KV复用 / KV量化」开关组；不支持的组合（nil）不渲染。
+    @ViewBuilder
+    private func parameterToggles(
+        thinking: Binding<Bool>?,
+        kvReuse: Binding<Bool>?,
+        kvInt8: Binding<Bool>?
+    ) -> some View {
+        if thinking != nil || kvReuse != nil || kvInt8 != nil {
+            HStack(alignment: .center, spacing: 10) {
+                if let thinking {
+                    Toggle("思考", isOn: thinking)
+                        .toggleStyle(.checkbox)
+                        .font(.caption2)
+                        .fixedSize()
+                }
+                if let kvReuse {
+                    Toggle("KV复用", isOn: kvReuse)
+                        .toggleStyle(.checkbox)
+                        .font(.caption2)
+                        .fixedSize()
+                        .help("关闭后每轮全量重建 KV（等效禁用前缀缓存）：主模型与辅助模型各自独立")
+                }
+                if let kvInt8 {
+                    Toggle("KV量化", isOn: kvInt8)
+                        .toggleStyle(.checkbox)
+                        .font(.caption2)
+                        .fixedSize()
+                        .help("KV cache int8 量化：KV 内存约减半，质量几乎无损；主模型与辅助模型各自独立")
+                }
             }
         }
     }
@@ -673,6 +761,8 @@ struct SettingsView: View {
         auxTimeout = config.auxRequestTimeout
         auxPromptBatch = config.auxPromptBatchSize
         auxThinking = config.auxLocalLLMEnableThinking
+        auxKVReuse = config.auxKvReuse
+        auxKVInt8Enabled = config.auxKvCacheInt8
 
         workspace = config.workspace
         knowledgeBase = config.knowledgeBase
@@ -801,8 +891,8 @@ struct SettingsView: View {
 
     /// KV 复用 / 量化只对 MLX-LM 与 GGUF 生效：
     /// ONNX 自动复用 past_key_values，MLX-VLM 每轮重建 prompt，均不消费这两个开关。
-    private var kvTogglesVisible: Bool {
-        [mainBackend, auxBackend].contains { $0 == "mlx-lm" || $0 == "gguf" }
+    private func supportsKVToggles(_ backend: String) -> Bool {
+        backend == "mlx-lm" || backend == "gguf"
     }
 
     /// 保存并应用高级 RAG / OCR 设置（包含自定义 OCR 模型、PDF/EPUB OCR 引擎等）。
@@ -938,6 +1028,8 @@ struct SettingsView: View {
         config.auxRequestTimeout = max(10, auxTimeout)
         config.auxPromptBatchSize = max(0, auxPromptBatch)
         config.auxLocalLLMEnableThinking = auxThinking
+        config.auxKvReuse = auxKVReuse
+        config.auxKvCacheInt8 = auxKVInt8Enabled
 
         config.workspace = (workspace.trimmingCharacters(in: .whitespacesAndNewlines) as NSString)
             .expandingTildeInPath

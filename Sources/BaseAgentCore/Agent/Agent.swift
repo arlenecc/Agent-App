@@ -1083,9 +1083,11 @@ public final class Agent: @unchecked Sendable {
         } catch {
             log("[llm] 后台调用失败: \(error.localizedDescription)")
         }
-        // 辅助模型的请求每次内容都不同，KV 复用命中率低；调用结束立即丢弃，
-        // 避免一段长摘要的 KV cache 长期常驻。主模型缓存不能在这里清。
-        if service !== llm {
+        // 辅助模型默认（`aux_llm_kv_reuse=false`）在调用结束后丢弃 KV：后台摘要 /
+        // 事实抽取的内容每次都不同、跨调用命中率低，长 KV 常驻不划算；
+        // 开启复用后保留缓存，相同前缀（system prompt）可跨调用复用。
+        // 主模型缓存始终不能在这里清。
+        if service !== llm, !config.auxKvReuse {
             (service as? KVCacheInvalidating)?.invalidateKVCache()
         }
         return output.trimmingCharacters(in: .whitespacesAndNewlines)

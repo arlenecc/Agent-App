@@ -823,6 +823,40 @@ final class ParserTests: XCTestCase {
         XCTAssertEqual(config.export()["aux_enabled"] as? Bool, false)
     }
 
+    /// 辅助模型的 KV 复用 / 量化独立于主模型：旧配置缺失这两个键时，
+    /// 复用保持默认关闭（与「用后即清」的既有行为一致）、量化跟随主模型；
+    /// 写入后各自独立生效（面板上主/辅助各有一组开关）。
+    func testConfigAuxKVSettingsFollowMainThenIndependent() throws {
+        let path = directory.appendingPathComponent("config-aux-kv.json")
+
+        // 旧配置只写了主模型的键：复用默认关闭，量化跟随主模型。
+        try """
+        {"llm_kv_reuse":true,"kv_cache_int8":false}
+        """.write(to: path, atomically: true, encoding: .utf8)
+        var config = AgentConfig.load(path.path)
+        XCTAssertTrue(config.llmKVReuse)
+        XCTAssertFalse(config.kvCacheInt8)
+        XCTAssertFalse(config.auxKvReuse, "辅助模型默认不复用 KV")
+        XCTAssertFalse(config.auxKvCacheInt8, "缺省应跟随主模型的 KV 量化")
+
+        // 显式写入辅助键后与主模型解耦，两个方向互不影响。
+        try """
+        {"llm_kv_reuse":false,"kv_cache_int8":true,
+         "aux_llm_kv_reuse":true,"aux_kv_cache_int8":false}
+        """.write(to: path, atomically: true, encoding: .utf8)
+        config = AgentConfig.load(path.path)
+        XCTAssertFalse(config.llmKVReuse)
+        XCTAssertTrue(config.kvCacheInt8)
+        XCTAssertTrue(config.auxKvReuse)
+        XCTAssertFalse(config.auxKvCacheInt8)
+        XCTAssertEqual(config.export()["aux_llm_kv_reuse"] as? Bool, true)
+        XCTAssertEqual(config.export()["aux_kv_cache_int8"] as? Bool, false)
+
+        // 默认值：复用关闭、量化开启（KV 内存约减半）。
+        XCTAssertFalse(AgentConfig().auxKvReuse)
+        XCTAssertTrue(AgentConfig().auxKvCacheInt8)
+    }
+
     /// MLX embedding 默认后端：别名能把 Q 名解析到本地目录。
     func testConfigMLXEmbeddingDefaults() throws {
         XCTAssertEqual(AgentConfig().localEmbeddingBackend, "mlx",

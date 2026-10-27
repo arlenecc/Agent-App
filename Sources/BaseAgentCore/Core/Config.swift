@@ -82,15 +82,20 @@ public struct AgentConfig: Sendable {
     public var kvCacheMaxTokens: Int = 32_768
     /// 主 LLM 跨轮 KV/前缀复用开关。开启时 system+tools 等不变前缀的 KV
     /// 跨轮保留，每轮只 prefill 新增消息；关闭时每轮全量重建。
-    /// 同时作用于 MLX 与 GGUF (llama.cpp) 后端；辅助模型不受影响（其缓存
-    /// 按约定每次后台任务后即失效）。
+    /// 同时作用于 MLX 与 GGUF (llama.cpp) 后端；辅助模型用 `auxKvReuse`。
     public var llmKVReuse: Bool = true
     /// 辅助模型 KV cache 的 token 硬上限；0 表示跟随 auxMaxContextTokens。
     public var auxKvCacheMaxTokens: Int = 16_384
+    /// 辅助模型跨轮 KV/前缀复用开关（`aux_llm_kv_reuse`，默认关闭）：
+    /// 辅助调用多为一次性长文本、跨调用命中率低，关闭时每轮全量重建并在
+    /// 调用结束后丢弃 KV，避免长 KV 常驻；开启后保留缓存供相同前缀复用。
+    public var auxKvReuse: Bool = false
     /// KV cache int8 量化（MLX 用 kvBits=8 的 QuantizedKVCache，GGUF 用
     /// ggml q8_0 KV）。q8_0 对生成质量几乎无损，KV 内存约减半；
-    /// 同时作用于 MLX 与 GGUF 后端的主模型和辅助模型。
+    /// 作用于 MLX 与 GGUF 后端的主模型，辅助模型用 `auxKvCacheInt8`。
     public var kvCacheInt8: Bool = true
+    /// 辅助模型的 KV cache int8 量化开关（缺省跟随 `kv_cache_int8`）。
+    public var auxKvCacheInt8: Bool = true
     public var contextShrinkRatio: Double = 0.9
 
     /// 实际生效的主模型上下文：min(配置上下文, KV 硬上限)。
@@ -383,6 +388,10 @@ public struct AgentConfig: Sendable {
         if let v = int("kv_cache_max_tokens") { kvCacheMaxTokens = v }
         if let v = bool("llm_kv_reuse") { llmKVReuse = v }
         if let v = bool("kv_cache_int8") { kvCacheInt8 = v }
+        // 旧配置没有辅助模型的 KV 键：复用默认关闭（与改造前「用后即清」一致），
+        // 量化跟随主模型。
+        auxKvReuse = bool("aux_llm_kv_reuse") ?? false
+        auxKvCacheInt8 = bool("aux_kv_cache_int8") ?? kvCacheInt8
         if let v = int("aux_kv_cache_max_tokens") { auxKvCacheMaxTokens = v }
         if let v = int("kernel_max_context_tokens") { kernelMaxContextTokens = v }
         if let v = int("kernel_raw_turns") { kernelRawTurns = v }
@@ -698,6 +707,8 @@ public struct AgentConfig: Sendable {
             "llm_kv_reuse": llmKVReuse,
             "kv_cache_int8": kvCacheInt8,
             "aux_kv_cache_max_tokens": auxKvCacheMaxTokens,
+            "aux_llm_kv_reuse": auxKvReuse,
+            "aux_kv_cache_int8": auxKvCacheInt8,
             "kernel_max_context_tokens": kernelMaxContextTokens,
             "kernel_raw_turns": kernelRawTurns,
             "kernel_consolidate_every": kernelConsolidateEvery,
@@ -813,6 +824,7 @@ public struct AgentConfig: Sendable {
         "aux_temperature", "aux_max_tokens", "aux_top_p", "aux_min_p", "aux_top_k",
         "aux_repetition_penalty", "aux_request_timeout",
         "aux_max_context_tokens", "aux_prompt_batch_size", "aux_kv_cache_max_tokens",
+        "aux_llm_kv_reuse", "aux_kv_cache_int8",
         "aux_tokenizer_path", "aux_mmproj_path",
     ]
 

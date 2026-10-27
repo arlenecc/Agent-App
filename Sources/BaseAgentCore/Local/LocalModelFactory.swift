@@ -528,7 +528,7 @@ public final class LocalModelFactory: @unchecked Sendable {
             }
         }
         if backend == "gguf" {
-            let key = "aux-gguf:\(value):\(config.effectiveAuxContextTokens):\(config.auxMaxTokens):\(config.llmKVReuse):\(config.kvCacheInt8)"
+            let key = "aux-gguf:\(value):\(config.effectiveAuxContextTokens):\(config.auxMaxTokens):\(config.auxKvReuse):\(config.auxKvCacheInt8)"
             return llms.value(for: key) {
                 do {
                     let file = try GGUFFileResolver.resolve(
@@ -543,8 +543,8 @@ public final class LocalModelFactory: @unchecked Sendable {
                         repetitionPenalty: config.auxRepetitionPenalty,
                         enableThinking: config.auxLocalLLMEnableThinking,
                         gpuLayers: config.llamaGpuLayers,
-                        kvReuse: config.llmKVReuse,
-                        kvInt8: config.kvCacheInt8
+                        kvReuse: config.auxKvReuse,
+                        kvInt8: config.auxKvCacheInt8
                     )
                 } catch {
                     AgentLog.warning("本地 GGUF 辅助模型不可用：\(error.localizedDescription)")
@@ -566,8 +566,8 @@ public final class LocalModelFactory: @unchecked Sendable {
             enableThinking: config.auxLocalLLMEnableThinking,
             contextWindow: config.effectiveAuxContextTokens,
             promptBatchSize: config.auxPromptBatchSize,
-            kvReuse: config.llmKVReuse,
-            kvInt8: config.kvCacheInt8
+            kvReuse: config.auxKvReuse,
+            kvInt8: config.auxKvCacheInt8
         )
 
         return llms.value(for: key) {
@@ -588,8 +588,8 @@ public final class LocalModelFactory: @unchecked Sendable {
                     enableThinking: config.auxLocalLLMEnableThinking,
                     contextWindow: config.auxMaxContextTokens,
                     promptBatchSize: config.auxPromptBatchSize,
-                    kvReuse: config.llmKVReuse,
-                    kvInt8: config.kvCacheInt8
+                    kvReuse: config.auxKvReuse,
+                    kvInt8: config.auxKvCacheInt8
                 )
             } catch {
                 AgentLog.warning("本地辅助 LLM 不可用：\(error.localizedDescription)")

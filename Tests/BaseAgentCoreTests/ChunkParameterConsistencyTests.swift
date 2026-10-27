@@ -134,6 +134,30 @@ final class ChunkParameterConsistencyTests: XCTestCase {
             toggledAux.agentRebuildKeys(comparedTo: base, allowing: AgentConfig.mainLLMOnlyKeys),
             ["aux_enabled"], "主槽位不得吞掉辅助模型开关")
 
+        // 辅助模型的 KV 复用 / 量化是独立参数：重载辅助模型即可生效，
+        // 但换主模型不能把它的变化一起吞掉。
+        var toggledAuxKV = base
+        toggledAuxKV.auxKvReuse.toggle()
+        toggledAuxKV.auxKvCacheInt8.toggle()
+        XCTAssertTrue(toggledAuxKV
+            .agentRebuildKeys(comparedTo: base, allowing: AgentConfig.auxLLMOnlyKeys)
+            .isEmpty, "辅助 KV 开关属于辅助槽位自身参数")
+        XCTAssertEqual(
+            toggledAuxKV.agentRebuildKeys(comparedTo: base,
+                                          allowing: AgentConfig.mainLLMOnlyKeys),
+            ["aux_kv_cache_int8", "aux_llm_kv_reuse"], "主槽位不得吞掉辅助 KV 设置")
+
+        var toggledMainKV = base
+        toggledMainKV.llmKVReuse.toggle()
+        toggledMainKV.kvCacheInt8.toggle()
+        XCTAssertTrue(toggledMainKV
+            .agentRebuildKeys(comparedTo: base, allowing: AgentConfig.mainLLMOnlyKeys)
+            .isEmpty, "主 KV 开关属于主槽位自身参数")
+        XCTAssertEqual(
+            toggledMainKV.agentRebuildKeys(comparedTo: base,
+                                           allowing: AgentConfig.auxLLMOnlyKeys),
+            ["kv_cache_int8", "llm_kv_reuse"], "辅助槽位不得吞掉主模型 KV 设置")
+
         XCTAssertTrue(base
             .agentRebuildKeys(comparedTo: base, allowing: AgentConfig.mainLLMOnlyKeys)
             .isEmpty, "配置未变时不应触发任何重建")
