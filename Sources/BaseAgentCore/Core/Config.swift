@@ -138,9 +138,13 @@ public struct AgentConfig: Sendable {
     /// 需配合 ragRerankThreshold=0.45 使用（原 0.7 阈值会滤掉全部结果）。
     /// 追求排序质量可改回 bge-reranker-v2-m3-mlx-mxfp8（MLX 后端）并上调阈值。
     public var ragRerankModel: String = "jina-reranker-v2-base-multilingual-onnx"
-    /// 重排分数过滤阈值（0-1）。全部低于阈值时回退原排序 topK，不会空结果。
+    /// 重排分数过滤阈值（0-1）。全部低于阈值时回退原排序，不会空结果。
     public var ragRerankThreshold: Double = 0.45
     public var ragRerankEnabled: Bool = true
+    /// 重排序后保留的结果数量（1...20，默认 5）。开启重排序时以此为准：
+    /// 候选池按它放大后交给 reranker，最终只取分数最高的 N 条；
+    /// 关闭重排序时仍按调用方 `top_k` 返回。
+    public var ragRerankTopN: Int = 5
     /// 检索结果格式化时单条片段的字符上限（超出截断加省略号）。
     public var ragSearchMaxCharsPerResult: Int = 1_500
     /// 检索结果总字符上限（超出截断）。
@@ -420,6 +424,7 @@ public struct AgentConfig: Sendable {
         if let v = string("rag_embedding_model") { ragEmbeddingModel = v }
         if let v = string("rag_rerank_model") { ragRerankModel = v }
         if let v = bool("rag_rerank_enabled") { ragRerankEnabled = v }
+        if let v = int("rag_rerank_top_n") { ragRerankTopN = v }
         if let v = bool("rag_auto_ingest") { ragAutoIngest = v }
         if let v = string("rag_pdf_engine") { ragPDFEngine = PDFEngine(stored: v) }
         if let v = string("rag_epub_ocr_engine") { ragEPUBOCREngine = PDFEngine(stored: v) }
@@ -730,6 +735,7 @@ public struct AgentConfig: Sendable {
             "rag_embedding_model": ragEmbeddingModel,
             "rag_rerank_model": ragRerankModel,
             "rag_rerank_enabled": ragRerankEnabled,
+            "rag_rerank_top_n": ragRerankTopN,
             "rag_auto_ingest": ragAutoIngest,
             "rag_pdf_engine": ragPDFEngine.rawValue,
             "rag_epub_ocr_engine": ragEPUBOCREngine.rawValue,

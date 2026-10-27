@@ -78,6 +78,7 @@ struct SettingsView: View {
     @State private var chunkSize = 500
     @State private var chunkOverlap = 50
     @State private var rerankEnabled = true
+    @State private var rerankTopN = 5
     @State private var semanticChunking = true
     @State private var autoIngest = false
     @State private var embeddingMinBatch = 2
@@ -415,51 +416,64 @@ struct SettingsView: View {
                     Button("选择…") { chooseDirectory($knowledgeBase, title: "选择知识库目录") }
                 }
 
-                HStack(spacing: 8) {
-                    Text("Embedding").font(.caption)
-                    Picker("", selection: $embeddingBackend) {
-                        ForEach(embeddingTypes, id: \.id) { type in
-                            Text(type.label).tag(type.id)
+                // Embedding 行：模型类型 / 本地路径之后紧接切片设置（语义切片 +
+                // 切片大小 + overlap），再是「应用配置 / 同步知识」。优先单行；
+                // 放不下时先把按钮换到下一行（切片设置仍在 Embedding 这一行），
+                // 窗口极窄时再把切片设置换行，避免控件被裁剪。
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 8) {
+                        embeddingPathControls
+                        chunkControls()
+                        Spacer(minLength: 8)
+                        knowledgeButtons()
+                    }
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(spacing: 8) {
+                            embeddingPathControls
+                            chunkControls()
+                            Spacer(minLength: 8)
+                        }
+                        HStack(spacing: 8) {
+                            Spacer(minLength: 8)
+                            knowledgeButtons()
                         }
                     }
-                    .labelsHidden()
-                    .frame(width: 130)
-                    Text("本地路径").font(.caption)
-                    TextField("可选", text: $embeddingPath)
-                        .textFieldStyle(.roundedBorder)
-                        .frame(minWidth: 140)
-                    Button("选择…") { chooseDirectory($embeddingPath, title: "选择 Embedding 目录") }
-                    Spacer(minLength: 8)
-                    Button("应用配置") { applyKnowledgeConfig() }
-                        .disabled(model.isSyncing || model.isDeduplicating
-                            || model.isModelLoading || model.isRunning || model.isWarmingUp)
-                    Button("同步知识") { applyAndSync() }
-                        .help("同步期间会自动等待模型加载/预热结束")
-                        .disabled(model.isSyncing || model.isDeduplicating || model.isRunning)
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(spacing: 8) {
+                            embeddingPathControls
+                            Spacer(minLength: 8)
+                        }
+                        HStack(spacing: 8) {
+                            chunkControls()
+                            Spacer(minLength: 8)
+                        }
+                        HStack(spacing: 8) {
+                            Spacer(minLength: 8)
+                            knowledgeButtons()
+                        }
+                    }
                 }
 
-                HStack(spacing: 8) {
-                    Text("Reranker").font(.caption)
-                    Picker("", selection: $rerankerBackend) {
-                        ForEach(embeddingTypes, id: \.id) { type in
-                            Text(type.label).tag(type.id)
+                // Reranker 行：模型类型 / 本地路径之后是「启用重排序 + TopN」，
+                // 再是「向量去重 / 停止同步」，同样按可用宽度自动折行。
+                ViewThatFits(in: .horizontal) {
+                    HStack(spacing: 8) {
+                        rerankerPathControls
+                        rerankControls()
+                        Spacer(minLength: 8)
+                        dedupeButtons()
+                    }
+                    VStack(alignment: .leading, spacing: 6) {
+                        HStack(spacing: 8) {
+                            rerankerPathControls
+                            rerankControls()
+                            Spacer(minLength: 8)
+                        }
+                        HStack(spacing: 8) {
+                            Spacer(minLength: 8)
+                            dedupeButtons()
                         }
                     }
-                    .labelsHidden()
-                    .frame(width: 130)
-                    Text("本地路径").font(.caption)
-                    TextField("可选", text: $rerankerPath)
-                        .textFieldStyle(.roundedBorder)
-                        .frame(minWidth: 140)
-                    Button("选择…") { chooseDirectory($rerankerPath, title: "选择 Reranker 目录") }
-                    Spacer(minLength: 8)
-                    Button(model.isDeduplicating ? "去重中…" : "向量去重") {
-                        model.requestVectorDedupe()
-                    }
-                    .help("排查并清理向量库内重复的向量，保留入库时间最早的一份")
-                    .disabled(model.isDeduplicating)
-                    Button("停止同步") { model.stopSync() }
-                        .disabled(!model.isSyncing)
                 }
 
                 DisclosureGroup("高级 RAG / OCR 设置", isExpanded: $showAdvanced) {
@@ -531,25 +545,8 @@ struct SettingsView: View {
                             Text("同步参数设置")
                                 .font(.caption.weight(.semibold))
                                 .foregroundStyle(.secondary)
-                            Toggle("启用重排序", isOn: $rerankEnabled)
                             Toggle("启动时自动同步", isOn: $autoIngest)
-                            Toggle("语义切片", isOn: $semanticChunking)
-                                .help("开启后大段落在句间相似度低谷处断开，切片阶段需嵌入全部候选句，明显更慢；关闭则按结构+token 边界递归切片")
-                            VStack(alignment: .leading, spacing: 1) {
-                                Stepper("切片大小：\(chunkSize) token", value: $chunkSize,
-                                        in: 100...4000, step: 50)
-                                    .help("含 overlap 的总预算，全链路（切分、入库、检索呈现）统一按它计算；"
-                                        + "超过 embedding 模型输入窗口时会自动压到窗口上限。"
-                                        + "纯中文约 1 字 ≈ 1 token，中英混排约 1.8 字符/token")
-                                if let limit = embeddingContentLimit, chunkSize > limit {
-                                    Text("实际生效：\(limit) token（受 embedding 模型输入窗口限制）")
-                                        .font(.caption2)
-                                        .foregroundStyle(.orange)
-                                }
-                            }
-                            Stepper("overlap：\(chunkOverlap) token", value: $chunkOverlap,
-                                    in: 0...1000, step: 10)
-                                .help("占切片大小的 10%，计入总预算：正文按 chunk_size − overlap 切片")
+                                .help("启动后自动执行一次知识增量同步")
                         }
                         HStack(spacing: 8) {
                             Text("自适应子批参数")
@@ -591,6 +588,101 @@ struct SettingsView: View {
         } label: {
             Text("知识同步配置").font(.headline)
         }
+    }
+
+    // MARK: - 知识同步配置的分段控件
+
+    /// Embedding 的「模型类型 + 本地路径 + 选择…」。
+    @ViewBuilder
+    private var embeddingPathControls: some View {
+        modelPathControls(title: "Embedding",
+                          backend: $embeddingBackend,
+                          path: $embeddingPath,
+                          chooseTitle: "选择 Embedding 目录")
+    }
+
+    /// Reranker 的「模型类型 + 本地路径 + 选择…」。
+    @ViewBuilder
+    private var rerankerPathControls: some View {
+        modelPathControls(title: "Reranker",
+                          backend: $rerankerBackend,
+                          path: $rerankerPath,
+                          chooseTitle: "选择 Reranker 目录")
+    }
+
+    @ViewBuilder
+    private func modelPathControls(title: String,
+                                   backend: Binding<String>,
+                                   path: Binding<String>,
+                                   chooseTitle: String) -> some View {
+        Text(title).font(.caption)
+        Picker("", selection: backend) {
+            ForEach(embeddingTypes, id: \.id) { type in
+                Text(type.label).tag(type.id)
+            }
+        }
+        .labelsHidden()
+        .frame(width: 130)
+        Text("本地路径").font(.caption)
+        TextField("可选", text: path)
+            .textFieldStyle(.roundedBorder)
+            .frame(minWidth: 140)
+        Button("选择…") { chooseDirectory(path, title: chooseTitle) }
+    }
+
+    /// 切片设置：语义切片开关 + 切片大小（含模型窗口收口提示）+ overlap。
+    @ViewBuilder
+    private func chunkControls() -> some View {
+        Toggle("语义切片", isOn: $semanticChunking)
+            .help("开启后大段落在句间相似度低谷处断开，切片阶段需嵌入全部候选句，明显更慢；"
+                + "关闭则按结构+token 边界递归切片")
+        VStack(alignment: .leading, spacing: 1) {
+            Stepper("切片大小：\(chunkSize) token", value: $chunkSize,
+                    in: 100...4000, step: 50)
+                .help("含 overlap 的总预算，全链路（切分、入库、检索呈现）统一按它计算；"
+                    + "超过 embedding 模型输入窗口时会自动压到窗口上限。"
+                    + "纯中文约 1 字 ≈ 1 token，中英混排约 1.8 字符/token")
+            if let limit = embeddingContentLimit, chunkSize > limit {
+                Text("实际生效：\(limit) token（受 embedding 模型输入窗口限制）")
+                    .font(.caption2)
+                    .foregroundStyle(.orange)
+            }
+        }
+        Stepper("overlap：\(chunkOverlap) token", value: $chunkOverlap,
+                in: 0...1000, step: 10)
+            .help("占切片大小的 10%，计入总预算：正文按 chunk_size − overlap 切片")
+    }
+
+    /// 重排序开关与 TopN：开启后最终返回分数最高的 TopN 条。
+    @ViewBuilder
+    private func rerankControls() -> some View {
+        Toggle("启用重排序", isOn: $rerankEnabled)
+            .help("开启后先用混合检索取候选，再由 reranker 重新打分排序，"
+                + "按下面的 TopN 返回最终结果；关闭则直接用 RRF 排序结果")
+        Stepper("TopN：\(rerankTopN)", value: $rerankTopN, in: 1...20)
+            .help("重排序之后保留的结果数量，默认 5；候选池会按它放大后再打乱重排。"
+                + "关闭重排序时按检索调用方的 top_k 返回")
+    }
+
+    @ViewBuilder
+    private func knowledgeButtons() -> some View {
+        Button("应用配置") { applyKnowledgeConfig() }
+            .disabled(model.isSyncing || model.isDeduplicating
+                || model.isModelLoading || model.isRunning || model.isWarmingUp)
+        Button("同步知识") { applyAndSync() }
+            .help("同步期间会自动等待模型加载/预热结束")
+            .disabled(model.isSyncing || model.isDeduplicating || model.isRunning)
+    }
+
+    @ViewBuilder
+    private func dedupeButtons() -> some View {
+        Button(model.isDeduplicating ? "去重中…" : "向量去重") {
+            model.requestVectorDedupe()
+        }
+        .help("排查并清理向量库内重复的向量，保留入库时间最早的一份")
+        .disabled(model.isDeduplicating)
+        Button("停止同步") { model.stopSync() }
+            .disabled(!model.isSyncing)
     }
 
     // MARK: - 参数控件
@@ -785,6 +877,7 @@ struct SettingsView: View {
         chunkSize = config.ragChunkSize
         chunkOverlap = config.ragChunkOverlap
         rerankEnabled = config.ragRerankEnabled
+        rerankTopN = config.ragRerankTopN
         semanticChunking = config.ragSemanticChunking
         autoIngest = config.ragAutoIngest
         embeddingMinBatch = config.ragEmbeddingMinBatch
@@ -1072,6 +1165,7 @@ struct SettingsView: View {
         config.ragChunkSize = max(100, chunkSize)
         config.ragChunkOverlap = min(max(0, chunkOverlap), config.ragChunkSize / 2)
         config.ragRerankEnabled = rerankEnabled
+        config.ragRerankTopN = min(max(1, rerankTopN), 20)
         config.ragSemanticChunking = semanticChunking
         config.ragAutoIngest = autoIngest
         config.ragEmbeddingMaxBatch = min(max(2, embeddingMaxBatch), 256)

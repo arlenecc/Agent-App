@@ -1176,12 +1176,17 @@ public final class RAGEngine {
                        source: String? = nil) async throws -> [SearchHit] {
         guard let embedding else { throw AgentError.storage("embedding 模型不可用") }
         // topK 来自模型参数：硬性封顶，避免一次检索把 reranker 批量推到很高。
-        let limit = max(1, min(topK, 20))
+        let requested = max(1, min(topK, 20))
         // 先做耗时的 embedQuery，再取 store：避免 await 期间 close/reload
         // 把已经取到的连接关掉，导致在途检索报「数据库已关闭」。
         let queryVector = try await embedding.embedQuery(query)
         let rerankEnabled = config.ragRerankEnabled && reranker != nil
-        let candidateCount = max(limit, rerankEnabled ? limit * 4 : limit)
+        // 开启重排序时，最终条数由设置里的 TopN 决定（候选池按它放大）；
+        // 未开启时仍按调用方 top_k。两者都封顶 20。
+        let resultCount = rerankEnabled
+            ? max(1, min(config.ragRerankTopN, 20))
+            : requested
+        let candidateCount = max(requested, resultCount) * (rerankEnabled ? 4 : 1)
 
         let fetched: [SearchHit]? = try withStore { store in
             guard store.count > 0 else { return nil }
@@ -1206,19 +1211,19 @@ public final class RAGEngine {
                     }
                     // 重排序后丢弃阈值以下结果（默认 0.45，适配 jina ONNX 的
                     // 分数分布；bge-mlx 方案可上调至 0.7）；全部低于阈值时
-                    // 回退到原排序的 topK 候选，避免模型完全拿不到上下文。
+                    // 回退到原排序的候选，避免模型完全拿不到上下文。
                     let threshold = config.ragRerankThreshold
                     let filtered = hits.filter { $0.score >= threshold }
                         .sorted { $0.score > $1.score }
                     hits = filtered.isEmpty
-                        ? Array(hits.sorted { $0.score > $1.score }.prefix(topK))
+                        ? Array(hits.sorted { $0.score > $1.score }.prefix(resultCount))
                         : filtered
                 }
             } catch {
                 AgentLog.warning("RAG rerank 失败，使用 RRF 排序: \(error.localizedDescription)")
             }
         }
-        return Array(hits.prefix(limit))
+        return Array(hits.prefix(resultCount))
     }
 
     public func searchFormatted(query: String, topK: Int = 3, source: String? = nil,

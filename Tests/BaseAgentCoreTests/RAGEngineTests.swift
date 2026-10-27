@@ -40,6 +40,16 @@ private final class RagFakeEmbedding: EmbeddingProvider {
     }
 }
 
+/// 确定性的假 reranker：按候选顺序给递减分数，全部高于默认阈值，
+/// 用于验证「重排序后的 TopN 截断」而不是分数过滤。
+private final class RagFakeReranker: RerankProvider {
+    let identifier = "rag-fake-rerank"
+
+    func rerank(query: String, documents: [String]) async throws -> [Double] {
+        documents.enumerated().map { index, _ in 0.9 - Double(index) * 0.01 }
+    }
+}
+
 final class RAGEngineTests: XCTestCase {
     func testIngestAndHybridSearchEndToEnd() async throws {
         let root = URL(fileURLWithPath: NSTemporaryDirectory())
@@ -629,5 +639,61 @@ final class RAGEngineTests: XCTestCase {
         XCTAssertEqual(afterSemantic.processed, 1, "语义切片开关变化必须重建")
         XCTAssertEqual(afterSemantic.skipped, 0)
         switched.close()
+    }
+
+    func testRerankTopNControlsResultCount() async throws {
+        // 设置面板的 TopN 决定重排序后最终返回几条：TopN=3 时即使调用方
+        // 请求 top_k=10，也只返回 3 条；关闭重排序后恢复按调用方 top_k。
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("base-agent-rag-topn-\(UUID().uuidString)")
+        let kb = root.appendingPathComponent("kb")
+        try FileManager.default.createDirectory(at: kb, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        var markdown = "# 检索片段\n\n"
+        for index in 1...8 {
+            markdown += "\n## 片段\(index)\n\n这是第\(index)段用于验证重排序 TopN 的正文内容。\n"
+        }
+        try markdown.write(to: kb.appendingPathComponent("topn.md"),
+                           atomically: true, encoding: .utf8)
+
+        var config = AgentConfig()
+        config.workspace = root.path
+        config.knowledgeBase = kb.path
+        config.ragChunkSize = 40
+        config.ragChunkOverlap = 5
+        config.ragRerankEnabled = true
+        config.ragRerankTopN = 3
+        // 阈值降到 0，避免分数过滤影响条数断言。
+        config.ragRerankThreshold = 0
+
+        let engine = RAGEngine(config: config, knowledgeBase: kb.path,
+                               embedding: RagFakeEmbedding(),
+                               reranker: RagFakeReranker())
+        let stats = await engine.ingest()
+        XCTAssertGreaterThanOrEqual(stats.chunks, 4, "需要多条候选才能验证 TopN")
+
+        let three = try await engine.search(query: "片段", topK: 10)
+        XCTAssertEqual(three.count, 3, "TopN 决定重排序后的返回条数")
+        engine.close()
+
+        // 同一份库换 TopN=6：返回条数随设置放大（仍受库内条数限制）。
+        config.ragRerankTopN = 6
+        let wider = RAGEngine(config: config, knowledgeBase: kb.path,
+                              embedding: RagFakeEmbedding(),
+                              reranker: RagFakeReranker())
+        let six = try await wider.search(query: "片段", topK: 10)
+        XCTAssertEqual(six.count, min(6, stats.chunks), "TopN 放大后返回条数随之增加")
+        wider.close()
+
+        // 关闭重排序：回到调用方 top_k，TopN 不参与。
+        config.ragRerankEnabled = false
+        config.ragRerankTopN = 3
+        let plain = RAGEngine(config: config, knowledgeBase: kb.path,
+                              embedding: RagFakeEmbedding(),
+                              reranker: RagFakeReranker())
+        let two = try await plain.search(query: "片段", topK: 2)
+        XCTAssertEqual(two.count, 2, "未开启重排序时按调用方 top_k 返回")
+        plain.close()
     }
 }

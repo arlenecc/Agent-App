@@ -32,7 +32,8 @@ public final class RagSearchTool: AgentTool {
             ]),
             "top_k": .object([
                 "type": .string("integer"),
-                "description": .string("返回片段数，默认 5，范围 1-10"),
+                "description": .string("候选片段数，默认 5，范围 1-10；开启重排序时"
+                    + "最终条数由设置里的 TopN 决定"),
             ]),
         ]),
         "required": .array([.string("query")]),
