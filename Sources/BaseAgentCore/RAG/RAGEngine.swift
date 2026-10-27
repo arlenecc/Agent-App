@@ -1330,9 +1330,10 @@ public final class RAGEngine {
         // 来源名单直接来自 manifest（同步/去重后都会更新）：千万级切片的库上
         // `SELECT DISTINCT source ... LIMIT` 实测 13.7 秒，会长期占住 searchLock，
         // 把并发的 rag_search 卡住。只有旧库没有 manifest 时才回退到索引扫描。
-        let manifestSources = indexedSources > 0
-            ? Array(indexedEntries.keys.sorted().prefix(sourceLimit))
-            : []
+        let sortedSources = indexedEntries.keys.sorted()
+        let manifestSources = sourceLimit > 0
+            ? Array(sortedSources.prefix(sourceLimit))
+            : sortedSources
         let snapshot = try? withStore { store -> [String: JSONValue] in
             let sources = manifestSources.isEmpty
                 ? store.listSources(limit: sourceLimit)
