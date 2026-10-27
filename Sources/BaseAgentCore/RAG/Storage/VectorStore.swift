@@ -65,6 +65,21 @@ public final class VectorStore: @unchecked Sendable {
 
     public func close() { db.close() }
 
+    /// 在期限内执行只读查询：先限时获取切片锁（避免大批量写入把读路径无限期
+    /// 挡住），再把剩余时间交给底层语句级期限。超时抛 `AgentError.timeout`，
+    /// 调用方跳过本次查询即可。
+    public func withQueryDeadline<T>(seconds: Double, _ body: () throws -> T) throws -> T {
+        guard seconds > 0 else { throw AgentError.timeout("查询超出时限被跳过") }
+        let deadline = Date().addingTimeInterval(seconds)
+        guard lock.lock(before: deadline) else {
+            throw AgentError.timeout("知识库正在写入，本次查询已跳过")
+        }
+        defer { lock.unlock() }
+        let remaining = deadline.timeIntervalSinceNow
+        guard remaining > 0 else { throw AgentError.timeout("查询超出时限被跳过") }
+        return try db.withDeadline(seconds: remaining, body)
+    }
+
     // MARK: - Schema
 
     private func createBaseSchema() throws {

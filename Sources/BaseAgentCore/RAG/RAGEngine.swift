@@ -226,6 +226,18 @@ public final class RAGEngine {
     /// 写操作使快照失效时自增；并发中的 `status()` 若跨了一次失效，
     /// 不再把旧统计写回缓存（否则会继续展示最长 `maxAge` 秒）。
     private var statusGeneration: UInt64 = 0
+    /// 超时后返回的「跳过」快照：短时间内不再重复等待同一个超时，
+    /// 否则状态栏每 30 秒刷新一次、每次都要白等满整个超时。
+    private var statusSkipSnapshot: [String: JSONValue]?
+    private var statusSkipUntil: TimeInterval = 0
+    private var lastTimeoutLog: TimeInterval = 0
+    private static let statusSkipCacheSeconds: TimeInterval = 30
+    /// 后台打开向量库：上次同步被中断/应用被强杀后，SQLite 需要先恢复遗留
+    /// WAL，可能要数分钟。打开放到后台队列，读路径只等 `timeout` 秒。
+    private let openCondition = NSCondition()
+    private var openInFlight = false
+    private var openFailure: Error?
+    private let openQueue = DispatchQueue(label: "base-agent.rag.open", qos: .utility)
 
     public static let supportedExtensions: Set<String> = [
         "pdf", "txt", "md", "markdown", "html", "htm", "xhtml",
@@ -367,6 +379,95 @@ public final class RAGEngine {
     private func withStore<T>(_ body: (VectorStore) throws -> T) throws -> T {
         searchLock.lock(); defer { searchLock.unlock() }
         return try body(try ensureStore())
+    }
+
+    /// 供 UI/工具读取当前生效的查询超时秒数（0 = 关闭超时）。
+    public var queryTimeoutSeconds: Double { config.ragQueryTimeoutSeconds }
+
+    /// 只读查询的实际超时：显式参数优先，否则用配置（0 = 不设超时）。
+    private func resolvedTimeout(_ explicit: Double?) -> Double {
+        explicit ?? config.ragQueryTimeoutSeconds
+    }
+
+    /// 带超时的只读查询入口：限时取 `searchLock`、限时等「打开库」、限时执行语句。
+    /// 任何一步超时都抛 `AgentError.timeout`，由调用方跳过本次查询
+    /// （状态查询转成提示快照，检索转成工具失败信息），不阻塞整个过程。
+    private func withStoreBounded<T>(timeout: Double,
+                                     _ body: (VectorStore) throws -> T) throws -> T {
+        guard timeout > 0 else { return try withStore(body) }
+        let deadline = Date().addingTimeInterval(timeout)
+        guard searchLock.lock(before: deadline) else {
+            throw logTimeout(AgentError.timeout(
+                "知识库正忙（同步/维护进行中），本次查询已跳过"))
+        }
+        defer { searchLock.unlock() }
+        do {
+            let store = try storeBounded(by: deadline)
+            let remaining = deadline.timeIntervalSinceNow
+            guard remaining > 0 else { throw AgentError.timeout("查询超出时限被跳过") }
+            return try store.withQueryDeadline(seconds: remaining) {
+                try body(store)
+            }
+        } catch {
+            throw logTimeout(error)
+        }
+    }
+
+    /// 限时拿到已打开的 store。打开动作放后台队列执行（同一时刻只有一个），
+    /// 超时即抛出；打开完成后后续查询自动可用，不会重复建连接。
+    private func storeBounded(by deadline: Date) throws -> VectorStore {
+        storeLock.lock()
+        if let store { storeLock.unlock(); return store }
+        storeLock.unlock()
+
+        openCondition.lock()
+        if !openInFlight {
+            openInFlight = true
+            openFailure = nil
+            openCondition.unlock()
+            openQueue.async { [weak self] in self?.runBackgroundOpen() }
+            openCondition.lock()
+        }
+        while openInFlight {
+            guard openCondition.wait(until: deadline) else {
+                openCondition.unlock()
+                throw AgentError.timeout(
+                    "知识库仍在打开（可能是上次同步中断后的恢复），本次查询已跳过")
+            }
+        }
+        let failure = openFailure
+        openCondition.unlock()
+        if let failure { throw failure }
+        storeLock.lock(); defer { storeLock.unlock() }
+        guard let store else { throw AgentError.storage("向量库不可用") }
+        return store
+    }
+
+    private func runBackgroundOpen() {
+        var failure: Error?
+        do { _ = try ensureStore() } catch { failure = error }
+        openCondition.lock()
+        openInFlight = false
+        openFailure = failure
+        openCondition.broadcast()
+        openCondition.unlock()
+        if let failure {
+            AgentLog.warning("RAG: 后台打开向量库失败: \(failure.localizedDescription)")
+        }
+    }
+
+    /// 超时日志限流：同一次卡顿只提示一次，避免刷屏。
+    private func logTimeout(_ error: Error) -> Error {
+        guard case AgentError.timeout = error else { return error }
+        statusLock.lock()
+        let now = Date().timeIntervalSince1970
+        let shouldLog = now - lastTimeoutLog > 60
+        if shouldLog { lastTimeoutLog = now }
+        statusLock.unlock()
+        guard shouldLog else { return error }
+        AgentLog.warning("RAG: 查询超时已跳过（\(error.localizedDescription)）；"
+            + "若持续出现，可能是上次同步中断后索引仍在恢复，或向量库过大")
+        return error
     }
 
     public func close() {
@@ -1186,8 +1287,10 @@ public final class RAGEngine {
     // MARK: Search
 
     public func search(query: String, topK: Int = 3,
-                       source: String? = nil) async throws -> [SearchHit] {
+                       source: String? = nil,
+                       timeout: Double? = nil) async throws -> [SearchHit] {
         guard let embedding else { throw AgentError.storage("embedding 模型不可用") }
+        let limit = resolvedTimeout(timeout)
         // topK 来自模型参数：硬性封顶，避免一次检索把 reranker 批量推到很高。
         let requested = max(1, min(topK, 20))
         // 先做耗时的 embedQuery，再取 store：避免 await 期间 close/reload
@@ -1201,7 +1304,7 @@ public final class RAGEngine {
             : requested
         let candidateCount = max(requested, resultCount) * (rerankEnabled ? 4 : 1)
 
-        let fetched: [SearchHit]? = try withStore { store in
+        let fetched: [SearchHit]? = try withStoreBounded(timeout: limit) { store in
             guard store.hasChunks else { return nil }
             return try store.hybridSearch(
                 vector: queryVector, query: query, topK: candidateCount,
@@ -1317,10 +1420,18 @@ public final class RAGEngine {
     /// 都是秒级到分钟级（56GB、2100 万切片实测约 6 分钟），因此：
     /// - 切片数直接用 `VectorStore` 维护的计数器（O(1)）；
     /// - 来源数用 manifest 条目数（同步/去重后都会更新），不再 COUNT DISTINCT；
-    /// - 结果缓存 `maxAge` 秒，写操作会主动失效。
+    /// - 结果缓存 `maxAge` 秒，写操作会主动失效；
+    /// - `timeout` 秒内没拿到结果就返回带 `error` 的提示快照（默认取配置
+    ///   `rag_query_timeout_seconds`，0 = 不设超时），调用方照常展示，
+    ///   不会因为这个查询把启动/对话卡住。
     public func status(sourceLimit: Int = 256,
-                       maxAge: TimeInterval = 600) -> [String: JSONValue] {
+                       maxAge: TimeInterval = 600,
+                       timeout: Double? = nil) -> [String: JSONValue] {
         if let cached = cachedStatus(maxAge: maxAge) { return cached }
+        // `maxAge <= 0` 表示调用方要绕过缓存（诊断/刚同步完），此时也不复用
+        // 「上次超时」的跳过快照，直接重试。
+        if maxAge > 0, let skipped = cachedSkipSnapshot() { return skipped }
+        let limit = resolvedTimeout(timeout)
         statusLock.lock()
         let generation = statusGeneration
         statusLock.unlock()
@@ -1334,7 +1445,7 @@ public final class RAGEngine {
         let manifestSources = sourceLimit > 0
             ? Array(sortedSources.prefix(sourceLimit))
             : sortedSources
-        let snapshot = try? withStore { store -> [String: JSONValue] in
+        let snapshot = try? withStoreBounded(timeout: limit) { store -> [String: JSONValue] in
             let sources = manifestSources.isEmpty
                 ? store.listSources(limit: sourceLimit)
                 : manifestSources
@@ -1349,14 +1460,11 @@ public final class RAGEngine {
                 "vector_backend": .string(store.vectorEnabled ? "sqlite-vec" : "sqlite-exact"),
             ]
         }
-        let result = snapshot ?? [
-            "knowledge_base": .string(knowledgeBase),
-            "rag_dir": .string(ragDir),
-            "chunks_stored": .int(0),
-            "source_count": .int(indexedSources),
-            "sources": .array(manifestSources.map { .string($0) }),
-            "error": .string("向量库不可用"),
-        ]
+        guard let snapshot else {
+            // 超时/库不可用：返回「跳过」快照，保留上一次已知统计。
+            return skipSnapshot(limit: limit)
+        }
+        let result = snapshot
         statusLock.lock()
         // 统计期间若有同步/去重/清空完成，本次结果已过期，不写回缓存。
         if statusGeneration == generation {
@@ -1379,11 +1487,49 @@ public final class RAGEngine {
         return statusSnapshot
     }
 
+    /// 短时间内已超时过就不再重试：状态栏每 30 秒刷新一次，
+    /// 每次都白等满超时是没意义的。
+    private func cachedSkipSnapshot() -> [String: JSONValue]? {
+        statusLock.lock(); defer { statusLock.unlock() }
+        guard let statusSkipSnapshot,
+              Date().timeIntervalSince1970 < statusSkipUntil else { return nil }
+        return statusSkipSnapshot
+    }
+
+    /// 超时/不可用时给出的提示快照：保留上一次已知统计，附加可读原因。
+    private func skipSnapshot(limit: Double) -> [String: JSONValue] {
+        let reason = limit > 0
+            ? "查询超时（\(Self.timeoutLabel(limit))），已跳过"
+            : "向量库暂时不可用，已跳过"
+        logTimeout(AgentError.timeout(reason))
+        statusLock.lock()
+        var snapshot = statusSnapshot ?? [
+            "knowledge_base": .string(knowledgeBase),
+            "rag_dir": .string(ragDir),
+            "chunks_stored": .int(0),
+            "source_count": .int(0),
+            "sources": .array([]),
+        ]
+        snapshot["error"] = .string(reason)
+        statusSkipSnapshot = snapshot
+        statusSkipUntil = Date().timeIntervalSince1970 + Self.statusSkipCacheSeconds
+        statusLock.unlock()
+        return snapshot
+    }
+
+    private static func timeoutLabel(_ seconds: Double) -> String {
+        seconds >= 1
+            ? "\(Int(seconds.rounded()))s 未响应"
+            : "\(Int((seconds * 1000).rounded()))ms 未响应"
+    }
+
     /// 数据变化（同步/删除/去重/清空/重载）后丢弃快照，下次展示重新统计。
     public func invalidateStatusCache() {
         statusLock.lock()
         statusSnapshot = nil
         statusSnapshotTime = 0
+        statusSkipSnapshot = nil
+        statusSkipUntil = 0
         statusGeneration &+= 1
         statusLock.unlock()
     }

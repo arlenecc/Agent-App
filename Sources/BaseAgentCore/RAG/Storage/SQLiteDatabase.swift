@@ -69,6 +69,11 @@ public final class SQLiteDatabase {
     public let path: String
     /// sqlite-vec 是否可用（vec0 虚拟表 + KNN）。
     public private(set) var vectorExtensionLoaded = false
+    /// 当前生效的期限（`DispatchTime` 纳秒，0 = 不设期限）。只在 `lock` 内读写。
+    private var deadlineNanos: UInt64 = 0
+    /// 进度回调间隔（VM 指令数）：越小越灵敏、开销越大。2000 条指令约
+    /// 几十微秒的量级，配合 5s 级期限足够灵敏。
+    private static let progressInstructionCount = 2_000
 
     public init(path: String, readOnly: Bool = false) throws {
         self.path = path
@@ -105,22 +110,81 @@ public final class SQLiteDatabase {
         }
     }
 
+    // MARK: Deadline
+
+    /// 在期限内执行一批语句：到期后正在执行的语句会被 VM 层中断
+    /// （`sqlite3_progress_handler` 返回非 0 → SQLITE_INTERRUPT）并抛 `AgentError.timeout`。
+    ///
+    /// 这是掐断长查询的唯一手段：sqlite-vec 的 KNN 循环在虚拟表内部，Swift 侧
+    /// 插不进检查点；56GB / 2100 万切片的库上一次全量 KNN 可能耗时数分钟。
+    /// `seconds` 必须为正，否则视为「期限已过」直接抛超时（配置里 0 = 关闭
+    /// 超时由调用方决定，不要在期限内传 0）。
+    public func withDeadline<T>(seconds: Double, _ body: () throws -> T) throws -> T {
+        guard seconds > 0 else { throw AgentError.timeout("查询超出时限被跳过") }
+        lock.lock(); defer { lock.unlock() }
+        let deadline = DispatchTime.now().uptimeNanoseconds
+            + UInt64(seconds * 1_000_000_000)
+        let previous = deadlineNanos
+        deadlineNanos = deadline
+        if let handle {
+            sqlite3_progress_handler(handle, Int32(Self.progressInstructionCount),
+                                     { context in
+                guard let context else { return 0 }
+                let database = Unmanaged<SQLiteDatabase>
+                    .fromOpaque(context).takeUnretainedValue()
+                return database.deadlineExpired ? 1 : 0
+            }, Unmanaged.passUnretained(self).toOpaque())
+        }
+        defer {
+            deadlineNanos = previous
+            if previous == 0, let handle {
+                sqlite3_progress_handler(handle, 0, nil, nil)
+            }
+        }
+        // 期限可能在进入前就已耗尽（例如「打开库」已经花光预算）：直接跳过，
+        // 保证不产生任何副作用。
+        try checkDeadline()
+        return try body()
+    }
+
+    private var deadlineExpired: Bool {
+        let deadline = deadlineNanos
+        return deadline != 0 && DispatchTime.now().uptimeNanoseconds >= deadline
+    }
+
+    /// 语句入口的廉价检查：期限已过就不再开始新语句。
+    private func checkDeadline() throws {
+        guard deadlineExpired else { return }
+        throw AgentError.timeout("查询超出时限被跳过")
+    }
+
+    /// 把「被期限中断」与普通 SQL 错误区分开：前者是预期行为，不该报成存储错误。
+    private func statementError(_ handle: OpaquePointer, stage: String, sql: String) -> AgentError {
+        let code = sqlite3_errcode(handle)
+        let message = String(cString: sqlite3_errmsg(handle))
+        if code == SQLITE_INTERRUPT {
+            return AgentError.timeout("查询超出时限被中断")
+        }
+        return AgentError.storage("\(stage): \(message)\n\(sql.prefix(300))")
+    }
+
     // MARK: Core execution
 
     @discardableResult
     public func execute(_ sql: String, _ bindings: [SQLValue] = []) throws -> Int {
         lock.lock(); defer { lock.unlock() }
         guard let handle else { throw AgentError.storage("数据库已关闭") }
+        try checkDeadline()
         var stmt: OpaquePointer?
         let rc = sqlite3_prepare_v2(handle, sql, -1, &stmt, nil)
         guard rc == SQLITE_OK else {
-            throw AgentError.storage("SQL 准备失败: \(String(cString: sqlite3_errmsg(handle)))\n\(sql.prefix(300))")
+            throw statementError(handle, stage: "SQL 准备失败", sql: sql)
         }
         defer { sqlite3_finalize(stmt) }
         try bind(stmt, bindings)
         let step = sqlite3_step(stmt)
         guard step == SQLITE_DONE || step == SQLITE_ROW else {
-            throw AgentError.storage("SQL 执行失败: \(String(cString: sqlite3_errmsg(handle)))\n\(sql.prefix(300))")
+            throw statementError(handle, stage: "SQL 执行失败", sql: sql)
         }
         return Int(sqlite3_changes(handle))
     }
@@ -128,10 +192,11 @@ public final class SQLiteDatabase {
     public func query(_ sql: String, _ bindings: [SQLValue] = []) throws -> [[String: SQLValue]] {
         lock.lock(); defer { lock.unlock() }
         guard let handle else { throw AgentError.storage("数据库已关闭") }
+        try checkDeadline()
         var stmt: OpaquePointer?
         let rc = sqlite3_prepare_v2(handle, sql, -1, &stmt, nil)
         guard rc == SQLITE_OK else {
-            throw AgentError.storage("SQL 准备失败: \(String(cString: sqlite3_errmsg(handle)))\n\(sql.prefix(300))")
+            throw statementError(handle, stage: "SQL 准备失败", sql: sql)
         }
         defer { sqlite3_finalize(stmt) }
         try bind(stmt, bindings)
@@ -140,7 +205,7 @@ public final class SQLiteDatabase {
             let step = sqlite3_step(stmt)
             if step == SQLITE_DONE { break }
             guard step == SQLITE_ROW else {
-                throw AgentError.storage("SQL 查询失败: \(String(cString: sqlite3_errmsg(handle)))")
+                throw statementError(handle, stage: "SQL 查询失败", sql: sql)
             }
             var row: [String: SQLValue] = [:]
             let count = sqlite3_column_count(stmt)
@@ -161,6 +226,7 @@ public final class SQLiteDatabase {
     public func execScript(_ sql: String) throws -> Int {
         lock.lock(); defer { lock.unlock() }
         guard let handle else { throw AgentError.storage("数据库已关闭") }
+        try checkDeadline()
         var err: UnsafeMutablePointer<CChar>?
         let rc = sqlite3_exec(handle, sql, nil, nil, &err)
         if rc != SQLITE_OK {

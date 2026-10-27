@@ -149,6 +149,10 @@ public struct AgentConfig: Sendable {
     public var ragSearchMaxCharsPerResult: Int = 1_500
     /// 检索结果总字符上限（超出截断）。
     public var ragSearchMaxTotalChars: Int = 12_000
+    /// 知识库只读查询（打开库 / 状态 / 检索）的超时秒数。上次同步被中断、
+    /// 应用被强杀时，SQLite 需要先恢复遗留 WAL，可能耗时数分钟；启动与对话
+    /// 路径都必须设上限：超出即跳过本次查询，不再阻塞。0 = 关闭超时。
+    public var ragQueryTimeoutSeconds: Double = 5
     /// 辅助模型精简触发下限：检索结果总字数低于该值时原样返回，
     /// 不调用辅助模型（内容不多时总结只会丢细节、平白增加延迟）。
     public var ragAuxSummarizeMinChars: Int = 4_000
@@ -425,6 +429,7 @@ public struct AgentConfig: Sendable {
         if let v = string("rag_rerank_model") { ragRerankModel = v }
         if let v = bool("rag_rerank_enabled") { ragRerankEnabled = v }
         if let v = int("rag_rerank_top_n") { ragRerankTopN = v }
+        if let v = double("rag_query_timeout_seconds"), v >= 0 { ragQueryTimeoutSeconds = v }
         if let v = bool("rag_auto_ingest") { ragAutoIngest = v }
         if let v = string("rag_pdf_engine") { ragPDFEngine = PDFEngine(stored: v) }
         if let v = string("rag_epub_ocr_engine") { ragEPUBOCREngine = PDFEngine(stored: v) }
@@ -736,6 +741,7 @@ public struct AgentConfig: Sendable {
             "rag_rerank_model": ragRerankModel,
             "rag_rerank_enabled": ragRerankEnabled,
             "rag_rerank_top_n": ragRerankTopN,
+            "rag_query_timeout_seconds": ragQueryTimeoutSeconds,
             "rag_auto_ingest": ragAutoIngest,
             "rag_pdf_engine": ragPDFEngine.rawValue,
             "rag_epub_ocr_engine": ragEPUBOCREngine.rawValue,

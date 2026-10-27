@@ -475,6 +475,8 @@ public enum AgentError: LocalizedError {
     case permission(String)
     case notFound(String)
     case internalError(String)
+    /// 操作超出时限被主动放弃（知识库查询、打开库等），调用方应跳过而不是重试等待。
+    case timeout(String)
 
     public var errorDescription: String? {
         switch self {
@@ -488,6 +490,7 @@ public enum AgentError: LocalizedError {
         case .permission(let s): return "权限错误: \(s)"
         case .notFound(let s): return "未找到: \(s)"
         case .internalError(let s): return "内部错误: \(s)"
+        case .timeout(let s): return "超时: \(s)"
         }
     }
 }

@@ -1229,7 +1229,13 @@ final class AppViewModel: ObservableObject {
             let backend = status["vector_backend"]?.stringValue ?? "sqlite"
             let sources = status["source_count"]?.intValue
                 ?? status["sources"]?.arrayValue?.count ?? 0
-            let text = "\(chunks) 切片 · \(sources) 文件 · \(backend)"
+            // 超时/不可用时 status 带 error：状态栏给可读提示，不显示误导性的 0 切片。
+            let text: String
+            if let reason = status["error"]?.stringValue {
+                text = "知识库\(reason)（上次统计：\(chunks) 切片 · \(sources) 文件）"
+            } else {
+                text = "\(chunks) 切片 · \(sources) 文件 · \(backend)"
+            }
             await MainActor.run { [weak self] in
                 guard let self else { return }
                 self.ragStatusRefreshing = false
