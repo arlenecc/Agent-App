@@ -27,14 +27,17 @@ public final class VisionPDFParser: DocumentParser {
     public func parse(url: URL,
                       options: ParserOptions,
                       progress: ((ParserProgress) -> Void)?) async throws -> ParsedDocument {
-        guard let document = PDFDocument(url: url) else {
-            throw AgentError.parse("无法打开 PDF：\(url.lastPathComponent)")
+        // PDFKit 文档只在文本层/书签阶段使用：先取出页数与书签，
+        // 让 PDFDocument 在进入内存密集的渲染/OCR 阶段前释放。
+        let (totalPages, bookmarkEntries): (Int, [OutlineEntry]) = try autoreleasepool {
+            guard let document = PDFDocument(url: url) else {
+                throw AgentError.parse("无法打开 PDF：\(url.lastPathComponent)")
+            }
+            if document.isLocked, !document.unlock(withPassword: "") {
+                throw AgentError.parse("PDF 已加密且无法用空密码解锁：\(url.lastPathComponent)")
+            }
+            return (document.pageCount, PDFBookmarks.entries(of: document))
         }
-        if document.isLocked, !document.unlock(withPassword: "") {
-            throw AgentError.parse("PDF 已加密且无法用空密码解锁：\(url.lastPathComponent)")
-        }
-
-        let totalPages = document.pageCount
         guard totalPages > 0 else {
             throw AgentError.parse("PDF 不包含任何页面：\(url.lastPathComponent)")
         }
@@ -49,7 +52,9 @@ public final class VisionPDFParser: DocumentParser {
         // 1. 按页并行提取文本层，并判断是否达到阈值。
         //    每个 worker 独占一个 PDFDocument（PDFKit 不能跨线程共享同一文档），
         //    文本提取是 CPU 单线程工作，串行时大 PDF 只有一个核在跑。
-        let textWorkerCount = max(1, min(PDFPageRenderer.renderWorkers, pageLimit))
+        //    超大 PDF 按体积收紧 worker 数，避免多份 PDFDocument 同时解析。
+        let plan = PDFProcessingPlan.plan(fileURL: url)
+        let textWorkerCount = max(1, min(plan.workerCount, pageLimit))
         let textOutcomes = try await withThrowingTaskGroup(of: VisionTextLayerOutcome.self) { group in
             for worker in 0..<textWorkerCount {
                 group.addTask {
@@ -65,13 +70,20 @@ public final class VisionPDFParser: DocumentParser {
                     for index in stride(from: worker, to: pageLimit, by: textWorkerCount) {
                         if Task.isCancelled { throw AgentError.cancelled }
                         progress?(.page(index: index + 1, total: pageLimit, stage: "text"))
-                        guard let page = workerDocument.page(at: index) else {
+                        let textStarted = Date()
+                        // 每页排空一次 autorelease pool：PDFPage 由 PDFKit 惰性
+                        // 解析，整本书的页对象若一直挂在池里会累积到数 GB。
+                        let text: String? = autoreleasepool {
+                            guard let page = workerDocument.page(at: index) else {
+                                return nil
+                            }
+                            return (page.string ?? "")
+                                .trimmingCharacters(in: .whitespacesAndNewlines)
+                        }
+                        guard let text else {
                             outcome.texts.append((index, ""))
                             continue
                         }
-                        let textStarted = Date()
-                        let text = (page.string ?? "")
-                            .trimmingCharacters(in: .whitespacesAndNewlines)
                         outcome.textSeconds += Date().timeIntervalSince(textStarted)
                         if DocumentCleaner.effectiveCharacterCount(text)
                             >= Self.textLayerMinCharacters {
@@ -133,7 +145,7 @@ public final class VisionPDFParser: DocumentParser {
         }
 
         var plain = sections.joined(separator: "\n\n")
-        var outlineEntries = PDFBookmarks.entries(of: document)
+        var outlineEntries = bookmarkEntries
         var metadata: [String: String] = ["engine": "vision",
                                           "ocr_pages": String(pagesNeedingOCR.count),
                                           "timing_text": String(format: "%.2f", textSeconds),

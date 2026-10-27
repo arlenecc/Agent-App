@@ -30,6 +30,10 @@ public enum PDFPageRenderer {
     public static let textLayerMinCharacters = 50
     public static let defaultMaxLongSide = 4096
     public static let defaultMaxPixelCount = 16_000_000
+    /// 内嵌 JPEG 的像素数安全上限（200MP）。超过时放弃「直提取」，
+    /// 回退到有界的页面栅格化：扫描页最终长边只有 1408/1500，
+    /// 没必要为一页图像承担数 GB 的解码内存。
+    public static let maxEmbeddedPixelCount = 200_000_000
 
     /// 扫描页渲染 worker 数：每 worker 独占一个 CGPDFDocument 实例串行产图，
     /// worker 之间并行。文件级并发由 PDFPageScanRunner 的全局闸门统一限流。
@@ -144,8 +148,9 @@ public enum PDFPageRenderer {
                              targetLongSide: Int,
                              dpi: Double) -> CGImage? {
         guard let cgPage = document.page(at: pageIndex + 1) else { return nil }
-        if let extracted = extractEmbeddedJPEG(cgPage: cgPage) {
-            return fitted(extracted, targetLongSide: targetLongSide)
+        if let extracted = extractEmbeddedJPEG(cgPage: cgPage,
+                                               targetLongSide: targetLongSide) {
+            return extracted
         }
         return render(cgPage: cgPage, dpi: dpi,
                       maxLongSide: targetLongSide,
@@ -154,13 +159,54 @@ public enum PDFPageRenderer {
 
     /// 提取页面唯一的大尺寸 JPEG（扫描件整页图）。C 级判断在 CPDFShim 中，
     /// 任何不确定的情况都返回 nil 走渲染兜底，确保不丢内容。
-    static func extractEmbeddedJPEG(cgPage: CGPDFPage) -> CGImage? {
+    ///
+    /// 关键：解码时直接用 ImageIO 缩略图接口按目标长边降采样，而不是
+    /// `CGImageSourceCreateImageAtIndex` 先解出整张原图再 `fitted` 缩小。
+    /// 高像素扫描页（例如 20000×20000）完整解码单页就要 1.6GB，
+    /// 多个 worker 在途时会瞬间吃掉几十 GB。
+    static func extractEmbeddedJPEG(cgPage: CGPDFPage,
+                                    targetLongSide: Int) -> CGImage? {
         guard let jpeg = CPDFShimCopyEmbeddedPageJPEG(cgPage) else { return nil }
-        let data = jpeg.takeRetainedValue()
-        guard let source = CGImageSourceCreateWithData(data, nil),
-              let image = CGImageSourceCreateImageAtIndex(source, 0, [kCGImageSourceShouldCache: false] as CFDictionary)
-        else { return nil }
-        return image
+        let data = jpeg.takeRetainedValue() as Data
+        return decodeEmbeddedJPEG(data, targetLongSide: targetLongSide)
+    }
+
+    /// 把内嵌 JPEG 数据解码为不超过 `targetLongSide` 的位图。
+    ///
+    /// - `maxPixelCount` 为解码前的像素数预检：超过上限直接放弃直提取，
+    ///   由调用方走有界栅格化，避免解压炸弹式 JPEG。
+    /// - 使用 `CGImageSourceCreateThumbnailAtIndex` + `ShouldCacheImmediately`，
+    ///   ImageIO 会在解码阶段直接做子采样，峰值内存约为目标尺寸位图，
+    ///   与原始 JPEG 的像素数无关。
+    static func decodeEmbeddedJPEG(_ data: Data,
+                                   targetLongSide: Int,
+                                   maxPixelCount: Int = maxEmbeddedPixelCount) -> CGImage? {
+        guard targetLongSide > 0, !data.isEmpty,
+              let source = CGImageSourceCreateWithData(data as CFData, nil) else {
+            return nil
+        }
+
+        if maxPixelCount > 0,
+           let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil)
+            as? [CFString: Any],
+           let width = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue,
+           let height = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue,
+           width > 0, height > 0,
+           Int64(width) * Int64(height) > Int64(maxPixelCount) {
+            return nil
+        }
+
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceShouldCacheImmediately: true,
+            kCGImageSourceThumbnailMaxPixelSize: max(1, targetLongSide),
+        ]
+        guard let image = CGImageSourceCreateThumbnailAtIndex(
+            source, 0, options as CFDictionary) else {
+            return nil
+        }
+        return fitted(image, targetLongSide: targetLongSide)
     }
 
     /// 长边超出目标时缩一次到位；带 alpha 通道时合成白底。

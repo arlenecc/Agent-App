@@ -59,14 +59,17 @@ public final class OvisPDFParser: DocumentParser, VLMBackedParser {
     public func parse(url: URL,
                       options: ParserOptions,
                       progress: ((ParserProgress) -> Void)?) async throws -> ParsedDocument {
-        guard let document = PDFDocument(url: url) else {
-            throw AgentError.parse("无法打开 PDF：\(url.lastPathComponent)")
+        // 与 Vision 路径一致：只取页数/书签，PDFDocument 在进入渲染与
+        // VLM 识别前释放，避免大文档的解析缓存与页面位图叠加。
+        let (totalPages, bookmarkEntries): (Int, [OutlineEntry]) = try autoreleasepool {
+            guard let document = PDFDocument(url: url) else {
+                throw AgentError.parse("无法打开 PDF：\(url.lastPathComponent)")
+            }
+            if document.isLocked, !document.unlock(withPassword: "") {
+                throw AgentError.parse("PDF 已加密且无法用空密码解锁：\(url.lastPathComponent)")
+            }
+            return (document.pageCount, PDFBookmarks.entries(of: document))
         }
-        if document.isLocked, !document.unlock(withPassword: "") {
-            throw AgentError.parse("PDF 已加密且无法用空密码解锁：\(url.lastPathComponent)")
-        }
-
-        let totalPages = document.pageCount
         guard totalPages > 0 else {
             throw AgentError.parse("PDF 不包含任何页面：\(url.lastPathComponent)")
         }
@@ -95,7 +98,8 @@ public final class OvisPDFParser: DocumentParser, VLMBackedParser {
         // 共享同一文档），文本提取与表格区域渲染都是 CPU 单线程工作，串行时
         // 大 PDF 只有一个核在跑。表格 OCR 仍由 VLM 实例池/MLX 全局串行。
         let tableVLM = self.vlm
-        let textWorkerCount = max(1, min(PDFPageRenderer.renderWorkers, pageLimit))
+        let plan = PDFProcessingPlan.plan(fileURL: url)
+        let textWorkerCount = max(1, min(plan.workerCount, pageLimit))
         let textOutcomes = try await withThrowingTaskGroup(of: TextLayerOutcome.self) { group in
             for worker in 0..<textWorkerCount {
                 group.addTask {
@@ -116,8 +120,12 @@ public final class OvisPDFParser: DocumentParser, VLMBackedParser {
                             outcome.texts.append((index, ""))
                             continue
                         }
+                        // 每页排空 autorelease pool：PDFPage 对象与 PDFKit
+                        // 解析缓存不随循环自动释放，整本书会持续累积。
                         let textStarted = Date()
-                        let rawText = page.string ?? ""
+                        let rawText: String = autoreleasepool {
+                            page.string ?? ""
+                        }
                         let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
                         outcome.textSeconds += Date().timeIntervalSince(textStarted)
                         if DocumentCleaner.effectiveCharacterCount(text)
@@ -375,7 +383,7 @@ public final class OvisPDFParser: DocumentParser, VLMBackedParser {
             structureEntries = restored.entries
             metadata["structure_restored"] = "true"
         }
-        var outlineEntries = PDFBookmarks.entries(of: document)
+        var outlineEntries = bookmarkEntries
         outlineEntries.append(contentsOf: structureEntries)
         var parsed = ParsedDocument(text: finalText,
                                     source: url.lastPathComponent,
@@ -407,8 +415,11 @@ public final class OvisPDFParser: DocumentParser, VLMBackedParser {
             AgentLog.warning("PDF 第 \(pageNumber) 页检测到表格，但 OvisOCR3 不可用，保留文本层")
             return nil
         }
-        guard let fullImage = PDFPageRenderer.render(page: page, dpi: 300,
-                                                     maxLongSide: 4_096) else {
+        // 整页图在多次 VLM 调用期间驻留，但渲染产生的中间对象应立即释放；
+        // 返回的 CGImage 由 fullImage 强引用，不受 pool 影响。
+        guard let fullImage = autoreleasepool(invoking: {
+            PDFPageRenderer.render(page: page, dpi: 300, maxLongSide: 4_096)
+        }) else {
             AgentLog.warning("PDF 第 \(pageNumber) 页表格区域渲染失败，保留文本层")
             return nil
         }

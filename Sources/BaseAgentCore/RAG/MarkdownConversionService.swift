@@ -122,11 +122,34 @@ public enum MarkdownConversionError: LocalizedError, Sendable {
 /// 复用 RAG 的 `DocumentParserRegistry`，把单个文件或整个目录转换成
 /// 独立的 Markdown 文件。解析、OCR、图片归一化、清洗与入库使用同一套
 /// 解析器，唯一区别是不做切片、embedding 和向量库写入。
+///
+/// 执行策略与主流程一致：轻文件按 `ragIngestConcurrency`（最多 6）分批并发，
+/// 大文件单独成批且串行；PDF 内部再按文件体积收紧 worker / 在途页 / 批大小，
+/// 并受全局页面图像闸门约束。这样目录转换既有并发加速，也不会因多份大文件
+/// 同时解析把内存顶爆。
 public actor MarkdownConversionService {
     private struct SourceFile: Sendable {
         let url: URL
         let relativePath: String
     }
+
+    /// 一个待转换文件及其预先分配的输出路径。
+    private struct FileTask: Sendable {
+        let index: Int
+        let file: SourceFile
+        let outputURL: URL
+    }
+
+    private struct FileOutcome: Sendable {
+        let index: Int
+        /// 取消的批次不产生结果（与串行版本一致）。
+        let result: MarkdownConversionResult?
+        let cancelled: Bool
+    }
+
+    /// 大文件阈值：达到该体积的 PDF/文档单独成批，不与任何文件并发。
+    /// 大文件内部的页级并发已由 `PDFProcessingPlan` 按体积收紧。
+    static let heavyFileBytes: Int64 = 32 * 1024 * 1024
 
     public init() {}
 
@@ -177,151 +200,86 @@ public actor MarkdownConversionService {
             stage: "发现 \(total) 个待转换文件",
             overallFraction: 0))
 
-        let registry = DocumentParserRegistry.makeDefault(config: request.config)
+        let config = request.config
+        // 与主流程一致的文件级并发：默认 10 会夹到 6；单文件或大文件
+        // 批次内实际上只有 1 个任务。转换工具不做 embedding/入库，
+        // 因此这里只保留解析阶段的并发。
+        let baseConcurrency = min(max(1, config.ragIngestConcurrency), 6, max(1, total))
+        let fileSizes = files.map { PDFProcessingPlan.fileSize(of: $0.url) }
+        let batches = Self.batchIndices(fileSizes: fileSizes,
+                                        baseConcurrency: baseConcurrency)
+
+        // 输出路径在并发开始前按发现顺序分配，保证 a.txt/a.html 的
+        // a.md / a-2.md 与串行版本完全一致。
+        var usedOutputs: Set<String> = []
+        let outputURLs = files.map { file in
+            Self.uniqueOutputURL(
+                Self.desiredOutputURL(for: file,
+                                      sourceIsDirectory: sourceIsDirectory.boolValue,
+                                      output: output),
+                used: &usedOutputs)
+        }
+
+        let registry = DocumentParserRegistry.makeDefault(config: config)
         var results: [MarkdownConversionResult] = []
         var succeeded = 0
         var failed = 0
-        var usedOutputs: Set<String> = []
         var cancelled = false
 
-        for (offset, file) in files.enumerated() {
+        for batch in batches {
             if Task.isCancelled {
                 cancelled = true
                 break
             }
+            let baseCompleted = succeeded
+            let baseFailed = failed
+            let tasks = batch.map {
+                FileTask(index: $0, file: files[$0], outputURL: outputURLs[$0])
+            }
 
-            let fileIndex = offset + 1
-            let fileName = file.relativePath
-            let fileStarted = Date()
-            let baseOverall = Double(succeeded + failed) / Double(total)
-
-            progress?(MarkdownConversionProgress(
-                phase: .parsing,
-                fileIndex: fileIndex,
-                fileTotal: total,
-                fileName: fileName,
-                stage: "解析与提取",
-                completedFiles: succeeded,
-                failedFiles: failed,
-                overallFraction: baseOverall))
-
-            do {
-                let options = ParserOptions(config: request.config)
-                guard let parser = registry.freshParser(for: file.url,
-                                                        options: options) else {
-                    throw MarkdownConversionError.sourceNotSupported(fileName)
-                }
-
-                let parsed = try await parser.parse(url: file.url, options: options) { event in
-                    switch event {
-                    case .page(let pageIndex, let pageTotal, let rawStage):
-                        // 解析占单文件进度的 90%，留出清洗/写盘时间。
-                        let pageFraction = Double(max(0, pageIndex))
-                            / Double(max(1, pageTotal))
-                        let intra = 0.9 * min(1, max(0, pageFraction))
-                        progress?(MarkdownConversionProgress(
-                            phase: .parsing,
-                            fileIndex: fileIndex,
-                            fileTotal: total,
-                            fileName: fileName,
-                            stage: Self.stageText(rawStage),
-                            pageIndex: pageIndex,
-                            pageTotal: pageTotal,
-                            completedFiles: succeeded,
-                            failedFiles: failed,
-                            overallFraction: (Double(succeeded + failed) + intra)
-                                / Double(total)))
-                    case .message(let message):
-                        progress?(MarkdownConversionProgress(
-                            phase: .parsing,
-                            fileIndex: fileIndex,
-                            fileTotal: total,
-                            fileName: fileName,
-                            stage: message,
-                            completedFiles: succeeded,
-                            failedFiles: failed,
-                            overallFraction: baseOverall))
+            // 同一批内并发解析；大文件批次只有一个元素，等价于串行。
+            // 批结束时才合并结果，保证 results 顺序与发现顺序一致。
+            let outcomes = await withTaskGroup(of: FileOutcome.self) { group in
+                for task in tasks {
+                    group.addTask {
+                        await Self.convertFile(
+                            task,
+                            config: config,
+                            registry: registry,
+                            total: total,
+                            baseCompleted: baseCompleted,
+                            baseFailed: baseFailed,
+                            progress: progress)
                     }
                 }
+                var collected: [FileOutcome] = []
+                for await outcome in group { collected.append(outcome) }
+                return collected.sorted { $0.index < $1.index }
+            }
 
-                if Task.isCancelled {
+            for outcome in outcomes {
+                if outcome.cancelled {
                     cancelled = true
-                    break
+                    continue
                 }
-
-                let text = parsed.metadata["cleaned"] == "1"
-                    ? parsed.text
-                    : DocumentCleaner.clean(
-                        parsed.text,
-                        keepHeadersFooters: false,
-                        profile: DocumentProfile.defaultProfile(for: file.url))
-                guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-                    throw AgentError.parse("解析结果为空")
-                }
-
-                progress?(MarkdownConversionProgress(
-                    phase: .writing,
-                    fileIndex: fileIndex,
-                    fileTotal: total,
-                    fileName: fileName,
-                    stage: "结果清洗 / Markdown 转换",
-                    completedFiles: succeeded,
-                    failedFiles: failed,
-                    overallFraction: (Double(succeeded + failed) + 0.95)
-                        / Double(total)))
-
-                let desired = Self.desiredOutputURL(
-                    for: file,
-                    sourceIsDirectory: sourceIsDirectory.boolValue,
-                    output: output)
-                let outputURL = Self.uniqueOutputURL(desired, used: &usedOutputs)
-                try fm.createDirectory(at: outputURL.deletingLastPathComponent(),
-                                       withIntermediateDirectories: true)
-                let body = text.hasSuffix("\n") ? text : text + "\n"
-                try body.write(to: outputURL, atomically: true, encoding: .utf8)
-
-                succeeded += 1
-                let result = MarkdownConversionResult(
-                    source: file.url,
-                    outputURL: outputURL,
-                    error: nil,
-                    elapsed: Date().timeIntervalSince(fileStarted))
+                guard let result = outcome.result else { continue }
                 results.append(result)
-                onResult?(result)
-
-                progress?(MarkdownConversionProgress(
-                    phase: .writing,
-                    fileIndex: fileIndex,
-                    fileTotal: total,
-                    fileName: fileName,
-                    stage: "已写入 \(outputURL.lastPathComponent)",
-                    completedFiles: succeeded,
-                    failedFiles: failed,
-                    overallFraction: Double(succeeded + failed) / Double(total)))
-            } catch {
-                if Task.isCancelled || Self.isCancellation(error) {
-                    cancelled = true
-                    break
-                }
-                failed += 1
-                let message = error.localizedDescription
-                let result = MarkdownConversionResult(
-                    source: file.url,
-                    outputURL: nil,
-                    error: message,
-                    elapsed: Date().timeIntervalSince(fileStarted))
-                results.append(result)
+                if result.succeeded { succeeded += 1 } else { failed += 1 }
                 onResult?(result)
                 progress?(MarkdownConversionProgress(
-                    phase: .parsing,
-                    fileIndex: fileIndex,
+                    phase: .writing,
+                    fileIndex: outcome.index + 1,
                     fileTotal: total,
-                    fileName: fileName,
-                    stage: "失败：\(message)",
+                    fileName: files[outcome.index].relativePath,
+                    stage: result.succeeded
+                        ? "已写入 \(result.outputURL?.lastPathComponent ?? "Markdown")"
+                        : "失败：\(result.error ?? "未知错误")",
                     completedFiles: succeeded,
                     failedFiles: failed,
                     overallFraction: Double(succeeded + failed) / Double(total)))
             }
+
+            if cancelled { break }
         }
 
         let processed = succeeded + failed
@@ -337,6 +295,166 @@ public actor MarkdownConversionService {
             results: results,
             wasCancelled: cancelled,
             elapsed: Date().timeIntervalSince(startedAt))
+    }
+
+    // MARK: - 单文件转换（供并发批次调用）
+
+    /// 解析、清洗并写出单个文件的 Markdown。
+    ///
+    /// 该方法是 `nonisolated` 的静态函数：由 `convert` 的 task group 并发调用，
+    /// 不触碰 actor 状态；每个文件通过 `registry.freshParser` 拿到独立解析器，
+    /// 与主流程的文件级并发完全一致。
+    private static func convertFile(
+        _ task: FileTask,
+        config: AgentConfig,
+        registry: DocumentParserRegistry,
+        total: Int,
+        baseCompleted: Int,
+        baseFailed: Int,
+        progress: ((MarkdownConversionProgress) -> Void)?
+    ) async -> FileOutcome {
+        guard !Task.isCancelled else {
+            return FileOutcome(index: task.index, result: nil, cancelled: true)
+        }
+
+        let fileIndex = task.index + 1
+        let fileName = task.file.relativePath
+        let fileStarted = Date()
+        let baseFraction = Double(baseCompleted + baseFailed) / Double(total)
+
+        progress?(MarkdownConversionProgress(
+            phase: .parsing,
+            fileIndex: fileIndex,
+            fileTotal: total,
+            fileName: fileName,
+            stage: "解析与提取",
+            completedFiles: baseCompleted,
+            failedFiles: baseFailed,
+            overallFraction: baseFraction))
+
+        do {
+            let options = ParserOptions(config: config)
+            guard let parser = registry.freshParser(for: task.file.url,
+                                                    options: options) else {
+                throw MarkdownConversionError.sourceNotSupported(fileName)
+            }
+
+            let parsed = try await parser.parse(url: task.file.url,
+                                                options: options) { event in
+                switch event {
+                case .page(let pageIndex, let pageTotal, let rawStage):
+                    // 解析占单文件进度的 90%，留出清洗/写盘时间。
+                    let pageFraction = Double(max(0, pageIndex))
+                        / Double(max(1, pageTotal))
+                    let intra = 0.9 * min(1, max(0, pageFraction))
+                    progress?(MarkdownConversionProgress(
+                        phase: .parsing,
+                        fileIndex: fileIndex,
+                        fileTotal: total,
+                        fileName: fileName,
+                        stage: stageText(rawStage),
+                        pageIndex: pageIndex,
+                        pageTotal: pageTotal,
+                        completedFiles: baseCompleted,
+                        failedFiles: baseFailed,
+                        overallFraction: (Double(baseCompleted + baseFailed) + intra)
+                            / Double(total)))
+                case .message(let message):
+                    progress?(MarkdownConversionProgress(
+                        phase: .parsing,
+                        fileIndex: fileIndex,
+                        fileTotal: total,
+                        fileName: fileName,
+                        stage: message,
+                        completedFiles: baseCompleted,
+                        failedFiles: baseFailed,
+                        overallFraction: baseFraction))
+                }
+            }
+
+            if Task.isCancelled {
+                return FileOutcome(index: task.index, result: nil, cancelled: true)
+            }
+
+            let text = parsed.metadata["cleaned"] == "1"
+                ? parsed.text
+                : DocumentCleaner.clean(
+                    parsed.text,
+                    keepHeadersFooters: false,
+                    profile: DocumentProfile.defaultProfile(for: task.file.url))
+            guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                throw AgentError.parse("解析结果为空")
+            }
+
+            progress?(MarkdownConversionProgress(
+                phase: .writing,
+                fileIndex: fileIndex,
+                fileTotal: total,
+                fileName: fileName,
+                stage: "结果清洗 / Markdown 转换",
+                completedFiles: baseCompleted,
+                failedFiles: baseFailed,
+                overallFraction: (Double(baseCompleted + baseFailed) + 0.95)
+                    / Double(total)))
+
+            try FileManager.default.createDirectory(
+                at: task.outputURL.deletingLastPathComponent(),
+                withIntermediateDirectories: true)
+            let body = text.hasSuffix("\n") ? text : text + "\n"
+            try autoreleasepool {
+                try body.write(to: task.outputURL, atomically: true, encoding: .utf8)
+            }
+
+            return FileOutcome(
+                index: task.index,
+                result: MarkdownConversionResult(
+                    source: task.file.url,
+                    outputURL: task.outputURL,
+                    error: nil,
+                    elapsed: Date().timeIntervalSince(fileStarted)),
+                cancelled: false)
+        } catch {
+            if Task.isCancelled || isCancellation(error) {
+                return FileOutcome(index: task.index, result: nil, cancelled: true)
+            }
+            return FileOutcome(
+                index: task.index,
+                result: MarkdownConversionResult(
+                    source: task.file.url,
+                    outputURL: nil,
+                    error: error.localizedDescription,
+                    elapsed: Date().timeIntervalSince(fileStarted)),
+                cancelled: false)
+        }
+    }
+
+    // MARK: - 分批
+
+    /// 按文件体积分批：达到 `heavyFileBytes` 的大文件单独成批（批间串行，
+    /// 因此永远不会多份大 PDF 同时解析）；轻文件按 `baseConcurrency`
+    /// （最多 6）打包，批内并发。返回的下标始终保持发现顺序。
+    static func batchIndices(fileSizes: [Int64], baseConcurrency: Int) -> [[Int]] {
+        let concurrency = max(1, min(baseConcurrency, 6))
+        var batches: [[Int]] = []
+        var light: [Int] = []
+
+        func flushLight() {
+            guard !light.isEmpty else { return }
+            batches.append(light)
+            light.removeAll(keepingCapacity: true)
+        }
+
+        for (index, size) in fileSizes.enumerated() {
+            if size >= heavyFileBytes {
+                flushLight()
+                batches.append([index])
+            } else {
+                light.append(index)
+                if light.count >= concurrency { flushLight() }
+            }
+        }
+        flushLight()
+        return batches
     }
 
     // MARK: - 文件发现与输出路径

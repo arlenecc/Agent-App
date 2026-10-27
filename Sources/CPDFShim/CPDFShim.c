@@ -75,6 +75,12 @@ CFDataRef CPDFShimCopyEmbeddedPageJPEG(CGPDFPageRef page) {
         || !CGPDFDictionaryGetInteger(streamDict, "BitsPerComponent", &bitsPerComponent)
         || bitsPerComponent != 8) return NULL;
 
+    // 与 Swift 侧 PDFPageRenderer.maxEmbeddedPixelCount 保持一致：
+    // 超高像素图片放弃直提取，交给有界栅格化（目标长边 1408/1500）。
+    // 否则 ImageIO 解码器仍得面对数亿像素，单页就可能要几 GB 内存。
+    if (width > 20000 || height > 20000
+        || (double)width * (double)height > 200000000.0) return NULL;
+
     CGRect box = CGPDFPageGetBoxRect(page, kCGPDFCropBox);
     if (box.size.width > 0 && box.size.height > 0) {
         double pageAR = (double)box.size.width / (double)box.size.height;
