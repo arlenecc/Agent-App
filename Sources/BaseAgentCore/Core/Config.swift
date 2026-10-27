@@ -221,6 +221,9 @@ public struct AgentConfig: Sendable {
     public var localLLMModel: String = "models/qwen3.5-4b-agentic-coder-v4-4bit-mlx"
     public var localLLMBackend: String = "mlx-lm"
     public var localLLMEnableThinking: Bool = true
+    /// 启动时是否预加载主模型。默认开启；关闭后启动只创建 Agent，不加载权重，
+    /// 需在配置窗口手动「加载模型」。不影响配置应用/同步结束后的模型恢复。
+    public var autoPreloadMain: Bool = true
 
     /// 是否启用辅助模型。默认关闭：启动和知识同步前后都不加载辅助模型；
     /// RAG 精简直接跳过，后台记忆/总结回退主模型（若主模型可用）。
@@ -440,6 +443,7 @@ public struct AgentConfig: Sendable {
         if let v = string("local_llm_model") { localLLMModel = v }
         if let v = string("local_llm_backend") { localLLMBackend = v }
         if let v = bool("local_llm_enable_thinking") { localLLMEnableThinking = v }
+        if let v = bool("auto_preload_main") { autoPreloadMain = v }
 
         if let v = bool("aux_enabled") { auxEnabled = v }
         if let v = string("aux_llm_provider") { auxLLMProvider = v }
@@ -745,6 +749,7 @@ public struct AgentConfig: Sendable {
             "local_llm_model": localLLMModel,
             "local_llm_backend": localLLMBackend,
             "local_llm_enable_thinking": localLLMEnableThinking,
+            "auto_preload_main": autoPreloadMain,
             "aux_enabled": auxEnabled,
             "aux_llm_provider": auxLLMProvider,
             "aux_local_llm_model": auxLocalLLMModel,

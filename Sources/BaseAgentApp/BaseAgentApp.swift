@@ -91,6 +91,11 @@ struct BaseAgentDesktopApp: App {
                 .frame(minWidth: 900, minHeight: 640)
         }
         .defaultSize(width: 1280, height: 880)
+
+        Window("转换工具", id: "markdown-converter") {
+            MarkdownConvertView(model: model)
+        }
+        .defaultSize(width: 1120, height: 680)
     }
 }
 

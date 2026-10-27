@@ -158,6 +158,9 @@ final class AppViewModel: ObservableObject {
     @Published var config: AgentConfig
     /// 识别测试窗口使用的临时配置（含尚未保存的自定义 OCR 设置）；为空时回退 `config`。
     @Published var ocrLabConfig: AgentConfig?
+    /// 转换工具窗口使用的临时配置（含尚未保存的 OCR / PDF 设置）；为空时回退 `config`。
+    /// 仅作为解析参数快照，不写回 config.json，也不重建 Agent。
+    @Published var converterConfig: AgentConfig?
     @Published var chatItems: [ChatItem] = []
     @Published var reasoning = ""
     @Published var logs: [LogLine] = []
@@ -212,13 +215,17 @@ final class AppViewModel: ObservableObject {
         if agent?.discardPersistedPlan() == true {
             appendLog("[plan] 已清除上次未完成的计划")
         }
-        // 默认在后台加载主模型；辅助模型需在设置中显式启用后才加载，
-        // 模型缺失时只记录可诊断错误，不阻塞启动。
+        // 启动时是否预加载主模型由 auto_preload_main 控制；辅助模型需在设置中
+        // 显式启用后才加载。模型缺失时只记录可诊断错误，不阻塞启动。
+        let shouldPreloadMain = config.llmProvider == "local" && config.autoPreloadMain
+        if !shouldPreloadMain, config.llmProvider == "local" {
+            appendLog("[model] 已关闭启动预加载，主模型需在配置窗口手动加载")
+        }
         if !config.auxEnabled {
             appendLog("[model] 辅助模型未启用，启动时不加载")
         }
         Task {
-            await preloadModels(main: config.llmProvider == "local",
+            await preloadModels(main: shouldPreloadMain,
                                 aux: config.auxEnabled)
         }
     }

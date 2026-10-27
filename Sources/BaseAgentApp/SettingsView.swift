@@ -26,6 +26,8 @@ struct SettingsView: View {
     @State private var mainPromptBatch = 512
     @State private var mainThinking = true
     @State private var mainKVReuse = true
+    /// 应用启动时是否预加载主模型（auto_preload_main）。
+    @State private var autoPreloadMain = true
 
     // MARK: API 模式
 
@@ -74,7 +76,10 @@ struct SettingsView: View {
     @State private var rerankEnabled = true
     @State private var semanticChunking = true
     @State private var autoIngest = false
+    @State private var embeddingMinBatch = 2
     @State private var embeddingMaxBatch = 32
+    @State private var embeddingBatchStep = 2
+    @State private var embeddingInitialBatch = 16
     @State private var embeddingMemoryLimitMB = 6_144
     @State private var embeddingThroughputTolerance = 0.03
     @State private var embeddingProbeBatches = 2
@@ -146,8 +151,13 @@ struct SettingsView: View {
 
     private var mainModelBlock: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack {
+            HStack(spacing: 10) {
                 Text("主模型").font(.subheadline).bold()
+                if mainMode == "local" {
+                    Toggle("启动时预加载", isOn: $autoPreloadMain)
+                        .toggleStyle(.checkbox)
+                        .help("默认开启：应用启动时在后台加载主模型；关闭后需手动点「加载模型」。修改后需点「应用配置」保存；同步结束后的模型恢复不受影响")
+                }
                 Spacer()
                 Picker("", selection: $mainMode) {
                     Text("本地模式").tag("local")
@@ -483,8 +493,14 @@ struct SettingsView: View {
                             .frame(width: 170)
                             Toggle("图像归一化", isOn: $ocrPreprocess)
                             Toggle("Otsu 二值化", isOn: $ocrBinarize)
+                            Button("转换工具") { openConverter() }
+                                .help("打开转换工具窗口：把 PDF/EPUB/Office/HTML/图片/文本等批量转换为 Markdown，"
+                                    + "沿用这里的 OCR 与切片前的解析设置")
                         }
                         HStack(spacing: 14) {
+                            Text("同步参数设置")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.secondary)
                             Toggle("启用重排序", isOn: $rerankEnabled)
                             Toggle("启动时自动同步", isOn: $autoIngest)
                             Toggle("语义切片", isOn: $semanticChunking)
@@ -496,11 +512,29 @@ struct SettingsView: View {
                                     in: 0...1000, step: 10)
                                 .help("占切片大小的 10%，计入总预算：正文按 chunk_size − overlap 切片")
                         }
-                        HStack(spacing: 14) {
-                            Stepper("子批上限：\(embeddingMaxBatch)",
-                                    value: $embeddingMaxBatch, in: 2...256, step: 2)
+                        HStack(spacing: 8) {
+                            Text("自适应子批参数")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                            Stepper("下限：\(embeddingMinBatch)",
+                                    value: $embeddingMinBatch, in: 2...64)
+                                .help("自适应下调的最小值，默认 2；超过上限时按上限收口")
+                            Stepper("上限：\(embeddingMaxBatch)",
+                                    value: $embeddingMaxBatch, in: 2...256)
                                 .help("embedding 自适应子批的最大值。实测 477 token 长块在 batch 4-16 已到吞吐平台，默认 32 兼顾短块；64 以上只增加内存与单批延迟")
-                            Stepper("内存阈值：\(embeddingMemoryLimitMB) MB",
+                            Stepper("步进：\(embeddingBatchStep)",
+                                    value: $embeddingBatchStep, in: 1...16)
+                                .help("每次上探/下探的调整幅度，默认 2")
+                            Stepper("启动预设：\(embeddingInitialBatch)",
+                                    value: $embeddingInitialBatch, in: 2...256)
+                                .help("同步开始时的初始子批，默认 16；会被夹在下限与上限之间")
+                            Stepper("探测批次：\(embeddingProbeBatches)",
+                                    value: $embeddingProbeBatches, in: 1...16)
+                                .help("每档至少观察多少个 embedding 批后评估一次，默认 2")
+                            Stepper("探测窗口：\(String(format: "%.1f", embeddingProbeSeconds))s",
+                                    value: $embeddingProbeSeconds, in: 0.5...30, step: 0.5)
+                                .help("每档至少观察多少秒后评估一次，默认 2s；与探测批次数满足其一即评估")
+                            Stepper("内存阈值：\(embeddingMemoryLimitMB)MB",
                                     value: $embeddingMemoryLimitMB,
                                     in: 1_024...32_768, step: 512)
                                 .help("进程 footprint 超过该值立即下调子批；bge 单独运行峰值约 1.6GB，默认 6144MB")
@@ -509,15 +543,7 @@ struct SettingsView: View {
                                     in: 0.01...0.50, step: 0.01)
                                 .help("吞吐变化小于该比例视为测量噪声，不调整子批；默认 3%，实测噪声较大时可调到 8-10%")
                         }
-                        HStack(spacing: 14) {
-                            Stepper("探测批次数：\(embeddingProbeBatches)",
-                                    value: $embeddingProbeBatches, in: 1...16)
-                                .help("每档至少观察多少个 embedding 批后评估一次，默认 2")
-                            Stepper("探测窗口：\(String(format: "%.1f", embeddingProbeSeconds)) s",
-                                    value: $embeddingProbeSeconds, in: 0.5...30, step: 0.5)
-                                .help("每档至少观察多少秒后评估一次，默认 2s；与探测批次数满足其一即评估")
-                            Spacer(minLength: 8)
-                        }
+                        .font(.caption)
                     }
                     .padding(.top, 8)
                 }
@@ -613,6 +639,7 @@ struct SettingsView: View {
         mainPromptBatch = config.promptBatchSize
         mainThinking = config.localLLMEnableThinking
         mainKVReuse = config.llmKVReuse
+        autoPreloadMain = config.autoPreloadMain
 
         baseURL = config.baseURL
         apiKey = config.apiKey
@@ -657,7 +684,10 @@ struct SettingsView: View {
         rerankEnabled = config.ragRerankEnabled
         semanticChunking = config.ragSemanticChunking
         autoIngest = config.ragAutoIngest
+        embeddingMinBatch = config.ragEmbeddingMinBatch
         embeddingMaxBatch = config.ragEmbeddingMaxBatch
+        embeddingBatchStep = config.ragEmbeddingBatchStep
+        embeddingInitialBatch = config.ragEmbeddingInitialBatch
         embeddingMemoryLimitMB = config.ragEmbeddingMemoryLimitMB
         embeddingThroughputTolerance = config.ragEmbeddingThroughputTolerance
         embeddingProbeBatches = config.ragEmbeddingProbeBatches
@@ -768,6 +798,33 @@ struct SettingsView: View {
         openWindow(id: "ocr-lab")
     }
 
+    /// 打开转换工具窗口：使用当前面板上的解析/OCR 设置快照（含尚未保存的修改），
+    /// 只影响这一窗口内的转换参数，不写回 config.json、不重建 Agent。
+    private func openConverter() {
+        var config = model.config
+        let path = ocrModelPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !path.isEmpty {
+            config.ragOCRModelName = customOCRName
+        }
+        config.ragOCRModelPath = path
+        config.ragOCRMMProjPath = ocrMMProjPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        config.localVLMBackend = vlmBackend
+        config.ragOCRPreprocess = ocrPreprocess
+        config.ragOCRBinarize = ocrBinarize
+        config.ragPDFEngine = pdfEngine
+        config.ragEPUBOCREngine = epubOCREngine
+        // 快照里若指定了自定义 OCR 却没有模型路径，回退 Apple Vision，
+        // 避免转换窗口因空模型路径直接失败。
+        if !customOCRAvailable {
+            if config.ragPDFEngine == .custom { config.ragPDFEngine = .vision }
+            if config.ragEPUBOCREngine == .custom { config.ragEPUBOCREngine = .vision }
+        } else {
+            config.ragOCRModelName = customOCRName
+        }
+        model.converterConfig = config
+        openWindow(id: "markdown-converter")
+    }
+
     private func buildConfig() -> AgentConfig? {
         let mb = AgentConfig.normalizeLLMBackend(mainBackend)
         let ab = AgentConfig.normalizeLLMBackend(auxBackend)
@@ -818,6 +875,7 @@ struct SettingsView: View {
         config.promptBatchSize = max(0, mainPromptBatch)
         config.localLLMEnableThinking = mainThinking
         config.llmKVReuse = mainKVReuse
+        config.autoPreloadMain = autoPreloadMain
 
         if mainMode == "api" {
             config.baseURL = baseURL.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -885,6 +943,13 @@ struct SettingsView: View {
         config.ragSemanticChunking = semanticChunking
         config.ragAutoIngest = autoIngest
         config.ragEmbeddingMaxBatch = min(max(2, embeddingMaxBatch), 256)
+        config.ragEmbeddingMinBatch = min(max(2, embeddingMinBatch), 64)
+        config.ragEmbeddingMinBatch = min(config.ragEmbeddingMinBatch,
+                                          config.ragEmbeddingMaxBatch)
+        config.ragEmbeddingInitialBatch = min(max(config.ragEmbeddingMinBatch,
+                                                  embeddingInitialBatch),
+                                              config.ragEmbeddingMaxBatch)
+        config.ragEmbeddingBatchStep = min(max(1, embeddingBatchStep), 16)
         config.ragEmbeddingMemoryLimitMB = min(max(1_024, embeddingMemoryLimitMB), 32_768)
         config.ragEmbeddingThroughputTolerance = min(max(0.01, embeddingThroughputTolerance),
                                                       0.5)
