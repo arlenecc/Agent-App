@@ -1398,13 +1398,16 @@ final class AppViewModel: ObservableObject {
             // 只重载实际执行同步的引擎：配置切换后 self.agent 可能已经是新实例，
             // 绝不能把旧同步的结果作用到新 agent 上。
             agent.reloadRAG()
+            // 先复制到不可变局部变量：下面的 MainActor 闭包是 Sendable，
+            // 直接捕获 var 在 Swift 6 语言模式下会报错。
+            let finishedRebuildSummary = rebuildSummary
             await MainActor.run { [weak self] in
                 guard let self, self.syncGeneration == syncGen else { return }
                 self.isSyncing = false
                 self.isStoppingSync = false
                 self.syncTask = nil
-                if let rebuildSummary {
-                    self.appendLog("RAG: \(rebuildSummary)")
+                if let finishedRebuildSummary {
+                    self.appendLog("RAG: \(finishedRebuildSummary)")
                 }
                 self.appendLog("RAG: \(stats.summary)")
                 for error in stats.errors.prefix(20) {
