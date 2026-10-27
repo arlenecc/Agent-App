@@ -144,9 +144,39 @@ public final class WebScanTool: AgentTool, ShutdownableTool {
                 }
             }
 
-            // 列表页/SPA 动态加载检测：正文过短 + AJAX 特征时附降级建议，
+            // 列表页/SPA 动态加载检测：正文短或主体只是加载占位时附降级建议，
             // 避免模型把加载占位误当有效内容。
-            let hint = ToolSupport.dynamicLoadingHint(html: bodyText, extracted: content)
+            var hint = ToolSupport.dynamicLoadingHint(html: bodyText, extracted: content)
+
+            // 数据源线索增强：动态页的真实接口常写在同源 JS 里（HTML 内联只有少量线索），
+            // 抓取评分最高的几个脚本，把其中的 /api/... 端点合并进提示。
+            if !hint.isEmpty {
+                var externalScriptTexts: [String] = []
+                var inspectedScriptURLs: [String] = []
+                for scriptURL in ToolSupport.selectScriptSourcesForInspection(
+                    html: bodyText, baseURL: url, limit: 2) {
+                    var scriptRequest = URLRequest(url: scriptURL)
+                    scriptRequest.timeoutInterval = 5
+                    let scriptLimit = min(ToolSupport.maxFetchBytes, 512 * 1024)
+                    guard let scriptResult = try? await redirectGuard.fetch(
+                        session: session, request: scriptRequest, limit: scriptLimit) else {
+                        continue
+                    }
+                    let scriptText = ToolSupport.decodeUTF8Prefix(scriptResult.data)
+                        ?? String(decoding: scriptResult.data, as: UTF8.self)
+                    guard !scriptText.isEmpty else { continue }
+                    externalScriptTexts.append(scriptText)
+                    inspectedScriptURLs.append(scriptURL.path)
+                }
+                if !externalScriptTexts.isEmpty {
+                    hint = ToolSupport.dynamicLoadingHint(
+                        html: bodyText,
+                        extracted: content,
+                        externalScriptTexts: externalScriptTexts,
+                        inspectedScriptURLs: inspectedScriptURLs)
+                }
+            }
+
             let renderMode = ToolSupport.string(args, "render")
             let shouldRender: Bool
             switch renderMode {
@@ -157,18 +187,21 @@ public final class WebScanTool: AgentTool, ShutdownableTool {
 
             if shouldRender {
                 do {
+                    let staticText = content.trimmingCharacters(in: .whitespacesAndNewlines)
                     // 自动降级：用内置 WebKit 渲染一次拿真实正文。
+                    // 静态正文明显偏少时等待正文增长（SPA 数据落地），而不是固定睡 1.5s。
                     let outcome = try await WebRenderer.shared.render(
                         url: url,
-                        waitMS: 1500,
+                        waitMS: 500,
                         waitSelector: nil,
                         script: nil,
                         wantHTML: false,
                         wantScreenshot: false,
-                        timeout: 45)
+                        timeout: 45,
+                        waitForTextGrowthFrom: hint.isEmpty ? nil : staticText.count,
+                        maxContentWait: 8)
                     let rendered = outcome.text
                         .trimmingCharacters(in: .whitespacesAndNewlines)
-                    let staticText = content.trimmingCharacters(in: .whitespacesAndNewlines)
                     if rendered.count > staticText.count {
                         var sections: [String] = [
                             "[渲染后正文（检测到动态加载，已自动用内置 WebKit 渲染提取），"

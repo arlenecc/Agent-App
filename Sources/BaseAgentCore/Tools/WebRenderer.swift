@@ -122,20 +122,36 @@ final class WebRenderer: @unchecked Sendable {
     }
 
     /// 等待整页渲染完成并提取结果。`timeout` 覆盖加载 + 等待 + 脚本全流程。
+    ///
+    /// - `waitForTextGrowthFrom`: 传入静态 HTML 的正文长度时，等待页面正文比它
+    ///   明显增长（SPA 数据落地），最多 `maxContentWait` 秒；传 0 也会等待，
+    ///   用于静态页面是空壳的情况。nil 表示不做正文增长等待。
     func render(url: URL,
                 waitMS: Int,
                 waitSelector: String?,
                 script: String?,
                 wantHTML: Bool,
                 wantScreenshot: Bool,
-                timeout: TimeInterval) async throws -> Outcome {
+                timeout: TimeInterval,
+                waitForTextGrowthFrom: Int? = nil,
+                maxContentWait: TimeInterval = 8) async throws -> Outcome {
         guard await serial.acquire() else { throw AgentError.cancelled }
         defer { serial.release() }
         return try await withTimeout(timeout, "渲染") {
-            try await self.renderOnMain(url: url, waitMS: waitMS,
-                                        waitSelector: waitSelector, script: script,
-                                        wantHTML: wantHTML, wantScreenshot: wantScreenshot)
+            try await self.renderOnMain(
+                url: url, waitMS: waitMS, waitSelector: waitSelector, script: script,
+                wantHTML: wantHTML, wantScreenshot: wantScreenshot,
+                waitForTextGrowthFrom: waitForTextGrowthFrom,
+                maxContentWait: maxContentWait)
         }
+    }
+
+    /// 正文增长是否达到「数据已加载」的阈值。
+    /// 基线为 0（空壳）时，出现 200 字符即视为有内容；否则要求至少 +200 字符
+    /// 或 +10%，避免动态时间戳/广告等小波动导致过早提取。
+    static func textGrowthReached(baseline: Int, current: Int) -> Bool {
+        guard baseline > 0 else { return current >= 200 }
+        return current >= baseline + max(200, baseline / 10)
     }
 
     /// 会话结束时清理：停止加载并释放 WKWebView（可在任意线程调用）。
@@ -156,7 +172,9 @@ final class WebRenderer: @unchecked Sendable {
                               waitSelector: String?,
                               script: String?,
                               wantHTML: Bool,
-                              wantScreenshot: Bool) async throws -> Outcome {
+                              wantScreenshot: Bool,
+                              waitForTextGrowthFrom: Int?,
+                              maxContentWait: TimeInterval) async throws -> Outcome {
         let webView = try ensureWebView()
 
         // 1. 加载页面：didFinish 或软超时取先到者。软超时到点 stopLoading
@@ -185,13 +203,19 @@ final class WebRenderer: @unchecked Sendable {
             group.cancelAll()
         }
 
-        // 2. didFinish 后等待 SPA 异步渲染：固定等待 + 可选 selector 轮询。
+        // 2. didFinish 后等待 SPA 异步渲染：固定等待 + 可选 selector 轮询
+        //    + 正文增长轮询（比固定 sleep 更能适应慢接口站点）。
         if waitMS > 0 {
             try? await Task.sleep(nanoseconds: UInt64(min(waitMS, 30_000)) * 1_000_000)
         }
         if let selector = waitSelector?.trimmingCharacters(in: .whitespacesAndNewlines),
            !selector.isEmpty {
             try await waitForSelector(selector, webView: webView, maxWait: 10)
+        }
+        if let baseline = waitForTextGrowthFrom {
+            try await waitForTextGrowth(webView: webView,
+                                        baseline: baseline,
+                                        maxWait: maxContentWait)
         }
 
         // 3. 提取正文（innerText 为空时回退 textContent，覆盖部分隐藏布局）。
@@ -261,6 +285,30 @@ final class WebRenderer: @unchecked Sendable {
             if found { return }
             if Date() >= deadline { return } // 超时不报错：返回已有内容并继续
             try await Task.sleep(nanoseconds: 150_000_000)
+        }
+    }
+
+    /// 轮询正文长度，直到相对静态快照明显增长或超时。
+    /// 超时不报错：返回当前已渲染内容，交回调用方决定是否够用。
+    @MainActor
+    private func waitForTextGrowth(webView: WKWebView,
+                                   baseline: Int,
+                                   maxWait: TimeInterval) async throws {
+        let deadline = Date().addingTimeInterval(max(0, maxWait))
+        while true {
+            if Task.isCancelled { throw AgentError.cancelled }
+            let current: Int
+            if let value = try? await evaluate(
+                "document.body ? document.body.innerText.length : 0",
+                webView: webView),
+               let number = value as? NSNumber {
+                current = number.intValue
+            } else {
+                current = 0
+            }
+            if Self.textGrowthReached(baseline: baseline, current: current) { return }
+            if Date() >= deadline { return }
+            try await Task.sleep(nanoseconds: 250_000_000)
         }
     }
 

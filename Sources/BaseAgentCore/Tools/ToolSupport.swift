@@ -328,40 +328,80 @@ public enum ToolSupport {
         return normalizeLines((try? document.text()) ?? stripTags(limited))
     }
 
-    /// 列表页 / SPA 动态加载检测：提取正文过短且页面存在 AJAX/前端框架特征时，
-    /// 返回降级提示（分析数据接口直接调用 / webexec_js 浏览器渲染 / curl 诊断）。
+    /// 列表页 / SPA 动态加载检测：提取正文过短，或正文虽长但主体只是加载占位时，
+    /// 返回降级提示（分析数据接口直接调用 / 内置 WebKit 渲染 / webexec_js 交互）。
     /// 避免模型把「加载占位」误当有效内容或直接断定站点无信息。
-    /// 条件是「正文短 + 特征同时存在」，正常短页面不会误报。
-    /// 同时附上从页面里提取的数据源线索（候选接口、JS 引用、iframe），
-    /// 让模型少一轮摸索即可定位真正的数据来源。
-    static func dynamicLoadingHint(html: String, extracted: String) -> String {
+    ///
+    /// 触发条件（两者任一）：
+    /// - 正文短（<300 字符）且存在 AJAX/前端框架/加载占位/iframe 特征；
+    /// - 正文长但含加载占位文案，且同时存在 loader / AJAX / 框架挂载点——
+    ///   招聘站等页面常靠导航/页脚把正文撑到几百字符，只看长度会漏判。
+    ///
+    /// 同时附上从页面和已抓取的外部 JS 里提取的数据源线索（候选接口、JS 引用、
+    /// iframe），让模型少一轮摸索即可定位真正的数据来源。
+    static func dynamicLoadingHint(html: String,
+                                   extracted: String,
+                                   externalScriptTexts: [String] = [],
+                                   inspectedScriptURLs: [String] = []) -> String {
         let visible = extracted.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard visible.count < 300 else { return "" }
+        let shortBody = visible.count < 300
 
         let lowered = html.lowercased()
         var signals: [String] = []
         // 前端框架挂载点：body 里只有挂载容器，正文必然是空壳。
-        if lowered.contains("id=\"root\"") || lowered.contains("id=\"app\"")
+        let hasFrameworkMount = lowered.contains("id=\"root\"") || lowered.contains("id=\"app\"")
             || lowered.contains("id=\"__next\"") || lowered.contains("data-reactroot")
-            || lowered.contains("__nuxt__") || lowered.contains("ng-app") {
+            || lowered.contains("__nuxt__") || lowered.contains("ng-app")
+        if hasFrameworkMount {
             signals.append("前端框架挂载点")
         }
         // 加载占位元素：数据由 AJAX 填充的典型标志。
-        if lowered.range(of: "class=\"[^\"]*(loader|loading|skeleton|spinner)",
-                         options: .regularExpression) != nil {
+        let hasLoaderElement = lowered.range(
+            of: "class=\"[^\"]*(loader|loading|skeleton|spinner)",
+            options: .regularExpression) != nil
+        if hasLoaderElement {
             signals.append("加载占位元素（loader/skeleton/spinner）")
         }
         // 页面内 AJAX 调用代码。
-        if lowered.contains("xmlhttprequest") || lowered.contains("$.ajax")
-            || lowered.contains("axios") || lowered.contains("fetch(") {
+        let hasAjaxCode = lowered.contains("xmlhttprequest") || lowered.contains("$.ajax")
+            || lowered.contains("axios") || lowered.contains("fetch(")
+        if hasAjaxCode {
             signals.append("AJAX 请求代码")
         }
         // 正文为空但内容在 iframe 里（主文档只是壳）。
         let iframes = extractIframeSources(html: html)
-        if signals.isEmpty && iframes.isEmpty { return "" }
+
+        // 正文里出现「Loading jobs / please wait / 加载中」等占位文案。
+        // 长正文只靠这一条不足以判定（静态文章也可能写 please wait），
+        // 必须同时有 loader 元素 / AJAX 代码 / 框架挂载点。
+        let hasPlaceholderText = visible.range(
+            of: #"loading\s+(jobs|data|results|content)|please\s+wait|loading(\.\.\.|…)|正在加载|加载中"#,
+            options: [.regularExpression, .caseInsensitive]) != nil
+        let longBodyDynamic = !shortBody && hasPlaceholderText
+            && (hasLoaderElement || hasAjaxCode || hasFrameworkMount)
+        if longBodyDynamic && !hasLoaderElement {
+            signals.append("加载占位文案（loading/please wait）")
+        }
+
+        let shortBodyDynamic = shortBody && (!signals.isEmpty || !iframes.isEmpty)
+        guard shortBodyDynamic || longBodyDynamic else { return "" }
+
+        // 合并 HTML 内联接口与外部 JS 里的接口线索：先去重，再按接口优先级全局排序，
+        // 避免 HTML 里的噪声先入为主、把外部 JS 中真正的 /api/ 端点挤掉。
+        var merged: [(url: String, score: Int, order: Int)] = []
+        var seenEndpoints = Set<String>()
+        for source in [html] + externalScriptTexts {
+            for endpoint in extractAPIEndpointHints(html: source, limit: 8) {
+                guard seenEndpoints.insert(endpoint).inserted else { continue }
+                merged.append((endpoint, apiEndpointPriority(endpoint), merged.count))
+            }
+        }
+        let apiHints = merged
+            .sorted { $0.score == $1.score ? $0.order < $1.order : $0.score > $1.score }
+            .prefix(8)
+            .map(\.url)
 
         var lines: [String] = []
-        let apiHints = extractAPIEndpointHints(html: html)
         if !apiHints.isEmpty {
             lines.append("候选数据接口：\(apiHints.joined(separator: ", "))")
         }
@@ -372,12 +412,19 @@ public enum ToolSupport {
         if !iframes.isEmpty {
             lines.append("内嵌 iframe：\(iframes.joined(separator: ", "))")
         }
-        var hint = "\n\n[web_scan 提示] 本页提取正文仅 \(visible.count) 字符，且检测到动态加载"
-            + "特征（\(signals.joined(separator: "、"))）——页面内容很可能由 JS 动态加载，"
-            + "web_scan 只能拿到加载占位。建议：1) 优先检查下面的数据源线索，用 "
-            + "shell_run/code_run 直接调用数据接口，通常能拿到结构化数据；"
-            + "2) 若需要交互（点击/填表/滚动加载），用 web_render 的 script 参数执行 JS；"
-            + "3) 或 webexec_js 经外部浏览器桥渲染（需配置 browser_endpoint）。"
+        if !inspectedScriptURLs.isEmpty {
+            lines.append("已扫描 JS：\(inspectedScriptURLs.joined(separator: ", "))")
+        }
+
+        let summary = shortBody
+            ? "本页提取正文仅 \(visible.count) 字符"
+            : "本页提取正文 \(visible.count) 字符但主要是导航/页脚/静态文案"
+        var hint = "\n\n[web_scan 提示] \(summary)，且检测到动态加载"
+            + "特征（\(signals.joined(separator: "、"))）——页面主体内容很可能由 JS 动态加载，"
+            + "静态 HTML 只能拿到加载占位。建议：1) web_scan 会尝试内置 WebKit 渲染一次；"
+            + "若仍缺信息，优先检查下面的数据源线索，用 shell_run/code_run 直接调用数据接口，"
+            + "通常能拿到结构化数据；2) 若需要交互（点击/填表/滚动加载），用 web_render "
+            + "的 script 参数执行 JS；3) 或 webexec_js 经外部浏览器桥渲染（需配置 browser_endpoint）。"
         if !lines.isEmpty {
             hint += "\n已定位的数据源线索：\n" + lines.joined(separator: "\n")
         }
@@ -413,22 +460,116 @@ public enum ToolSupport {
         return urls
     }
 
+    /// 挑选值得抓取分析的同源脚本：数据接口通常写在 search/settings/config 类脚本里，
+    /// 而 jQuery/Bootstrap/统计/字体等基础设施脚本只增加流量。
+    ///
+    /// 规则：解析为绝对 URL 后只保留与页面同源的 http(s) 脚本，过滤已知基础设施库，
+    /// 再按路径关键词评分降序排列（同分保持页面出现顺序），返回前 `limit` 个。
+    static func selectScriptSourcesForInspection(html: String,
+                                                 baseURL: URL,
+                                                 limit: Int = 5) -> [URL] {
+        guard limit > 0,
+              let document = try? SwiftSoup.parse(html),
+              let scripts = try? document.select("script[src]") else { return [] }
+        let baseHost = baseURL.host?.lowercased() ?? ""
+
+        var seen = Set<String>()
+        var candidates: [(url: URL, score: Int, order: Int)] = []
+        for script in scripts.array() {
+            guard let raw = try? script.attr("src") else { continue }
+            let src = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !src.isEmpty,
+                  let resolved = URL(string: src, relativeTo: baseURL)?.absoluteURL,
+                  let scheme = resolved.scheme?.lowercased(),
+                  scheme == "http" || scheme == "https",
+                  let host = resolved.host?.lowercased(),
+                  host == baseHost,
+                  !isInfrastructureScript(resolved) else { continue }
+            guard seen.insert(resolved.absoluteString).inserted else { continue }
+            candidates.append((resolved, scriptInspectionScore(resolved), candidates.count))
+        }
+        return candidates
+            .sorted { $0.score == $1.score ? $0.order < $1.order : $0.score > $1.score }
+            .prefix(limit)
+            .map(\.url)
+    }
+
+    /// 基础设施/统计类脚本：对定位数据接口没有价值，抓取只会浪费流量。
+    private static func isInfrastructureScript(_ url: URL) -> Bool {
+        let lowered = url.absoluteString.lowercased()
+        let blocked = ["jquery", "bootstrap", "webfont", "polyfill", "analytics",
+                       "gtag", "doubleclick", "googletagmanager", "localize", "cdn"]
+        return blocked.contains { lowered.contains($0) }
+    }
+
+    /// 脚本路径关键词评分：搜索/岗位/接口类脚本最可能藏有真实数据端点。
+    private static func scriptInspectionScore(_ url: URL) -> Int {
+        let path = url.path.lowercased()
+        let weighted: [(String, Int)] = [
+            ("search", 6), ("settings", 4), ("job", 4), ("api", 4),
+            ("config", 3), ("data", 2), ("index", 2), ("bundle", 1), ("app", 1),
+        ]
+        return weighted.reduce(0) { score, item in
+            path.contains(item.0) ? score + item.1 : score
+        }
+    }
+
     /// 从页面源码提取候选数据接口路径（含 api/ajax/ashx/asmx/search/query/json/graphql
     /// 特征的站内 URL），供降级提示直接给出可调用的端点。
+    ///
+    /// 会过滤静态资源误报：`jquery` 里的 "query"、`.css/.js/图片/字体` 引用都不是接口；
+    /// 结果按「/api/ 优先，其次 ajax/ashx/search」排序，避免页面资源噪声挤掉真正的接口。
     static func extractAPIEndpointHints(html: String, limit: Int = 5) -> [String] {
-        // 字符类含 ?=&%*,~：带查询参数的接口 URL（/api/x?k=v）不能被截断丢弃。
-        let pattern = "[\"'](/[A-Za-z0-9_./?=&%*,~-]*(?:api|ajax|ashx|asmx|search|query|json|graphql)[A-Za-z0-9_./?=&%*,~-]*)[\"']"
+        guard limit > 0 else { return [] }
+        // 先匹配所有引号包裹的站内绝对路径，再做关键词/静态资源过滤。
+        let pattern = "[\"'](/[A-Za-z0-9_./?=&%*,~-]+)[\"']"
         guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else { return [] }
         let range = NSRange(html.startIndex..., in: html)
         var seen = Set<String>()
-        var hits: [String] = []
+        var hits: [(url: String, score: Int, order: Int)] = []
+        var scanned = 0
         for match in regex.matches(in: html, range: range) {
-            guard hits.count < limit else { break }
+            scanned += 1
+            guard scanned <= 500 else { break }
             guard let r = Range(match.range(at: 1), in: html) else { continue }
             let url = String(html[r])
-            if seen.insert(url).inserted { hits.append(url) }
+            guard isDataEndpointCandidate(url) else { continue }
+            guard seen.insert(url).inserted else { continue }
+            hits.append((url, apiEndpointPriority(url), hits.count))
         }
         return hits
+            .sorted { $0.score == $1.score ? $0.order < $1.order : $0.score > $1.score }
+            .prefix(limit)
+            .map(\.url)
+    }
+
+    /// 站内路径是否像数据接口：排除 jquery/静态资源，并要求含接口特征关键词。
+    private static func isDataEndpointCandidate(_ url: String) -> Bool {
+        let lowered = url.lowercased()
+        if lowered.contains("jquery") { return false }
+        let path = lowered.split(separator: "?", maxSplits: 1,
+                                  omittingEmptySubsequences: false)
+            .first.map(String.init) ?? lowered
+        let assetSuffixes = [".css", ".js", ".png", ".jpg", ".jpeg", ".gif", ".svg",
+                             ".ico", ".woff", ".woff2", ".ttf", ".eot", ".map"]
+        if assetSuffixes.contains(where: { path.hasSuffix($0) }) { return false }
+        let keywords = ["api", "ajax", "ashx", "asmx", "search", "query", "json", "graphql"]
+        return keywords.contains { lowered.contains($0) }
+    }
+
+    /// 接口优先级：/api/ 最高，其次 ajax/ashx/asmx/search 等明确的数据端点。
+    private static func apiEndpointPriority(_ url: String) -> Int {
+        let lowered = url.lowercased()
+        var score = 0
+        if lowered.contains("/api/") || lowered.hasPrefix("/api") { score += 10 }
+        if lowered.contains("ajax") { score += 6 }
+        if lowered.contains("ashx") || lowered.contains("asmx") { score += 5 }
+        if lowered.contains("/search") || lowered.contains("getsearch") { score += 4 }
+        if lowered.contains("query") { score += 3 }
+        if lowered.contains("graphql") { score += 3 }
+        if lowered.contains("json") { score += 2 }
+        if lowered.contains("data") { score += 1 }
+        return score
     }
 
     private static func collectHTMLText(_ node: Node,

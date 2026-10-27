@@ -30,6 +30,12 @@ final class WebRenderTests: XCTestCase {
         XCTAssertNotNil(WebRenderTool.validateURL("http://192.168.1.10/x"))
     }
 
+    func testTextGrowthThreshold() {
+        XCTAssertFalse(WebRenderer.textGrowthReached(baseline: 1_000, current: 1_100))
+        XCTAssertTrue(WebRenderer.textGrowthReached(baseline: 1_000, current: 1_300))
+        XCTAssertTrue(WebRenderer.textGrowthReached(baseline: 0, current: 300))
+    }
+
     // MARK: - WKWebView 渲染（本地 server）
 
     /// 极简本地 HTTP server：固定响应，端口自动分配。
