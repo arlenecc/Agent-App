@@ -23,6 +23,8 @@ struct SettingsView: View {
     @State private var mainTopK = 20
     @State private var mainRepetitionPenalty = 1.0
     @State private var mainTimeout = 120.0
+    /// 单次任务允许的最大工具调用轮数。
+    @State private var maxIterations = 15
     @State private var mainPromptBatch = 512
     @State private var mainThinking = true
     @State private var mainKVReuse = true
@@ -81,10 +83,22 @@ struct SettingsView: View {
     @State private var vectorElementType: VectorElementType = .int8
     @State private var matryoshkaMode: MatryoshkaMode = .auto
     @State private var matryoshkaDim = 512
+    /// ANN 检索开关与同步后自动构建。
+    @State private var annEnabled = true
+    @State private var annAutoBuild = true
     @State private var rerankEnabled = true
     @State private var rerankTopN = 5
+    /// 重排分数过滤阈值。
+    @State private var rerankThreshold = 0.45
+    /// 知识库只读查询超时（0 = 关闭）。
+    @State private var queryTimeoutSeconds = 5.0
     @State private var semanticChunking = true
     @State private var autoIngest = false
+    /// 同步并发、Vision OCR 并发与 MLX 内存上限。
+    @State private var ingestConcurrency = 10
+    @State private var visionConcurrency = 4
+    @State private var mlxCacheLimitMB = 512
+    @State private var mlxMemoryLimitMB = 0
     @State private var embeddingMinBatch = 2
     @State private var embeddingMaxBatch = 32
     @State private var embeddingBatchStep = 2
@@ -153,6 +167,8 @@ struct SettingsView: View {
                 mainModelBlock
                 Divider()
                 auxModelBlock
+                Divider()
+                runParametersRow
             }
             .padding(8)
         } label: {
@@ -314,6 +330,24 @@ struct SettingsView: View {
                 }
             }
         }
+    }
+
+    /// Agent 运行参数：单次任务的最大工具调用轮数。
+    private var runParametersRow: some View {
+        HStack(spacing: 14) {
+            Text("运行参数")
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+            Stepper("最大迭代：\(maxIterations) 轮",
+                    value: $maxIterations, in: 1...50)
+                .help("单次任务允许的最大工具调用轮数，默认 15；"
+                    + "调大能处理更长的任务，也会增加耗时与 API 费用")
+            Spacer(minLength: 8)
+            Button("应用配置") { applyAPIConfig() }
+                .disabled(model.isSyncing || model.isDeduplicating || model.isBuildingANN
+                    || model.isModelLoading || model.isRunning || model.isWarmingUp)
+        }
+        .font(.caption)
     }
 
     /// 本地模型：类型 + 路径 + 参数 + 操作按钮（两行紧贴，参数标签与文本框同行）。
@@ -484,34 +518,29 @@ struct SettingsView: View {
                     }
                 }
 
-                // 向量索引行：ANN 索引摘要 + 构建/停止/删除。
+                // 向量库与 ANN 索引合并为一行：元素类型 / Matryoshka /
+                // ANN 检索与自动构建 / ANN 索引摘要与维护 / 显式重建。
+                // 窗口较窄时整组换行，仍归属同一组设置。
                 ViewThatFits(in: .horizontal) {
                     HStack(spacing: 8) {
+                        vectorStorageControls
+                        annToggles()
                         annStatusLabel
                         Spacer(minLength: 8)
                         annButtons()
-                    }
-                    VStack(alignment: .leading, spacing: 6) {
-                        annStatusLabel
-                        HStack(spacing: 8) {
-                            Spacer(minLength: 8)
-                            annButtons()
-                        }
-                    }
-                }
-
-                // 向量存储行：元素类型 / Matryoshka / 显式重建。
-                ViewThatFits(in: .horizontal) {
-                    HStack(spacing: 8) {
-                        vectorStorageControls
-                        Spacer(minLength: 8)
                         vectorRebuildButtons()
                     }
                     VStack(alignment: .leading, spacing: 6) {
-                        vectorStorageControls
                         HStack(spacing: 8) {
+                            vectorStorageControls
+                            annToggles()
                             Spacer(minLength: 8)
                             vectorRebuildButtons()
+                        }
+                        HStack(spacing: 8) {
+                            annStatusLabel
+                            Spacer(minLength: 8)
+                            annButtons()
                         }
                     }
                 }
@@ -594,11 +623,33 @@ struct SettingsView: View {
                                     + "沿用这里的 OCR 与切片前的解析设置")
                         }
                         HStack(spacing: 14) {
-                            Text("同步参数设置")
+                            Text("RAG 参数设置")
                                 .font(.caption.weight(.semibold))
                                 .foregroundStyle(.secondary)
-                            Toggle("启动时自动同步", isOn: $autoIngest)
-                                .help("启动后自动执行一次知识增量同步")
+                            Stepper("查询超时：\(String(format: "%.0f", queryTimeoutSeconds))s",
+                                    value: $queryTimeoutSeconds, in: 0...60, step: 1)
+                                .help("知识库只读查询（打开库 / 状态 / 检索）的超时秒数，默认 5s，0 = 关闭。"
+                                    + "大库或上次同步中断后 SQLite 恢复 WAL 较慢时，可适当调大")
+                        }
+                        ViewThatFits(in: .horizontal) {
+                            HStack(spacing: 14) {
+                                syncSettingsLabel
+                                Toggle("启动时自动同步", isOn: $autoIngest)
+                                    .help("启动后自动执行一次知识增量同步")
+                                syncResourceControls()
+                                    .font(.caption)
+                                Spacer(minLength: 8)
+                            }
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack(spacing: 14) {
+                                    syncSettingsLabel
+                                    Toggle("启动时自动同步", isOn: $autoIngest)
+                                        .help("启动后自动执行一次知识增量同步")
+                                    Spacer(minLength: 8)
+                                }
+                                syncResourceControls()
+                                    .font(.caption)
+                            }
                         }
                         HStack(spacing: 8) {
                             Text("自适应子批参数")
@@ -714,6 +765,41 @@ struct SettingsView: View {
         Stepper("TopN：\(rerankTopN)", value: $rerankTopN, in: 1...20)
             .help("重排序之后保留的结果数量，默认 5；候选池会按它放大后再打乱重排。"
                 + "关闭重排序时按检索调用方的 top_k 返回")
+        Stepper("阈值：\(String(format: "%.2f", rerankThreshold))",
+                value: $rerankThreshold, in: 0...1, step: 0.05)
+            .help("重排分数过滤阈值（0-1），默认 0.45 适配 jina；低于阈值的片段会被过滤，"
+                + "全部低于阈值时回退原排序。换 bge 等 reranker 时通常需要上调")
+    }
+
+    @ViewBuilder
+    private var syncSettingsLabel: some View {
+        Text("同步参数设置")
+            .font(.caption.weight(.semibold))
+            .foregroundStyle(.secondary)
+    }
+
+    /// 同步并发 / OCR 并发 / MLX 内存：与「同步参数设置」同组，
+    /// 优先与标题、自动同步开关排在同一行。
+    @ViewBuilder
+    private func syncResourceControls() -> some View {
+        Stepper("同步并发：\(ingestConcurrency)",
+                value: $ingestConcurrency, in: 1...10)
+            .help("同时处理的文件数，默认 10，运行时上限 6；"
+                + "纯文本文件多时调高可填满等待空档")
+        Stepper("OCR 并发：\(visionConcurrency)",
+                value: $visionConcurrency, in: 1...8)
+            .help("Apple Vision OCR 的全局并发闸门，默认 4；"
+                + "实测 4 路已接近吞吐拐点，再多不一定更快")
+        Stepper("MLX 缓存：\(mlxCacheLimitMB)MB",
+                value: $mlxCacheLimitMB,
+                in: 256...1_024, step: 128)
+            .help("MLX 可复用 buffer 的上限，默认 512MB；"
+                + "运行时夹在 256...1024，只影响空闲缓存，不含模型权重与 KV")
+        Stepper("MLX 上限：\(mlxMemoryLimitText)",
+                value: $mlxMemoryLimitMB,
+                in: 0...32_768, step: 512)
+            .help("MLX 全局内存硬上限（含权重/KV/buffer）；"
+                + "0 = 自动取 min(物理内存 65%, 9.6GB)。误配可能导致 OOM")
     }
 
     @ViewBuilder
@@ -772,7 +858,7 @@ struct SettingsView: View {
 
     // MARK: - 向量存储 / Matryoshka
 
-    /// 向量落盘元素类型 + Matryoshka 模式/截断维 + 当前生效摘要。
+    /// 向量落盘元素类型 + Matryoshka 模式/截断维。
     @ViewBuilder
     private var vectorStorageControls: some View {
         Text("向量库").font(.caption)
@@ -804,10 +890,16 @@ struct SettingsView: View {
         .frame(width: 90)
         .disabled(matryoshkaMode == .off)
         .help("Matryoshka 截断维：越小向量库越小、召回精度越低；默认 512。")
-        Text(model.vectorStatusText)
-            .font(.caption2)
-            .foregroundStyle(model.vectorRebuildRequired ? .red : .secondary)
-            .lineLimit(1)
+    }
+
+    @ViewBuilder
+    private func annToggles() -> some View {
+        Toggle("ANN 检索", isOn: $annEnabled)
+            .help("开启后检索走分块 IVF 索引；索引未构建、维度不符或尾块超预算时"
+                + "自动回退精确检索。关闭后始终精确检索，大库上会明显变慢")
+        Toggle("自动构建", isOn: $annAutoBuild)
+            .help("同步完成后切片数达到阈值（默认 2 万）时自动构建/续建 ANN 索引；"
+                + "关闭后只能手动点「构建 ANN 索引」")
     }
 
     @ViewBuilder
@@ -826,6 +918,11 @@ struct SettingsView: View {
         case .fp16: return "FP16（不支持）"
         case .bin: return "BIN（最小）"
         }
+    }
+
+    /// MLX 全局内存上限的展示文本：0 表示自动。
+    private var mlxMemoryLimitText: String {
+        mlxMemoryLimitMB <= 0 ? "自动" : "\(mlxMemoryLimitMB)MB"
     }
 
     // MARK: - 参数控件
@@ -972,6 +1069,7 @@ struct SettingsView: View {
         mainTopK = config.topK
         mainRepetitionPenalty = config.repetitionPenalty
         mainTimeout = config.requestTimeout
+        maxIterations = config.maxIterations
         mainPromptBatch = config.promptBatchSize
         mainThinking = config.localLLMEnableThinking
         mainKVReuse = config.llmKVReuse
@@ -1024,8 +1122,16 @@ struct SettingsView: View {
         matryoshkaDim = config.ragMatryoshkaDim
         rerankEnabled = config.ragRerankEnabled
         rerankTopN = config.ragRerankTopN
+        rerankThreshold = config.ragRerankThreshold
+        queryTimeoutSeconds = config.ragQueryTimeoutSeconds
         semanticChunking = config.ragSemanticChunking
         autoIngest = config.ragAutoIngest
+        ingestConcurrency = config.ragIngestConcurrency
+        visionConcurrency = config.ragVisionConcurrency
+        mlxCacheLimitMB = config.mlxCacheLimitMB
+        mlxMemoryLimitMB = config.mlxMemoryLimitMB
+        annEnabled = config.ragANNEnabled
+        annAutoBuild = config.ragANNAutoBuild
         embeddingMinBatch = config.ragEmbeddingMinBatch
         embeddingMaxBatch = config.ragEmbeddingMaxBatch
         embeddingBatchStep = config.ragEmbeddingBatchStep
@@ -1246,6 +1352,9 @@ struct SettingsView: View {
         config.topK = max(0, mainTopK)
         config.repetitionPenalty = max(0, mainRepetitionPenalty)
         config.requestTimeout = max(10, mainTimeout)
+        config.maxIterations = min(max(1, maxIterations), 50)
+        config.mlxCacheLimitMB = min(max(256, mlxCacheLimitMB), 1_024)
+        config.mlxMemoryLimitMB = max(0, mlxMemoryLimitMB)
         config.promptBatchSize = max(0, mainPromptBatch)
         config.localLLMEnableThinking = mainThinking
         config.llmKVReuse = mainKVReuse
@@ -1317,11 +1426,17 @@ struct SettingsView: View {
         config.ragChunkOverlap = min(max(0, chunkOverlap), config.ragChunkSize / 2)
         config.ragRerankEnabled = rerankEnabled
         config.ragRerankTopN = min(max(1, rerankTopN), 20)
+        config.ragRerankThreshold = min(max(0, rerankThreshold), 1)
+        config.ragQueryTimeoutSeconds = min(max(0, queryTimeoutSeconds), 300)
         config.ragSemanticChunking = semanticChunking
         config.ragAutoIngest = autoIngest
+        config.ragIngestConcurrency = min(max(1, ingestConcurrency), 10)
+        config.ragVisionConcurrency = min(max(1, visionConcurrency), 8)
         config.ragVectorElementType = vectorElementType
         config.ragMatryoshka = matryoshkaMode
         config.ragMatryoshkaDim = [128, 256, 512].contains(matryoshkaDim) ? matryoshkaDim : 512
+        config.ragANNEnabled = annEnabled
+        config.ragANNAutoBuild = annAutoBuild
         config.ragEmbeddingMaxBatch = min(max(2, embeddingMaxBatch), 256)
         config.ragEmbeddingMinBatch = min(max(2, embeddingMinBatch), 64)
         config.ragEmbeddingMinBatch = min(config.ragEmbeddingMinBatch,

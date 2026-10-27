@@ -180,8 +180,6 @@ final class AppViewModel: ObservableObject {
     @Published var isBuildingANN = false
     /// ANN 索引摘要（设置窗口显示，来自 RAG status 快照）。
     @Published var annStatusText = "ANN 索引未构建"
-    /// 向量落盘类型 / Matryoshka 截断维摘要（设置窗口显示）。
-    @Published var vectorStatusText = "向量库未就绪"
     /// 当前索引与配置不匹配，需要用户显式重建。
     @Published var vectorRebuildRequired = false
     @Published var vectorRebuildReason = ""
@@ -1510,13 +1508,8 @@ final class AppViewModel: ObservableObject {
             let sources = status["source_count"]?.intValue
                 ?? status["sources"]?.arrayValue?.count ?? 0
             let ann = status["ann_index"]?.stringValue ?? ""
-            let elementType = status["vector_element_type"]?.stringValue ?? ""
-            let mrlDim = status["matryoshka_dim"]?.intValue ?? 0
             let rebuildRequired = status["vector_rebuild_required"]?.boolValue ?? false
             let rebuildReason = status["rebuild_reason"]?.stringValue ?? ""
-            let vectorText = elementType.isEmpty
-                ? ""
-                : "\(elementType)" + (mrlDim > 0 ? " · Matryoshka \(mrlDim) 维" : "")
             // 超时/不可用时 status 带 error：状态栏给可读提示，不显示误导性的 0 切片。
             let text: String
             if let reason = status["error"]?.stringValue {
@@ -1531,7 +1524,6 @@ final class AppViewModel: ObservableObject {
                    ObjectIdentifier(current) == targetID {
                     self.ragStatusText = text
                     if !ann.isEmpty { self.annStatusText = ann }
-                    if !vectorText.isEmpty { self.vectorStatusText = vectorText }
                     self.vectorRebuildRequired = rebuildRequired
                     self.vectorRebuildReason = rebuildReason
                 } else {
