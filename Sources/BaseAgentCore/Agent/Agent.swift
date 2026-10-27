@@ -247,7 +247,6 @@ public final class Agent: @unchecked Sendable {
     /// 动态上下文按「一次用户请求」冻结：同一轮内的多次工具循环复用同一段，
     /// 保证 system + 历史前缀稳定，KV cache 才能跨调用命中。
     private var cachedDynamicContext: String?
-    private var ragStatusCache: (time: TimeInterval, status: [String: JSONValue])?
     private var distillMinTurns = 6
     private let backgroundLock = NSLock()
     private var backgroundRunning = false
@@ -409,7 +408,6 @@ public final class Agent: @unchecked Sendable {
         turnIndex = 0
         lastUserText = ""
         cachedDynamicContext = nil
-        ragStatusCache = nil
         // 清空对话后 Session 已重置，但本地 LLM 仍持有旧会话的 KV cache；
         // 不失效会让下一轮继续复用已经“被清空”的历史。
         invalidateKVCache()
@@ -505,7 +503,7 @@ public final class Agent: @unchecked Sendable {
     }
 
     public func reloadRAG() {
-        ragStatusCache = nil
+        ragEngine.invalidateStatusCache()
         ragEngine.reload()
     }
 
@@ -762,7 +760,8 @@ public final class Agent: @unchecked Sendable {
             sections.append("# Active skill: \(matched.name)\n\(prompt)")
         }
 
-        // 知识库状态（30s 缓存，避免每轮连接/统计）。
+        // 知识库状态只读 RAGEngine 的快照：绝不在这里同步打开/扫描向量库。
+        // 千万级切片的库上 COUNT(*) 需要数分钟，会把首轮 LLM 调用卡住。
         if let status = ragStatus() {
             let chunks = Int(status["chunks_stored"]?.intValue ?? 0)
             let sources = status["sources"]?.arrayValue?.compactMap(\.stringValue) ?? []
@@ -777,6 +776,11 @@ public final class Agent: @unchecked Sendable {
             } else {
                 sections.append("# Knowledge base\nConfigured but empty. Use `rag_ingest` to index.")
             }
+        } else if FileManager.default.fileExists(atPath: ragEngine.indexDBPath) {
+            // 启动后状态快照还没生成（由 UI 在后台刷新）：先给一个无统计的轻提示，
+            // 仍可正常检索，不阻塞本轮。
+            sections.append("# Knowledge base\nIndexed locally. "
+                + "Use `rag_search` to retrieve relevant passages.")
         }
 
         let text = sections.joined(separator: "\n\n")
@@ -785,12 +789,9 @@ public final class Agent: @unchecked Sendable {
     }
 
     private func ragStatus() -> [String: JSONValue]? {
-        if let cache = ragStatusCache, Date().timeIntervalSince1970 - cache.time < 30 {
-            return cache.status
-        }
-        let status = ragEngine.status()
-        ragStatusCache = (Date().timeIntervalSince1970, status)
-        return status
+        // 快照由 AppModel 启动后/同步后刷新，写操作会主动失效；轮次路径只读
+        // 缓存且不设过期时间，避免长对话中途丢统计后反复走「无统计」提示。
+        ragEngine.cachedStatus(maxAge: .infinity)
     }
 
     // MARK: 兜底收缩

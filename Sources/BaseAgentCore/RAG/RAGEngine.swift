@@ -218,6 +218,14 @@ public final class RAGEngine {
     private var closePending = false
     private var cancelRequested = false
     private let cancelLock = NSLock()
+    /// `status()` 的快照缓存。轮次提示词与状态栏都只读这里，
+    /// 避免在千万级切片的库上重复执行全表 COUNT。
+    private let statusLock = NSLock()
+    private var statusSnapshot: [String: JSONValue]?
+    private var statusSnapshotTime: TimeInterval = 0
+    /// 写操作使快照失效时自增；并发中的 `status()` 若跨了一次失效，
+    /// 不再把旧统计写回缓存（否则会继续展示最长 `maxAge` 秒）。
+    private var statusGeneration: UInt64 = 0
 
     public static let supportedExtensions: Set<String> = [
         "pdf", "txt", "md", "markdown", "html", "htm", "xhtml",
@@ -384,7 +392,10 @@ public final class RAGEngine {
             AgentLog.warning("RAG: 同步进行中，跳过 reload")
             return
         }
-        defer { releaseIngestFlag() }
+        defer {
+            invalidateStatusCache()
+            releaseIngestFlag()
+        }
         searchLock.lock(); defer { searchLock.unlock() }
         storeLock.lock()
         store?.close()
@@ -450,6 +461,7 @@ public final class RAGEngine {
             return stats
         }
         defer {
+            invalidateStatusCache()
             releaseIngestFlag()
             closeIfPending()
         }
@@ -504,7 +516,7 @@ public final class RAGEngine {
         logFn("RAG: manifest 载入 \(manifest.count) 条")
         // 数据库被删除/重建但 manifest 还在时，增量逻辑会把所有文件当成
         // 「未变化」而跳过，知识库永久为空；此时必须全量重建。
-        if existingChunkCount == 0, !manifest.isEmpty {
+        if !store.hasChunks, !manifest.isEmpty {
             logFn("RAG: 向量库为空但 manifest 仍存在，执行全量重建")
             manifest.removeAll()
             manifestStore.clear()
@@ -1072,6 +1084,7 @@ public final class RAGEngine {
             throw AgentError.storage("另一个知识库任务正在进行，请稍后重试")
         }
         defer {
+            invalidateStatusCache()
             releaseIngestFlag()
             closeIfPending()
         }
@@ -1189,7 +1202,7 @@ public final class RAGEngine {
         let candidateCount = max(requested, resultCount) * (rerankEnabled ? 4 : 1)
 
         let fetched: [SearchHit]? = try withStore { store in
-            guard store.count > 0 else { return nil }
+            guard store.hasChunks else { return nil }
             return try store.hybridSearch(
                 vector: queryVector, query: query, topK: candidateCount,
                 sourceContains: source, rrfK: config.ragRRFK,
@@ -1297,27 +1310,81 @@ public final class RAGEngine {
         (try? withStore { $0.listDocuments() }) ?? []
     }
 
-    /// 知识库状态。`sourceLimit` 只返回前 N 个来源名，避免 7 万本书时
-    /// 每 30 秒把全部路径读进内存；来源总数由 `source_count` 给出。
-    public func status(sourceLimit: Int = 256) -> [String: JSONValue] {
+    /// 知识库状态。默认复用最近一次快照，避免在轮次/检索热路径上做全表扫描。
+    ///
+    /// `sourceLimit` 只返回前 N 个来源名，避免 7 万本书时把全部路径读进内存。
+    /// 大库上 `COUNT(*)` / `COUNT(DISTINCT source)` / `DISTINCT ... LIMIT`
+    /// 都是秒级到分钟级（56GB、2100 万切片实测约 6 分钟），因此：
+    /// - 切片数直接用 `VectorStore` 维护的计数器（O(1)）；
+    /// - 来源数用 manifest 条目数（同步/去重后都会更新），不再 COUNT DISTINCT；
+    /// - 结果缓存 `maxAge` 秒，写操作会主动失效。
+    public func status(sourceLimit: Int = 256,
+                       maxAge: TimeInterval = 600) -> [String: JSONValue] {
+        if let cached = cachedStatus(maxAge: maxAge) { return cached }
+        statusLock.lock()
+        let generation = statusGeneration
+        statusLock.unlock()
+        let manifest = manifestStore.load()
+        let indexedEntries = manifest.filter { ($0.value.duplicateOf ?? "").isEmpty }
+        let indexedSources = indexedEntries.count
+        // 来源名单直接来自 manifest（同步/去重后都会更新）：千万级切片的库上
+        // `SELECT DISTINCT source ... LIMIT` 实测 13.7 秒，会长期占住 searchLock，
+        // 把并发的 rag_search 卡住。只有旧库没有 manifest 时才回退到索引扫描。
+        let manifestSources = indexedSources > 0
+            ? Array(indexedEntries.keys.sorted().prefix(sourceLimit))
+            : []
         let snapshot = try? withStore { store -> [String: JSONValue] in
-            [
+            let sources = manifestSources.isEmpty
+                ? store.listSources(limit: sourceLimit)
+                : manifestSources
+            return [
                 "knowledge_base": .string(knowledgeBase),
                 "rag_dir": .string(ragDir),
-                "chunks_stored": .int(store.count),
-                "source_count": .int(store.sourceCount()),
-                "sources": .array(store.listSources(limit: sourceLimit).map { .string($0) }),
+                // 旧库的 MAX(rowid) 基线在“删光但自增序列残留”时会虚高；
+                // 先用 O(1) 的 LIMIT 1 判断是否真的有切片。
+                "chunks_stored": .int(store.hasChunks ? store.count : 0),
+                "source_count": .int(indexedSources > 0 ? indexedSources : sources.count),
+                "sources": .array(sources.map { .string($0) }),
                 "vector_backend": .string(store.vectorEnabled ? "sqlite-vec" : "sqlite-exact"),
             ]
         }
-        return snapshot ?? [
+        let result = snapshot ?? [
             "knowledge_base": .string(knowledgeBase),
             "rag_dir": .string(ragDir),
             "chunks_stored": .int(0),
-            "source_count": .int(0),
-            "sources": .array([]),
+            "source_count": .int(indexedSources),
+            "sources": .array(manifestSources.map { .string($0) }),
             "error": .string("向量库不可用"),
         ]
+        statusLock.lock()
+        // 统计期间若有同步/去重/清空完成，本次结果已过期，不写回缓存。
+        if statusGeneration == generation {
+            statusSnapshot = result
+            statusSnapshotTime = Date().timeIntervalSince1970
+        }
+        statusLock.unlock()
+        return result
+    }
+
+    /// 只读最近一次 `status()` 快照，不打开数据库、不扫描任何表。
+    /// 首轮 `dynamicContextPrompt` 用它，避免把数分钟的 COUNT 放在模型调用之前。
+    public func cachedStatus(maxAge: TimeInterval = 600) -> [String: JSONValue]? {
+        statusLock.lock(); defer { statusLock.unlock() }
+        guard let statusSnapshot else { return nil }
+        if maxAge > 0,
+           Date().timeIntervalSince1970 - statusSnapshotTime > maxAge {
+            return nil
+        }
+        return statusSnapshot
+    }
+
+    /// 数据变化（同步/删除/去重/清空/重载）后丢弃快照，下次展示重新统计。
+    public func invalidateStatusCache() {
+        statusLock.lock()
+        statusSnapshot = nil
+        statusSnapshotTime = 0
+        statusGeneration &+= 1
+        statusLock.unlock()
     }
 
     public func clear() throws {
@@ -1332,6 +1399,7 @@ public final class RAGEngine {
         try? FileManager.default.removeItem(atPath: markdownDir)
         try? FileManager.default.createDirectory(atPath: markdownDir, withIntermediateDirectories: true)
         manifestStore.clear()
+        invalidateStatusCache()
     }
 
     // MARK: Cache paths

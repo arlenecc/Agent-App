@@ -116,4 +116,34 @@ final class VectorStoreTests: XCTestCase {
         XCTAssertEqual(hits.count, 1)
         XCTAssertTrue(hits[0].text.contains("人工智能"))
     }
+
+    func testChunkCounterPersistsAcrossReopenAndLegacyFallback() throws {
+        let path = directory.appendingPathComponent("counter.sqlite").path
+        do {
+            let store = try VectorStore(dbPath: path, dimension: 2)
+            _ = try store.add(chunks: [
+                Chunk(text: "a", source: "a.md", chunkIndex: 0),
+                Chunk(text: "b", source: "a.md", chunkIndex: 1),
+                Chunk(text: "c", source: "b.md", chunkIndex: 0),
+            ], vectors: [[1, 0], [0, 1], [1, 1]])
+            XCTAssertEqual(store.count, 3)
+            XCTAssertEqual(try store.deleteBySource("a.md"), 2)
+            XCTAssertEqual(store.count, 1)
+            store.close()
+        }
+        do {
+            let store = try VectorStore(dbPath: path, dimension: 2)
+            XCTAssertEqual(store.count, 1, "计数器必须随库持久化，重开后无需 COUNT(*)")
+            // 模拟升级前的旧库：没有 meta 计数器。
+            try store.db.execute("DELETE FROM meta WHERE key = 'chunks_count'")
+            store.close()
+        }
+        do {
+            let legacy = try VectorStore(dbPath: path, dimension: 2)
+            XCTAssertEqual(legacy.count, 3,
+                           "旧库回退 MAX(rowid)（O(1)，允许略高于实际值）")
+            XCTAssertTrue(legacy.hasChunks)
+            legacy.close()
+        }
+    }
 }

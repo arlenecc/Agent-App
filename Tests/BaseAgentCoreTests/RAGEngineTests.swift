@@ -696,4 +696,41 @@ final class RAGEngineTests: XCTestCase {
         XCTAssertEqual(two.count, 2, "未开启重排序时按调用方 top_k 返回")
         plain.close()
     }
+
+    func testStatusSnapshotCachesAndInvalidatesOnIngest() async throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("base-agent-rag-status-\(UUID().uuidString)")
+        let kb = root.appendingPathComponent("kb")
+        try FileManager.default.createDirectory(at: kb, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        try "# 标题\n\n用于验证状态快照失效的正文。".write(
+            to: kb.appendingPathComponent("a.md"),
+            atomically: true, encoding: .utf8)
+
+        var config = AgentConfig()
+        config.workspace = root.path
+        config.knowledgeBase = kb.path
+        config.ragRerankEnabled = false
+        config.ragChunkSize = 40
+        config.ragChunkOverlap = 2
+
+        let engine = RAGEngine(config: config, knowledgeBase: kb.path,
+                               embedding: RagFakeEmbedding(), reranker: nil)
+        // 首轮提示词只读快照：还没有快照时不能打开数据库。
+        XCTAssertNil(engine.cachedStatus())
+
+        let empty = engine.status()
+        XCTAssertEqual(empty["chunks_stored"]?.intValue, 0)
+        XCTAssertEqual(engine.cachedStatus()?["chunks_stored"]?.intValue, 0)
+
+        let stats = await engine.ingest()
+        XCTAssertGreaterThan(stats.chunks, 0)
+        XCTAssertNil(engine.cachedStatus(), "写操作必须主动让快照失效")
+
+        let refreshed = engine.status()
+        XCTAssertEqual(refreshed["chunks_stored"]?.intValue, stats.chunks)
+        XCTAssertEqual(refreshed["source_count"]?.intValue, 1)
+        XCTAssertEqual(refreshed["sources"]?.arrayValue?.count, 1)
+        engine.close()
+    }
 }

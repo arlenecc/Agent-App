@@ -32,6 +32,11 @@ public final class VectorStore: @unchecked Sendable {
     private let insertBatchSize = 200
     /// sqlite-vec 的 KNN k 上限为 4096；分批/过滤不能越过该值。
     private let maxVectorK = 4096
+    /// 维护的切片总数，持久化在 meta 表。写操作增量更新，避免在状态/检索
+    /// 热路径上执行 `COUNT(*)`：千万级切片的库上实测需要数分钟。
+    /// 旧库没有该键时用 `MAX(rowid)` 作为基线（O(1)，可能略高但不阻塞）。
+    private var cachedChunkCount: Int?
+    private static let chunkCountKey = "chunks_count"
 
     public init(dbPath: String, dimension: Int, enableSQLiteVec: Bool = true) throws {
         self.dimension = max(1, dimension)
@@ -42,6 +47,7 @@ public final class VectorStore: @unchecked Sendable {
         self.db = try SQLiteDatabase(path: dbPath)
         var enabled = enableSQLiteVec && db.vectorExtensionLoaded
         try createBaseSchema()
+        self.cachedChunkCount = Self.readStoredCount(db, key: Self.chunkCountKey)
         if enabled {
             do {
                 try ensureVectorTable(dimension: self.dimension, useVec0: true)
@@ -110,6 +116,10 @@ public final class VectorStore: @unchecked Sendable {
                 try db.execute("DELETE FROM \(Self.chunksTable)")
                 try db.execute("DELETE FROM \(Self.ftsTable)")
                 try db.execute("DELETE FROM \(Self.documentsTable)")
+                // 维度重建后切片清空，计数器同步归零，避免状态栏显示旧数量。
+                try db.execute(
+                    "INSERT INTO meta(key, value) VALUES('\(Self.chunkCountKey)', '0') "
+                    + "ON CONFLICT(key) DO UPDATE SET value = excluded.value")
             }
         }
         try db.execute("INSERT INTO meta(key, value) VALUES('embedding_dim', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value",
@@ -159,12 +169,13 @@ public final class VectorStore: @unchecked Sendable {
             throw AgentError.storage("chunks 与 vectors 数量不一致: \(chunks.count) vs \(vectors.count)")
         }
         lock.lock(); defer { lock.unlock() }
+        // 先确定计数基线：旧库没有 meta 计数器时用 MAX(rowid) 兜底。
+        ensureChunkCounterLocked()
 
         // 模型未声明维度时，首次推理才发现真实值：空库允许直接重建；
         // 已有数据的库必须报错，避免静默清空用户的知识库。
         if let first = vectors.first, first.count != dimension {
-            let existing = try db.scalar("SELECT COUNT(*) FROM \(Self.chunksTable)").intValue ?? 0
-            guard existing == 0 else {
+            guard !hasChunks else {
                 throw AgentError.storage(
                     "向量维度 \(first.count) != \(dimension)；请重建索引后再同步")
             }
@@ -174,44 +185,51 @@ public final class VectorStore: @unchecked Sendable {
 
         let uniqueSources = Set(chunks.map(\.source))
         var inserted = 0
-        try db.transaction {
-            // 1) 删除这些 source 的旧数据（分批，事务内）。
-            for source in uniqueSources {
-                _ = try deleteBySourceLocked(source)
-            }
-            // 2) 分批插入正文 + FTS + 向量。
-            var offset = 0
-            while offset < chunks.count {
-                let end = min(offset + insertBatchSize, chunks.count)
-                for i in offset..<end {
-                    let chunk = chunks[i]
-                    let vector = VectorCodec.normalize(vectors[i])
-                    guard vector.count == dimension else {
-                        throw AgentError.storage("向量维度 \(vector.count) != \(dimension)")
-                    }
-                    let metadataJSON = JSONValue.object(chunk.metadata.mapValues { .string($0) }).jsonString()
-                    let returned = try db.query("""
-                    INSERT INTO chunks(id, source, source_hash, chunk_index, text, heading, metadata, created_at)
-                    VALUES(?, ?, ?, ?, ?, ?, ?, ?) RETURNING rowid
-                    """, [
-                        .text(chunk.id), .text(chunk.source),
-                        .text(Self.hashSource(chunk.source)),
-                        .int(Int64(chunk.chunkIndex)), .text(chunk.text),
-                        .text(chunk.heading), .text(metadataJSON),
-                        .double(Date().timeIntervalSince1970),
-                    ])
-                    guard let rowID = returned.first?["rowid"]?.intValue else {
-                        throw AgentError.storage("写入 chunks 后未返回 rowid: \(chunk.id)")
-                    }
-                    try db.execute(
-                        "INSERT INTO chunks_fts(rowid, tokens, source_hash, chunk_index) VALUES(?, ?, ?, ?)",
-                        [.int(rowID), .text(TextAnalyzer.ftsIndexText(chunk.text)),
-                         .text(Self.hashSource(chunk.source)), .int(Int64(chunk.chunkIndex))]
-                    )
-                    try insertVector(rowID: rowID, vector: vector)
-                    inserted += 1
+        try withChunkCounterRollback {
+            try db.transaction {
+                // 1) 删除这些 source 的旧数据（分批，事务内）。
+                for source in uniqueSources {
+                    _ = try deleteBySourceLocked(source)
                 }
-                offset = end
+                // 2) 分批插入正文 + FTS + 向量。
+                var offset = 0
+                while offset < chunks.count {
+                    let end = min(offset + insertBatchSize, chunks.count)
+                    for i in offset..<end {
+                        let chunk = chunks[i]
+                        let vector = VectorCodec.normalize(vectors[i])
+                        guard vector.count == dimension else {
+                            throw AgentError.storage("向量维度 \(vector.count) != \(dimension)")
+                        }
+                        let metadataJSON = JSONValue.object(chunk.metadata.mapValues { .string($0) }).jsonString()
+                        let returned = try db.query("""
+                        INSERT INTO chunks(id, source, source_hash, chunk_index, text, heading, metadata, created_at)
+                        VALUES(?, ?, ?, ?, ?, ?, ?, ?) RETURNING rowid
+                        """, [
+                            .text(chunk.id), .text(chunk.source),
+                            .text(Self.hashSource(chunk.source)),
+                            .int(Int64(chunk.chunkIndex)), .text(chunk.text),
+                            .text(chunk.heading), .text(metadataJSON),
+                            .double(Date().timeIntervalSince1970),
+                        ])
+                        guard let rowID = returned.first?["rowid"]?.intValue else {
+                            throw AgentError.storage("写入 chunks 后未返回 rowid: \(chunk.id)")
+                        }
+                        try db.execute(
+                            "INSERT INTO chunks_fts(rowid, tokens, source_hash, chunk_index) VALUES(?, ?, ?, ?)",
+                            [.int(rowID), .text(TextAnalyzer.ftsIndexText(chunk.text)),
+                             .text(Self.hashSource(chunk.source)), .int(Int64(chunk.chunkIndex))]
+                        )
+                        try insertVector(rowID: rowID, vector: vector)
+                        inserted += 1
+                    }
+                    offset = end
+                }
+                // 删除阶段已扣减，这里只补新增，随事务一起提交。
+                if let cachedChunkCount {
+                    self.cachedChunkCount = cachedChunkCount + inserted
+                    try persistChunkCounterLocked()
+                }
             }
         }
         AgentLog.info("VectorStore: 写入 \(inserted) 个切片（\(uniqueSources.count) 个来源，单事务）")
@@ -228,10 +246,15 @@ public final class VectorStore: @unchecked Sendable {
                 "INSERT INTO meta(key, value) VALUES('embedding_dim', ?) "
                 + "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
                 [.text(String(resolved))])
+            // 只在空库上重建；计数器同步归零，避免自增 rowid 残留造成虚高。
+            try db.execute(
+                "INSERT INTO meta(key, value) VALUES('\(Self.chunkCountKey)', '0') "
+                + "ON CONFLICT(key) DO UPDATE SET value = excluded.value")
         }
         // 事务成功后再更新内存状态：失败时仍与磁盘上的旧维度一致。
         dimension = resolved
         didResetForDimensionChange = true
+        cachedChunkCount = 0
     }
 
     private func insertVector(rowID: Int64, vector: [Float]) throws {
@@ -249,8 +272,10 @@ public final class VectorStore: @unchecked Sendable {
     @discardableResult
     public func deleteBySource(_ source: String) throws -> Int {
         lock.lock(); defer { lock.unlock() }
-        return try db.transaction {
-            try deleteBySourceLocked(source)
+        return try withChunkCounterRollback {
+            try db.transaction {
+                try deleteBySourceLocked(source)
+            }
         }
     }
 
@@ -270,6 +295,8 @@ public final class VectorStore: @unchecked Sendable {
 
     private func deleteRowIDsLocked(_ rowIDs: [Int64]) throws -> Int {
         guard !rowIDs.isEmpty else { return 0 }
+        // 删除前先确定基线；旧库没有计数器时用 MAX(rowid) 兜底。
+        ensureChunkCounterLocked()
         var index = 0
         while index < rowIDs.count {
             let batch = Array(rowIDs[index..<min(index + deleteBatchSize, rowIDs.count)])
@@ -280,6 +307,10 @@ public final class VectorStore: @unchecked Sendable {
             try db.execute("DELETE FROM \(Self.vectorTable) WHERE rowid IN (\(placeholders))", args)
             index += batch.count
         }
+        if let cachedChunkCount {
+            self.cachedChunkCount = max(0, cachedChunkCount - rowIDs.count)
+            try persistChunkCounterLocked()
+        }
         return rowIDs.count
     }
 
@@ -288,8 +319,10 @@ public final class VectorStore: @unchecked Sendable {
     public func deleteRowIDs(_ rowIDs: [Int64]) throws -> Int {
         guard !rowIDs.isEmpty else { return 0 }
         lock.lock(); defer { lock.unlock() }
-        return try db.transaction {
-            try deleteRowIDsLocked(rowIDs)
+        return try withChunkCounterRollback {
+            try db.transaction {
+                try deleteRowIDsLocked(rowIDs)
+            }
         }
     }
 
@@ -340,51 +373,53 @@ public final class VectorStore: @unchecked Sendable {
         var cursorCreatedAt = -Double.greatestFiniteMagnitude
         var cursorRowID = Int64.min
 
-        try db.transaction {
-            while true {
-                let rows = try db.query("""
-                    SELECT rowid, source, created_at, text FROM \(Self.chunksTable)
-                    WHERE (created_at > ? OR (created_at = ? AND rowid > ?))
-                    ORDER BY created_at ASC, rowid ASC
-                    LIMIT ?
-                    """, [
-                        .double(cursorCreatedAt),
-                        .double(cursorCreatedAt),
-                        .int(cursorRowID),
-                        .int(Int64(max(32, pageSize))),
-                    ])
-                if rows.isEmpty { break }
-                result.scannedRows += rows.count
+        try withChunkCounterRollback {
+            try db.transaction {
+                while true {
+                    let rows = try db.query("""
+                        SELECT rowid, source, created_at, text FROM \(Self.chunksTable)
+                        WHERE (created_at > ? OR (created_at = ? AND rowid > ?))
+                        ORDER BY created_at ASC, rowid ASC
+                        LIMIT ?
+                        """, [
+                            .double(cursorCreatedAt),
+                            .double(cursorCreatedAt),
+                            .int(cursorRowID),
+                            .int(Int64(max(32, pageSize))),
+                        ])
+                    if rows.isEmpty { break }
+                    result.scannedRows += rows.count
 
-                var duplicateRowIDs: [Int64] = []
-                for row in rows {
-                    guard let rowID = row["rowid"]?.intValue,
-                          let createdAt = row["created_at"]?.doubleValue else {
-                        // 游标无法前进时直接结束，避免死循环。
-                        return
-                    }
-                    cursorCreatedAt = createdAt
-                    cursorRowID = rowID
-
-                    guard let source = row["source"]?.stringValue,
-                          let text = row["text"]?.stringValue,
-                          !text.isEmpty else { continue }
-
-                    let digest = SHA256.hash(data: Data(text.utf8))
-                    let key = Data(digest.prefix(16))
-                    if let keptSource = firstSourceByHash[key] {
-                        duplicateRowIDs.append(rowID)
-                        result.duplicateRows += 1
-                        result.removedBySource[source, default: 0] += 1
-                        if result.canonicalBySource[source] == nil {
-                            result.canonicalBySource[source] = keptSource
+                    var duplicateRowIDs: [Int64] = []
+                    for row in rows {
+                        guard let rowID = row["rowid"]?.intValue,
+                              let createdAt = row["created_at"]?.doubleValue else {
+                            // 游标无法前进时直接结束，避免死循环。
+                            return
                         }
-                    } else {
-                        firstSourceByHash[key] = source
+                        cursorCreatedAt = createdAt
+                        cursorRowID = rowID
+
+                        guard let source = row["source"]?.stringValue,
+                              let text = row["text"]?.stringValue,
+                              !text.isEmpty else { continue }
+
+                        let digest = SHA256.hash(data: Data(text.utf8))
+                        let key = Data(digest.prefix(16))
+                        if let keptSource = firstSourceByHash[key] {
+                            duplicateRowIDs.append(rowID)
+                            result.duplicateRows += 1
+                            result.removedBySource[source, default: 0] += 1
+                            if result.canonicalBySource[source] == nil {
+                                result.canonicalBySource[source] = keptSource
+                            }
+                        } else {
+                            firstSourceByHash[key] = source
+                        }
                     }
-                }
-                if deleteDuplicates, !duplicateRowIDs.isEmpty {
-                    result.removedRows += try deleteRowIDsLocked(duplicateRowIDs)
+                    if deleteDuplicates, !duplicateRowIDs.isEmpty {
+                        result.removedRows += try deleteRowIDsLocked(duplicateRowIDs)
+                    }
                 }
             }
         }
@@ -394,21 +429,76 @@ public final class VectorStore: @unchecked Sendable {
     /// 清空全部切片/向量/文档元数据（单事务）。
     public func clear() throws {
         lock.lock(); defer { lock.unlock() }
-        try db.transaction {
-            try db.execute("DELETE FROM \(Self.chunksTable)")
-            try db.execute("DELETE FROM \(Self.ftsTable)")
-            try db.execute("DELETE FROM \(Self.vectorTable)")
-            try db.execute("DELETE FROM \(Self.documentsTable)")
+        try withChunkCounterRollback {
+            try db.transaction {
+                try db.execute("DELETE FROM \(Self.chunksTable)")
+                try db.execute("DELETE FROM \(Self.ftsTable)")
+                try db.execute("DELETE FROM \(Self.vectorTable)")
+                try db.execute("DELETE FROM \(Self.documentsTable)")
+                self.cachedChunkCount = 0
+                try persistChunkCounterLocked()
+            }
         }
     }
 
     // MARK: - Read / Search
 
+    /// 切片总数。优先返回持久化计数器，旧库回退到 `MAX(rowid)`。
+    /// 两者都是 O(1)，绝不在热路径上执行 `COUNT(*)` 全表扫描。
     public var count: Int {
-        (try? db.scalar("SELECT COUNT(*) FROM \(Self.chunksTable)").intValue).flatMap { Int($0) } ?? 0
+        lock.lock(); defer { lock.unlock() }
+        if let cachedChunkCount { return cachedChunkCount }
+        return maxRowIDLocked
     }
 
-    /// 已索引来源总数；大知识库避免把全部来源名读进内存。
+    /// 是否存在至少一条切片。用 `LIMIT 1` 探测（O(1)，实测 2100 万切片约 0.01s），
+    /// 不信任可能来自旧库 `MAX(rowid)` 的自增基线，避免空库被误判为非空。
+    public var hasChunks: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return (try? db.scalar("SELECT 1 FROM \(Self.chunksTable) LIMIT 1").intValue) != nil
+    }
+
+    private var maxRowIDLocked: Int {
+        (try? db.scalar("SELECT COALESCE(MAX(rowid), 0) FROM \(Self.chunksTable)").intValue)
+            .flatMap { Int($0) } ?? 0
+    }
+
+    private func ensureChunkCounterLocked() {
+        if cachedChunkCount == nil {
+            cachedChunkCount = maxRowIDLocked
+        }
+    }
+
+    /// 事务失败时恢复内存计数器：SQLite 已回滚磁盘写入，内存值也必须回滚，
+    /// 否则后续 count/status 会与库内实际切片数不一致。
+    private func withChunkCounterRollback<T>(_ body: () throws -> T) rethrows -> T {
+        let before = cachedChunkCount
+        do {
+            return try body()
+        } catch {
+            cachedChunkCount = before
+            throw error
+        }
+    }
+
+    /// 计数器写入失败必须让所在事务一起回滚，避免磁盘与内存分叉。
+    private func persistChunkCounterLocked() throws {
+        guard let cachedChunkCount else { return }
+        try db.execute(
+            "INSERT INTO meta(key, value) VALUES(?, ?) "
+            + "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [.text(Self.chunkCountKey), .text(String(cachedChunkCount))])
+    }
+
+    private static func readStoredCount(_ db: SQLiteDatabase, key: String) -> Int? {
+        guard let value = try? db.scalar(
+            "SELECT value FROM meta WHERE key = ?", [.text(key)]).stringValue,
+            let count = Int(value) else { return nil }
+        return count
+    }
+
+    /// 已索引来源总数。**全表扫描**，只在非热路径/诊断时使用；
+    /// 状态展示优先使用 manifest 中的来源数（见 `RAGEngine.status`）。
     public func sourceCount() -> Int {
         (try? db.scalar("SELECT COUNT(DISTINCT source) FROM \(Self.chunksTable)").intValue)
             .flatMap { Int($0) } ?? 0
@@ -447,7 +537,7 @@ public final class VectorStore: @unchecked Sendable {
         // 与写入/删除共用一把锁：两段式查询之间不能有事务提交，
         // 否则 KNN 拿到的 rowid 可能在 hydrate 时已被删掉。
         lock.lock(); defer { lock.unlock() }
-        guard count > 0 else { return [] }
+        guard hasChunks else { return [] }
         let query = VectorCodec.normalize(vector)
         let targeted = sourceFilter != nil || sourceContains != nil
 
