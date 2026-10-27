@@ -37,10 +37,7 @@ public final class MLXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCounti
         self.usesNomicPrefix = lowerName.contains("nomic")
         // bge-zh 官方检索用法：短 query 加指令前缀以对齐检索任务（en 版与 m3 不加）。
         self.usesBGEQueryInstruction = lowerName.contains("bge") && lowerName.contains("zh")
-        self.maxLength = min(
-            max(LocalModelRegistry.resolveMaxSequenceLength(
-                directory: directory, defaultValue: 512), 128),
-            8_192)
+        self.maxLength = Self.window(directory: directory)
 
         if let data = FileManager.default.contents(
             atPath: directory.appendingPathComponent("config.json").path),
@@ -113,7 +110,20 @@ public final class MLXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCounti
     /// 单条输入上限：窗口减去 [CLS]/[SEP]；nomic 还要给 document 前缀留余量。
     /// bge-zh 的 document 不加指令前缀（query 才加），内容预算为 512 - 2 = 510。
     public var maxContentTokens: Int {
-        max(16, maxLength - (usesNomicPrefix ? 10 : 2))
+        Self.contentTokenLimit(directory: directory, modelName: modelName)
+    }
+
+    /// 与 `maxContentTokens` 同源的静态换算：设置界面不加载权重也能算出
+    /// 「切片大小实际生效值」，两处口径不会漂移。
+    public static func contentTokenLimit(directory: URL, modelName: String) -> Int {
+        let reserve = modelName.lowercased().contains("nomic") ? 10 : 2
+        return max(16, window(directory: directory) - reserve)
+    }
+
+    /// 模型声明的最大序列长度（min 128 / max 8192 收口）。
+    private static func window(directory: URL) -> Int {
+        min(max(LocalModelRegistry.resolveMaxSequenceLength(
+            directory: directory, defaultValue: 512), 128), 8_192)
     }
 
     /// 切片用的精确 token 计数（不含特殊 token）：只加载 tokenizer，不牵动模型权重。

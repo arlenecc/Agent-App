@@ -200,6 +200,14 @@ public final class LocalModelFactory: @unchecked Sendable {
         }
     }
 
+    /// 当前配置下 embedding 的「单条内容 token 上限」；不支持精确计数的后端返回 nil。
+    ///
+    /// 与 ingest 的切片收口同源（同一个 provider 缓存实例），设置界面用它显示
+    /// 「切片大小实际生效值」，避免面板显示长切片、实际按模型窗口短切。
+    public func embeddingContentTokenLimit(config: AgentConfig) -> Int? {
+        (makeEmbedding(config: config) as? EmbeddingTokenCounting)?.maxContentTokens
+    }
+
     // MARK: - Reranker
 
     /// 本地 Reranker provider；API 模式返回 nil。

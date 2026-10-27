@@ -251,7 +251,15 @@ public final class ONNXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCount
 
     /// 单条输入上限：窗口减去 [CLS]/[SEP] 与 `search_document:` 前缀（约 4 token）。
     public var maxContentTokens: Int {
-        max(16, maxLength - 2 - 8)
+        Self.contentTokenLimit(directory: directory)
+    }
+
+    /// 与 `maxContentTokens` 同源的静态换算：设置界面不加载权重也能算出
+    /// 「切片大小实际生效值」，两处口径不会漂移。
+    public static func contentTokenLimit(directory: URL) -> Int {
+        let window = LocalModelRegistry.resolveMaxSequenceLength(
+            directory: directory, defaultValue: 8_192)
+        return max(16, window - 2 - 8)
     }
 
     /// 切片用的精确 token 计数（不含特殊 token）：只加载 tokenizer，不牵动模型权重。

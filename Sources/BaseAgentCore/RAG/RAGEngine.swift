@@ -475,6 +475,16 @@ public final class RAGEngine {
         let configSignature = makeIngestSignature()
         let signatureHash = Self.contentHash(configSignature)
         let effectiveForce = force
+        // 每次同步都打印一次生效的切片参数：用户可据此核对「面板设置 →
+        // 实际切片 → 检索呈现」是否一致，而不是只看面板数字。
+        let effectiveChunking = Self.resolvedChunkingOptions(config: config,
+                                                             embedding: embedding)
+        logFn("RAG: 切片参数 \(effectiveChunking.options.chunkSizeTokens) token"
+            + "（含 overlap \(effectiveChunking.options.overlapTokens)），"
+            + "语义切片 \(config.ragSemanticChunking ? "开" : "关")"
+            + (effectiveChunking.clampedFrom.map {
+                "，面板设置的 \($0) 已按 embedding 模型输入上限收口"
+            } ?? ""))
 
         let files = scanFiles()
         logFn("RAG: 开始同步，共 \(files.count) 个文件（force=\(effectiveForce)）")
@@ -681,6 +691,14 @@ public final class RAGEngine {
             ("ocr_binarize", String(config.ragOCRBinarize)),
             ("chunk_size", String(config.ragChunkSize)),
             ("chunk_overlap", String(config.ragChunkOverlap)),
+            // 语义切片开关会改变切片边界：不进签名的话，切换后旧切片会被
+            // 当作「文件未变化」继续沿用，设置等于没生效。
+            ("semantic_chunking", String(config.ragSemanticChunking)),
+            // embedding 后端 / 权重目录决定向量语义与可用窗口（切片收口上限），
+            // 换后端后旧向量必须重算。
+            ("embedding_backend", AgentConfig.normalizeEmbeddingBackend(
+                config.localEmbeddingBackend)),
+            ("embedding_path", config.localEmbeddingModelPath),
             ("embedding_model", embeddingModel),
         ]
         return fields.map { "\($0.0)=\($0.1)" }.joined(separator: "\n")
@@ -842,23 +860,16 @@ public final class RAGEngine {
             var chunkDocument = parsed
             chunkDocument.text = text
             var lastChunkLog = Date()
+            // 切片参数只有一处来源：设置面板（再按 embedding 模型窗口收口）。
+            // 检索结果呈现等下游环节读同一个生效值，避免「设置了长切片、
+            // 某个环节仍按短切片处理」。收口情况在同步开头统一打印一次。
+            var chunkOptions = Self.resolvedChunkingOptions(config: config,
+                                                            embedding: embedding).options
             // 模型分词器可用时改用精确 token 计数：整块（含 overlap）不超过
             // 上下文窗口，避免尾部被 embedding 的 prefix(maxLength) 静默截断。
-            var chunkOptions = ChunkingOptions(config: config)
-            if let provider = embedding as? EmbeddingTokenCounting {
-                // 用户把切片调得比模型窗口还大时以模型为准（bge-small-zh 为
-                // 512 - [CLS]/[SEP] = 510），overlap 同步压缩到 10%。
-                let limit = max(16, provider.maxContentTokens)
-                if chunkOptions.chunkSizeTokens > limit {
-                    let configured = chunkOptions.chunkSizeTokens
-                    chunkOptions.chunkSizeTokens = limit
-                    chunkOptions.overlapTokens = min(chunkOptions.overlapTokens, limit / 10)
-                    log("RAG: \(job.label) 切片大小 \(configured) 超过模型输入上限，"
-                        + "已限制为 \(limit) token")
-                }
-                if let counter = await provider.makeTokenCounter() {
-                    chunkOptions.tokenCounter = counter
-                }
+            if let provider = embedding as? EmbeddingTokenCounting,
+               let counter = await provider.makeTokenCounter() {
+                chunkOptions.tokenCounter = counter
             }
             let chunks = await TextChunker(options: chunkOptions)
                 .chunk(document: chunkDocument, variant: .hybrid) { done, total in
@@ -1119,6 +1130,46 @@ public final class RAGEngine {
         return stats
     }
 
+    // MARK: 切片参数
+
+    /// 实际生效的切片参数：唯一来源是设置面板的 `rag_chunk_size` /
+    /// `rag_chunk_overlap`，再按 embedding 模型的输入窗口收口——超过窗口的
+    /// 尾部会被模型自己的 `prefix(maxLength)` 静默截断，那才是真正的
+    /// 「设了长切片、实际按短切片入库」，所以必须显式压到上限并记录。
+    /// `clampedFrom` 非 nil 表示收口前用户设置的值。
+    static func resolvedChunkingOptions(
+        config: AgentConfig,
+        embedding: EmbeddingProvider?
+    ) -> (options: ChunkingOptions, clampedFrom: Int?) {
+        var options = ChunkingOptions(config: config)
+        let configured = options.chunkSizeTokens
+        guard let provider = embedding as? EmbeddingTokenCounting else {
+            return (options, nil)
+        }
+        let limit = max(16, provider.maxContentTokens)
+        guard configured > limit else { return (options, nil) }
+        options.chunkSizeTokens = limit
+        // overlap 也计入模型输入预算，同步压到 10%。
+        options.overlapTokens = min(options.overlapTokens, limit / 10)
+        return (options, configured)
+    }
+
+    /// 当前生效的切片 token 预算（含 overlap）。检索呈现等下游环节必须用它，
+    /// 不能再用与切片大小无关的固定字符数。
+    var effectiveChunkSizeTokens: Int {
+        Self.resolvedChunkingOptions(config: config, embedding: embedding)
+            .options.chunkSizeTokens
+    }
+
+    /// 单条检索结果的字符上限：不得小于一个切片的实际长度，否则用户把切片
+    /// 调大后，检索结果仍按固定的 1500 字符截短（切了长块却只看到前半段）。
+    /// 按估算器最保守的一档换算（中文 1 token/字、英文 1 token ≈ 1.43 字符），
+    /// 取 1 token ≈ 1.5 字符并留 64 字符余量。
+    static func resultCharLimit(configured: Int, chunkTokens: Int) -> Int {
+        let estimated = Int(Double(max(0, chunkTokens)) * 1.5) + 64
+        return max(200, max(configured, estimated))
+    }
+
     // MARK: Search
 
     public func search(query: String, topK: Int = 3,
@@ -1175,8 +1226,14 @@ public final class RAGEngine {
                                 maxTotalChars: Int? = nil) async throws -> String {
         let hits = try await search(query: query, topK: topK, source: source)
         guard !hits.isEmpty else { return "（知识库中未找到相关内容）" }
-        let perResultLimit = max(200, maxCharsPerResult ?? config.ragSearchMaxCharsPerResult)
-        let totalLimit = max(1_000, maxTotalChars ?? config.ragSearchMaxTotalChars)
+        let perResultLimit = max(200, maxCharsPerResult ?? Self.resultCharLimit(
+            configured: config.ragSearchMaxCharsPerResult,
+            chunkTokens: effectiveChunkSizeTokens))
+        // 总上限随切片放大：配置值是下限，长切片时按「本次返回条数的完整切片」
+        // 放大，但不超过 L0 硬上限（20k 字符，超过也会被内核先截断）。
+        let fitAll = min(20_000, perResultLimit * hits.count)
+        let totalLimit = max(1_000,
+                             maxTotalChars ?? max(config.ragSearchMaxTotalChars, fitAll))
         var lines = ["从知识库检索到 \(hits.count) 条相关内容（混合检索 + RRF\(config.ragRerankEnabled ? " + 重排序" : "")）：", ""]
         var total = lines.joined().count
         for (index, hit) in hits.enumerated() {

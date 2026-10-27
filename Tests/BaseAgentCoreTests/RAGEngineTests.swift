@@ -534,4 +534,100 @@ final class RAGEngineTests: XCTestCase {
         XCTAssertEqual(secondA.skipped, 1)
         backA.close()
     }
+
+    func testLongChunkIsNotTruncatedWhenChunkSizeGrows() async throws {
+        // 回归：检索呈现曾固定按 1500 字符/条截断（rag_search_max_chars_per_result），
+        // 用户把切片调大后仍只能看到切片前半段——即「设置面板改大了切片，
+        // 检索环节却仍按短块呈现」。呈现上限必须随生效切片放大。
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("base-agent-rag-long-chunk-\(UUID().uuidString)")
+        let kb = root.appendingPathComponent("kb")
+        try FileManager.default.createDirectory(at: kb, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        // 一段无标点的长正文（≈1.7k 字符，中文 1 字 ≈ 1 token），
+        // 单章节、单切片，尾部带唯一标记用于判断是否被截断。
+        let body = String(repeating: "甲", count: 1_700) + "尾部唯一标记XYZ"
+        try body.write(to: kb.appendingPathComponent("long.md"),
+                       atomically: true, encoding: .utf8)
+
+        var config = AgentConfig()
+        config.workspace = root.path
+        config.knowledgeBase = kb.path
+        config.ragRerankEnabled = false
+        // 长切片（大于默认 1500 字符呈现上限）；测试用 embedding 不声明窗口，
+        // 因此不会被收口，等价于用户显式设置了长切片。
+        config.ragChunkSize = 2_000
+        config.ragChunkOverlap = 100
+
+        let engine = RAGEngine(config: config, knowledgeBase: kb.path,
+                               embedding: RagFakeEmbedding(), reranker: nil)
+        let stats = await engine.ingest()
+        XCTAssertEqual(stats.processed, 1)
+        XCTAssertEqual(stats.chunks, 1, "长正文应作为完整切片入库")
+
+        let formatted = try await engine.searchFormatted(query: "甲", topK: 1)
+        XCTAssertTrue(formatted.contains("尾部唯一标记XYZ"),
+                      "长切片不得被固定字符上限截短")
+        XCTAssertGreaterThan(formatted.count, config.ragSearchMaxCharsPerResult)
+        engine.close()
+    }
+
+    func testChunkSizeAndOverlapChangesTriggerRebuild() async throws {
+        // 切片大小 / overlap 都进 ingest 签名：改任一项都必须逐文件重建，
+        // 不能因为「文件本身没变」而继续沿用旧切片。
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("base-agent-rag-chunk-signature-\(UUID().uuidString)")
+        let kb = root.appendingPathComponent("kb")
+        try FileManager.default.createDirectory(at: kb, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try """
+        # 切片签名
+
+        这是用于验证切片参数变化会触发重建的正文内容，多个句子。
+        第二句用于让切片边界随参数变化。第三句补齐长度。
+        """.write(to: kb.appendingPathComponent("doc.md"),
+                  atomically: true, encoding: .utf8)
+
+        var config = AgentConfig()
+        config.workspace = root.path
+        config.knowledgeBase = kb.path
+        config.ragRerankEnabled = false
+        config.ragChunkSize = 40
+        config.ragChunkOverlap = 2
+
+        let first = RAGEngine(config: config, knowledgeBase: kb.path,
+                              embedding: RagFakeEmbedding(), reranker: nil)
+        let initial = await first.ingest()
+        XCTAssertEqual(initial.processed, 1)
+        first.close()
+
+        // 只改切片大小：必须重建。
+        config.ragChunkSize = 80
+        let resized = RAGEngine(config: config, knowledgeBase: kb.path,
+                                embedding: RagFakeEmbedding(), reranker: nil)
+        let afterSize = await resized.ingest()
+        XCTAssertEqual(afterSize.processed, 1, "切片大小变化必须重建")
+        XCTAssertEqual(afterSize.skipped, 0)
+        resized.close()
+
+        // 只改 overlap：同样必须重建。
+        config.ragChunkOverlap = 8
+        let overlapped = RAGEngine(config: config, knowledgeBase: kb.path,
+                                   embedding: RagFakeEmbedding(), reranker: nil)
+        let afterOverlap = await overlapped.ingest()
+        XCTAssertEqual(afterOverlap.processed, 1, "overlap 变化必须重建")
+        XCTAssertEqual(afterOverlap.skipped, 0)
+        overlapped.close()
+
+        // 只切语义切片开关：不能因为「没改大小」就跳过。
+        config.ragSemanticChunking.toggle()
+        let switched = RAGEngine(config: config, knowledgeBase: kb.path,
+                                 embedding: RagFakeEmbedding(), reranker: nil)
+        let afterSemantic = await switched.ingest()
+        XCTAssertEqual(afterSemantic.processed, 1, "语义切片开关变化必须重建")
+        XCTAssertEqual(afterSemantic.skipped, 0)
+        switched.close()
+    }
 }

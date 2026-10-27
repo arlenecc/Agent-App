@@ -347,12 +347,46 @@ final class AppViewModel: ObservableObject {
 
     /// 只重载主模型，保留已加载的辅助模型与当前会话。
     func reloadMainModel(config newConfig: AgentConfig) {
-        swapModel(.main, config: newConfig)
+        reloadModel(.main, config: newConfig)
     }
 
     /// 只重载辅助模型，保留已加载的主模型与当前会话。
     func reloadAuxModel(config newConfig: AgentConfig) {
-        swapModel(.aux, config: newConfig)
+        reloadModel(.aux, config: newConfig)
+    }
+
+    /// 「加载主/辅助模型」的统一入口：面板除了本槽位模型参数之外还改了别的
+    /// （切片大小、语义切片、知识库目录、embedding / reranker 后端、OCR……）时，
+    /// 不能只替换 LLM —— Agent 与 RAGEngine 都持有配置快照，必须整体重建，
+    /// 否则会出现「面板设了长切片、运行时仍按短切片处理」这类不同步。
+    private func reloadModel(_ slot: ModelSlot, config newConfig: AgentConfig) {
+        guard !isSyncing, !isDeduplicating else {
+            isModelLoading = false
+            appendLog("[model] 知识同步进行中，暂不加载模型")
+            return
+        }
+        let allowed = slot == .main
+            ? AgentConfig.mainLLMOnlyKeys : AgentConfig.auxLLMOnlyKeys
+        let drifted = newConfig.agentRebuildKeys(comparedTo: config, allowing: allowed)
+        guard !drifted.isEmpty else {
+            swapModel(slot, config: newConfig)
+            return
+        }
+        let slotLabel = slot == .main ? "主模型" : "辅助模型"
+        let sample = drifted.prefix(6).joined(separator: "、")
+        appendLog("[model] 检测到 \(drifted.count) 项配置变化（\(sample)"
+            + (drifted.count > 6 ? " 等" : "") + "），重建 Agent 后加载\(slotLabel)")
+        let wasMain = mainModelLoaded
+        let wasAux = auxModelLoaded
+        applyConfig(newConfig) { [weak self] in
+            guard let self else { return }
+            // 这里不在同步流程内，清掉 applyConfig 留下的恢复标记，直接加载目标槽位。
+            self.pendingSyncRestore = nil
+            let main = wasMain || slot == .main
+            let aux = (wasAux || slot == .aux) && newConfig.auxEnabled
+            guard main || aux else { return }
+            Task { await self.preloadModels(main: main, aux: aux) }
+        }
     }
 
     /// 重建 Agent 会同时关闭主/辅模型；这里只替换目标槽位，另一个模型保持常驻。

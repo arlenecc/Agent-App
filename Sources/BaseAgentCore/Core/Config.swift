@@ -788,4 +788,64 @@ public struct AgentConfig: Sendable {
                                               options: [.prettyPrinted, .sortedKeys])
         try AtomicFile.write(data, to: path)
     }
+
+    // MARK: - 配置差异（决定是否需要重建 Agent）
+
+    /// 只影响主 LLM 实例的配置键：这些键变化可以走「只替换主模型」的轻量路径。
+    /// 其余键（切片、知识库目录、embedding / reranker 后端与模型、OCR、MCP、
+    /// 工具等）都会被 Agent / RAGEngine 在构建时快照，必须整体重建，
+    /// 否则会出现「面板设了长切片、运行时仍按旧切片处理」这类不同步。
+    public static let mainLLMOnlyKeys: Set<String> = [
+        "llm_provider", "base_url", "api_key", "model",
+        "temperature", "max_tokens", "top_p", "min_p", "top_k",
+        "repetition_penalty", "request_timeout",
+        "local_llm_model", "local_llm_backend", "local_llm_enable_thinking",
+        "llm_tokenizer_path", "llm_mmproj_path",
+        "max_context_tokens", "context_shrink_ratio", "prompt_batch_size",
+        "kv_cache_max_tokens", "llm_kv_reuse", "kv_cache_int8",
+        "auto_preload_main",
+    ]
+
+    /// 只影响辅助 LLM 槽位的配置键（辅助模型本身按需加载/卸载，槽位开关可原地生效）。
+    public static let auxLLMOnlyKeys: Set<String> = [
+        "aux_enabled", "aux_llm_provider", "aux_local_llm_model",
+        "aux_local_llm_backend", "aux_local_llm_enable_thinking",
+        "aux_temperature", "aux_max_tokens", "aux_top_p", "aux_min_p", "aux_top_k",
+        "aux_repetition_penalty", "aux_request_timeout",
+        "aux_max_context_tokens", "aux_prompt_batch_size", "aux_kv_cache_max_tokens",
+        "aux_tokenizer_path", "aux_mmproj_path",
+    ]
+
+    /// 与另一份配置逐键比较（基于 `export()` 全量导出），返回值不同的键。
+    public func changedKeys(comparedTo other: AgentConfig) -> Set<String> {
+        let lhs = export()
+        let rhs = other.export()
+        var changed: Set<String> = []
+        for key in Set(lhs.keys).union(rhs.keys) {
+            guard let left = lhs[key], let right = rhs[key] else {
+                changed.insert(key)
+                continue
+            }
+            if !Self.configValueEqual(left, right) {
+                changed.insert(key)
+            }
+        }
+        return changed
+    }
+
+    /// 需要重建 Agent 的差异键：`allowed`（本槽位模型参数）之外的任何差异都要重建。
+    /// 返回排序后的键名，便于日志与测试断言。
+    public func agentRebuildKeys(comparedTo other: AgentConfig,
+                                 allowing allowed: Set<String>) -> [String] {
+        changedKeys(comparedTo: other).subtracting(allowed).sorted()
+    }
+
+    /// `export()` 只产出 String / Bool / Int / Double / 数组 / 字典，桥接后深比较；
+    /// 不用 `String(describing:)` 是因为字典描述顺序不稳定，会把相同配置判成不同。
+    private static func configValueEqual(_ lhs: Any, _ rhs: Any) -> Bool {
+        if let left = lhs as? NSObject, let right = rhs as? NSObject {
+            return left.isEqual(right)
+        }
+        return String(describing: lhs) == String(describing: rhs)
+    }
 }

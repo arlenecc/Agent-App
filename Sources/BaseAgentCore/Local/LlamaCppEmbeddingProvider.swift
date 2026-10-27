@@ -2,7 +2,16 @@ import Foundation
 import llama
 
 /// 进程内 GGUF Embedding：直接加载模型并用 llama.cpp 的 pooled embedding。
-public final class LlamaCppEmbeddingProvider: EmbeddingProvider, @unchecked Sendable {
+public final class LlamaCppEmbeddingProvider: EmbeddingProvider,
+                                             EmbeddingTokenCounting,
+                                             @unchecked Sendable {
+    /// 上下文窗口（与 `LlamaCppEmbeddingRuntime` 一致）：llama.cpp 侧只按
+    /// 这个窗口解码，超出部分会被 `prefix()` 丢掉。声明出去后，切片环节
+    /// 会据此收口，而不是等模型静默截掉切片尾部。
+    static let contextWindow = 2_048
+    /// 单条输入的内容 token 上限：窗口减去 BOS/EOS。
+    public static var contentTokenLimit: Int { max(16, contextWindow - 2) }
+
     public let identifier: String
     public let modelPath: String
 
@@ -20,6 +29,11 @@ public final class LlamaCppEmbeddingProvider: EmbeddingProvider, @unchecked Send
         defer { dimensionLock.unlock() }
         return storedDimension
     }
+
+    /// 单条文本可安全送入模型的内容 token 上限（已扣特殊 token）。
+    public var maxContentTokens: Int { Self.contentTokenLimit }
+
+    public func makeTokenCounter() async -> (@Sendable (String) -> Int)? { nil }
 
     init(modelPath: String, modelName: String) {
         self.modelPath = modelPath
@@ -166,7 +180,9 @@ final class LlamaCppEmbeddingRuntime: @unchecked Sendable {
     init(modelPath: String) throws {
         model = try LlamaCppModel(path: modelPath, gpuLayers: 0)
         context = try LlamaCppContext.make(
-            model: model, contextWindow: 2_048, batchSize: 512, embeddings: true)
+            model: model,
+            contextWindow: LlamaCppEmbeddingProvider.contextWindow,
+            batchSize: 512, embeddings: true)
         memory = llama_get_memory(context)
         dimension = Int(llama_model_n_embd_out(model.raw))
         guard dimension > 0 else {
@@ -192,7 +208,7 @@ final class LlamaCppEmbeddingRuntime: @unchecked Sendable {
         guard !tokens.isEmpty else {
             return [Float](repeating: 0, count: dimension)
         }
-        let truncated = Array(tokens.prefix(2_048 - 2))
+        let truncated = Array(tokens.prefix(LlamaCppEmbeddingProvider.contentTokenLimit))
         if let memory {
             llama_memory_clear(memory, true)
         }

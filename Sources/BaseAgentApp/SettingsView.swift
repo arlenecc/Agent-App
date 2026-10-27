@@ -61,6 +61,8 @@ struct SettingsView: View {
     @State private var embeddingPath = ""
     @State private var rerankerBackend = "onnx"
     @State private var rerankerPath = ""
+    /// 当前 Embedding 后端下「切片实际生效值」的 token 上限（nil = 无精确换算）。
+    @State private var embeddingContentLimit: Int?
 
     // MARK: 高级 RAG
 
@@ -132,6 +134,8 @@ struct SettingsView: View {
         }
         .frame(minWidth: 880, minHeight: 760)
         .onAppear(perform: load)
+        .onChange(of: embeddingBackend) { refreshEmbeddingLimit() }
+        .onChange(of: embeddingPath) { refreshEmbeddingLimit() }
     }
 
     // MARK: - Agent 模型配置区
@@ -505,9 +509,18 @@ struct SettingsView: View {
                             Toggle("启动时自动同步", isOn: $autoIngest)
                             Toggle("语义切片", isOn: $semanticChunking)
                                 .help("开启后大段落在句间相似度低谷处断开，切片阶段需嵌入全部候选句，明显更慢；关闭则按结构+token 边界递归切片")
-                            Stepper("切片大小：\(chunkSize) token", value: $chunkSize,
-                                    in: 100...4000, step: 50)
-                                .help("含 overlap 的总预算。bge-small-zh 上下文为 512 token，超过 510 时会自动压到上限；纯中文约 1 字 ≈ 1 token，中英混排约 1.8 字符/token")
+                            VStack(alignment: .leading, spacing: 1) {
+                                Stepper("切片大小：\(chunkSize) token", value: $chunkSize,
+                                        in: 100...4000, step: 50)
+                                    .help("含 overlap 的总预算，全链路（切分、入库、检索呈现）统一按它计算；"
+                                        + "超过 embedding 模型输入窗口时会自动压到窗口上限。"
+                                        + "纯中文约 1 字 ≈ 1 token，中英混排约 1.8 字符/token")
+                                if let limit = embeddingContentLimit, chunkSize > limit {
+                                    Text("实际生效：\(limit) token（受 embedding 模型输入窗口限制）")
+                                        .font(.caption2)
+                                        .foregroundStyle(.orange)
+                                }
+                            }
                             Stepper("overlap：\(chunkOverlap) token", value: $chunkOverlap,
                                     in: 0...1000, step: 10)
                                 .help("占切片大小的 10%，计入总预算：正文按 chunk_size − overlap 切片")
@@ -692,6 +705,33 @@ struct SettingsView: View {
         embeddingThroughputTolerance = config.ragEmbeddingThroughputTolerance
         embeddingProbeBatches = config.ragEmbeddingProbeBatches
         embeddingProbeSeconds = config.ragEmbeddingProbeSeconds
+        refreshEmbeddingLimit()
+    }
+
+    /// 刷新「切片实际生效值」提示：embedding 模型输入窗口小于配置的切片大小时，
+    /// ingest 会把整块收口到窗口内（同一份收口逻辑在 RAGEngine 与 provider 里共用）。
+    /// 这里只做一次「面板选择 → 配置」的换算，不改变当前状态提示。
+    private func refreshEmbeddingLimit() {
+        let saved = statusMessage
+        defer { statusMessage = saved }
+        // 路径还没填完整时不要去解析模型目录：既算不出上限，又会刷无效路径告警。
+        let path = embeddingPath.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !path.isEmpty {
+            let isGGUF = AgentConfig.normalizeEmbeddingBackend(embeddingBackend) == "gguf"
+            var isDirectory: ObjCBool = false
+            guard FileManager.default.fileExists(atPath: (path as NSString).expandingTildeInPath,
+                                                isDirectory: &isDirectory),
+                  isDirectory.boolValue != isGGUF else {
+                embeddingContentLimit = nil
+                return
+            }
+        }
+        guard let config = buildConfig() else {
+            embeddingContentLimit = nil
+            return
+        }
+        embeddingContentLimit = LocalModelFactory.shared
+            .embeddingContentTokenLimit(config: config)
     }
 
     private func loadMainModel() {
