@@ -619,7 +619,8 @@ public final class WebRenderTool: AgentTool, ShutdownableTool {
             }
             if let scriptResult = outcome.scriptResult {
                 sections.append("[脚本返回]\n" + String(scriptResult.prefix(8_000)))
-            } else if script != nil {
+            } else if !script.isEmpty {
+                // 只有确实传了脚本才提示返回值为空，否则没传脚本的调用会被误导。
                 sections.append("[脚本返回] (no output——脚本需 return 字符串/数字/JSON 字符串)")
             }
             if let screenshotPath = outcome.screenshotPath {

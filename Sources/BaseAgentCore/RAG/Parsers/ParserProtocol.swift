@@ -70,10 +70,16 @@ public extension DocumentParser {
     }
 
     /// 解析后统一清洗（页眉页脚/空白/断行），并标记避免重复清洗。
-    func finish(_ document: ParsedDocument, options: ParserOptions) -> ParsedDocument {
+    /// - Parameter profile: 清洗档位；OCR 文本层用 `.ocr`，现代 Office /
+    ///   HTML / EPUB / 文本资料等结构化内容用 `.structured`（保真，不删 URL/编号）。
+    func finish(_ document: ParsedDocument, options: ParserOptions,
+                profile: DocumentProfile) -> ParsedDocument {
         var doc = document
-        doc.text = DocumentCleaner.clean(doc.text, keepHeadersFooters: options.keepHeadersFooters)
+        doc.text = DocumentCleaner.clean(doc.text,
+                                        keepHeadersFooters: options.keepHeadersFooters,
+                                        profile: profile)
         doc.metadata["cleaned"] = "1"
+        doc.metadata["clean_profile"] = profile == .structured ? "structured" : "ocr"
         return doc
     }
 }

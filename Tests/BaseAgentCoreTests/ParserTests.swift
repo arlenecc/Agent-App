@@ -785,6 +785,25 @@ final class ParserTests: XCTestCase {
         XCTAssertEqual(config.ragEmbeddingInitialBatch, 8)
     }
 
+    /// 启动预加载主模型默认开启；`auto_preload_main` 可显式关闭/打开。
+    func testConfigAutoPreloadMainDefaultsOn() throws {
+        XCTAssertTrue(AgentConfig().autoPreloadMain)
+        XCTAssertEqual(AgentConfig().export()["auto_preload_main"] as? Bool, true)
+
+        let path = directory.appendingPathComponent("config-auto-preload-main.json")
+        try #"{"auto_preload_main":false}"#
+            .write(to: path, atomically: true, encoding: .utf8)
+        var config = AgentConfig.load(path.path)
+        XCTAssertFalse(config.autoPreloadMain)
+        XCTAssertEqual(config.export()["auto_preload_main"] as? Bool, false)
+
+        try #"{"auto_preload_main":true}"#
+            .write(to: path, atomically: true, encoding: .utf8)
+        config = AgentConfig.load(path.path)
+        XCTAssertTrue(config.autoPreloadMain)
+        XCTAssertEqual(config.export()["auto_preload_main"] as? Bool, true)
+    }
+
     /// 辅助模型默认关闭：缺省即为 false，且 `aux_enabled` 可显式打开/关闭。
     func testConfigAuxEnabledDefaultsOff() throws {
         XCTAssertFalse(AgentConfig().auxEnabled)

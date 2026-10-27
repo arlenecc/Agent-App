@@ -44,6 +44,6 @@ public final class ImageParser: DocumentParser {
         document.metadata["structure_restored"] = "1"
         document.metadata["width"] = String(cgImage.width)
         document.metadata["height"] = String(cgImage.height)
-        return finish(document, options: options)
+        return finish(document, options: options, profile: .ocr)
     }
 }

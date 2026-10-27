@@ -92,6 +92,19 @@ enum RAGXMLHelper {
             throw AgentError.parse("XML 解析失败（\(source)）：\(error.localizedDescription)")
         }
     }
+
+    /// 保留文本节点原始空白地解析：AEXML 默认会 trim 文本值，Office 文档里
+    /// `<w:t xml:space="preserve">` 的前导/尾随空格被吃掉会让中英文粘连
+    /// （「第 1 章」变成「第1章」）。调用方需自行按 `xml:space` 决定是否 trim。
+    static func parsePreservingWhitespace(_ data: Data, source: String) throws -> AEXMLDocument {
+        var options = AEXMLOptions()
+        options.parserSettings.shouldTrimWhitespace = false
+        do {
+            return try AEXMLDocument(xml: data, options: options)
+        } catch {
+            throw AgentError.parse("XML 解析失败（\(source)）：\(error.localizedDescription)")
+        }
+    }
 }
 
 /// EPUB/OPF 内部路径规范化与相对路径解析。
@@ -348,7 +361,7 @@ public final class EPUBParser: DocumentParser {
                                     source: url.lastPathComponent,
                                     outline: outline,
                                     metadata: metadata)
-        parsed = finish(parsed, options: options)
+        parsed = finish(parsed, options: options, profile: .structured)
         return parsed
     }
 

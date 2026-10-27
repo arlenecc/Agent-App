@@ -1,5 +1,29 @@
 import Foundation
 
+/// 清洗档位：决定用「OCR 噪声清理」还是「结构化文档保真」的口径。
+///
+/// PDF/图片 OCR 的文本层天然含大量噪声（断行、页码、装饰符号、URL 串），
+/// 需要激进清洗；而现代 Office / HTML / EPUB / CSV 等结构化格式的文本
+/// 是程序生成的，属于真实内容（URL、IP、编号、统计数字），不能按噪声删除。
+public enum DocumentProfile: Sendable {
+    /// OCR / 扫描件文本层：激进去噪。
+    case ocr
+    /// 结构化文档（现代 Office、HTML、EPUB、文本资料）：保真，只清理排版噪声。
+    case structured
+
+    /// 按扩展名推断默认档位（解析器未显式指定时的兜底）。
+    public static func defaultProfile(for url: URL) -> DocumentProfile {
+        switch url.pathExtension.lowercased() {
+        case "html", "htm", "xhtml", "epub",
+             "docx", "xlsx", "pptx",
+             "csv", "tsv", "json", "jsonl", "md", "markdown", "rst", "tex", "latex":
+            return .structured
+        default:
+            return .ocr
+        }
+    }
+}
+
 /// 文本清洗：对应 Python `agent/rag/cleaner.py`。
 ///
 /// 处理顺序（与原项目保持一致）：
@@ -19,8 +43,11 @@ public enum DocumentCleaner {
     ///   - keepHeadersFooters: 为 true 时保留页眉页脚（仍会清理页码与空白）。
     ///   - markdown: 是否按 Markdown 处理；nil 时按内容自动识别。Markdown 模式会
     ///     保留标题、列表、链接、表格、引用、分隔线与代码，只清理 HTML/噪声。
+    ///   - profile: 清洗档位。`.structured` 不做「URL/邮箱删除、散落数据行删除、
+    ///     短行删除、硬换行合并」等面向 OCR 的破坏性处理，并保留段落空行。
     public static func clean(_ text: String, keepHeadersFooters: Bool = false,
-                             markdown: Bool? = nil) -> String {
+                             markdown: Bool? = nil,
+                             profile: DocumentProfile = .ocr) -> String {
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return "" }
 
         let normalized = normalizeLineEndings(text)
@@ -41,7 +68,7 @@ public enum DocumentCleaner {
         var pageLines: [[String]] = []
         pageLines.reserveCapacity(segments.count)
         for segment in segments {
-            pageLines.append(sanitize(segment.body, markdown: useMarkdown)
+            pageLines.append(sanitize(segment.body, markdown: useMarkdown, profile: profile)
                 .components(separatedBy: "\n"))
         }
 
@@ -53,19 +80,24 @@ public enum DocumentCleaner {
 
         var output: [String] = []
         output.reserveCapacity(segments.count * 2)
-        for (pageIndex, segment) in segments.enumerated() {
+        for pageIndex in segments.indices {
             var lines = pageLines[pageIndex]
             if !keepHeadersFooters {
                 lines = removeMargins(lines, headers: headers, footers: footers)
             }
-            lines = filterGarbageLines(lines, markdown: useMarkdown)
+            lines = filterGarbageLines(lines, markdown: useMarkdown, profile: profile)
             // 符号残渣在噪声行判定之后清理：先保留原始密度，避免把本该整行
             // 丢弃的 OCR 噪声洗成「看似正常」的短行。
-            lines = lines.map {
-                replace(noiseSymbolRunRegex, in: $0, with: " ")
+            if profile == .ocr {
+                lines = lines.map {
+                    replace(noiseSymbolRunRegex, in: $0, with: " ")
+                }
             }
-            let joined = joinHardWrappedLines(lines.joined(separator: "\n"),
-                                              preserveMarkdown: useMarkdown)
+            // 结构化档不合并硬换行：Office/HTML 的段内换行（w:br / <br>）是
+            // 作者排版意图，合并后标题与正文会粘成一行。
+            let joined = profile == .ocr
+                ? joinHardWrappedLines(lines.joined(separator: "\n"), preserveMarkdown: useMarkdown)
+                : lines.joined(separator: "\n").trimmingCharacters(in: .newlines)
             let pageText = joined.trimmingCharacters(in: .whitespacesAndNewlines)
 
             // 页标记只供本函数内部做跨页页眉页脚分析，不写入最终文本：
@@ -78,7 +110,7 @@ public enum DocumentCleaner {
         var result = output.joined(separator: "\n\n")
         // 密度压缩放在还原代码/HTML 表格之前：占位符是单行，不会被误伤；
         // 代码块与保留表格内部的空行、缩进保持原样。
-        result = normalizeDensity(result)
+        result = normalizeDensity(result, profile: profile)
         result = restoreFencedBlocks(result, blocks: codeBlocks)
         return result.trimmingCharacters(in: .whitespacesAndNewlines)
     }
@@ -88,7 +120,7 @@ public enum DocumentCleaner {
     /// - 页标记、列表项、表格行、引用行之间不保留空行；
     /// - 短行（通常来自 OCR 逐行排版）之间不保留空行，长段落之间保留一个；
     /// - 标题、代码、保留的 HTML 表格等结构块前后保留一个空行。
-    private static func normalizeDensity(_ text: String) -> String {
+    private static func normalizeDensity(_ text: String, profile: DocumentProfile) -> String {
         let rawLines = text.components(separatedBy: "\n")
         var lines: [String] = []
         lines.reserveCapacity(rawLines.count)
@@ -109,7 +141,7 @@ public enum DocumentCleaner {
             }
             if blankRun > 0 {
                 let previous = output.last ?? ""
-                if keepBlankLine(previous: previous, next: line),
+                if keepBlankLine(previous: previous, next: line, profile: profile),
                    output.last?.isEmpty == false {
                     output.append("")
                 }
@@ -121,7 +153,8 @@ public enum DocumentCleaner {
         return output.joined(separator: "\n")
     }
 
-    private static func keepBlankLine(previous: String, next: String) -> Bool {
+    private static func keepBlankLine(previous: String, next: String,
+                                      profile: DocumentProfile) -> Bool {
         guard !previous.isEmpty else { return false }
         let p = previous.trimmingCharacters(in: .whitespaces)
         let n = next.trimmingCharacters(in: .whitespaces)
@@ -134,6 +167,9 @@ public enum DocumentCleaner {
             return !sameDensityBlockKind(p, n)
         }
         if !pStructural && !nStructural {
+            // 结构化文档的相邻行是独立段落（短标题、条目、字段），
+            // 空行是段落边界，必须保留；OCR 短行则是硬换行排版，需要合并。
+            if profile == .structured { return true }
             // 短行多为 OCR 逐行排版，合并以提高密度；长段落之间保留一个空行。
             return p.count > 60 && n.count > 60
         }
@@ -321,7 +357,8 @@ public enum DocumentCleaner {
 
     // MARK: - 单页清理
 
-    private static func sanitize(_ text: String, markdown: Bool) -> String {
+    private static func sanitize(_ text: String, markdown: Bool,
+                                 profile: DocumentProfile) -> String {
         var result = text
 
         // 脚本/样式/注释/不可见容器（含跨行块）。
@@ -350,10 +387,14 @@ public enum DocumentCleaner {
 
         // Markdown 图片没有可用正文，始终删除；链接在 Markdown 模式保留语法。
         result = replace(markdownImageRegex, in: result, with: "")
-        if !markdown {
-            result = replace(markdownLinkRegex, in: result, with: "$1")
-            result = replace(urlRegex, in: result, with: "")
-            result = replace(emailRegex, in: result, with: "")
+        if profile == .ocr {
+            // URL/邮箱只在 OCR 场景视为噪声；结构化文档里它们是正文
+            // （部署地址、接口链接、联系人），删掉会造成内容缺失。
+            if !markdown {
+                result = replace(markdownLinkRegex, in: result, with: "$1")
+                result = replace(urlRegex, in: result, with: "")
+                result = replace(emailRegex, in: result, with: "")
+            }
         }
 
         result = normalizeUnicodeScalars(result)
@@ -507,7 +548,8 @@ public enum DocumentCleaner {
 
     // MARK: - 噪声行
 
-    private static func filterGarbageLines(_ lines: [String], markdown: Bool) -> [String] {
+    private static func filterGarbageLines(_ lines: [String], markdown: Bool,
+                                           profile: DocumentProfile) -> [String] {
         var result: [String] = []
         result.reserveCapacity(lines.count)
         // 纯数字行只有在页首/页尾才视为页码：正文中的数字（年份、编号、
@@ -568,13 +610,16 @@ public enum DocumentCleaner {
                 continue
             }
             // 散落数据行（表格提取残留：「23 大土地所有者 385 000' 19 250 000」）：
-            // 多个独立数字组且中文占比低，对检索无信息量。
-            if isScatteredDataRow(line) {
-                continue
-            }
-            // 与 Python 一致：长度 < 20 且字母数字占比 < 30% 视为噪声。
-            if line.count < 20, alphanumericRatio(line) < 0.3 {
-                continue
+            // 多个独立数字组且中文占比低，对检索无信息量。结构化档跳过该判定：
+            // Office/HTML 里的 IP、端口、容量、金额列表都是真实内容。
+            if profile == .ocr {
+                if isScatteredDataRow(line) {
+                    continue
+                }
+                // 与 Python 一致：长度 < 20 且字母数字占比 < 30% 视为噪声。
+                if line.count < 20, alphanumericRatio(line) < 0.3 {
+                    continue
+                }
             }
             if result.last?.trimmingCharacters(in: .whitespaces) == line {
                 continue

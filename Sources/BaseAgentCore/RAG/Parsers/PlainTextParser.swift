@@ -28,6 +28,76 @@ enum DocumentTextDecoder {
         }
         return String(decoding: data, as: UTF8.self)
     }
+
+    /// HTML 解码：在通用逻辑之前先看 `<meta charset>`（老网页常见 big5 /
+    /// shift_jis / gb2312，用 UTF-8 兜底会整篇乱码）。
+    ///
+    /// 顺序：BOM → 严格 UTF-8（合法 UTF-8 一定就是正确解码）→ 声明编码
+    /// → GB18030 → 有损 UTF-8。
+    static func decodeHTML(_ data: Data) -> String {
+        let hasBOM = data.starts(with: [0xEF, 0xBB, 0xBF])
+            || data.starts(with: [0xFF, 0xFE])
+            || data.starts(with: [0xFE, 0xFF])
+        if !hasBOM {
+            if let text = String(data: data, encoding: .utf8) { return text }
+            if let declared = declaredEncoding(in: data),
+               let encoding = stringEncoding(named: declared),
+               encoding != .utf8,
+               let text = String(data: data, encoding: encoding) {
+                return text
+            }
+        }
+        return decode(data)
+    }
+
+    /// 从文件头部（前 8KB）读取 `<meta charset>` / `<?xml encoding>` 声明。
+    private static func declaredEncoding(in data: Data) -> String? {
+        let prefix = data.prefix(8192)
+        let ascii = String(decoding: prefix, as: UTF8.self)
+        for regex in declaredEncodingRegexes {
+            let range = NSRange(ascii.startIndex..<ascii.endIndex, in: ascii)
+            guard let match = regex.firstMatch(in: ascii, range: range),
+                  match.numberOfRanges > 1,
+                  let valueRange = Range(match.range(at: 1), in: ascii) else { continue }
+            let value = String(ascii[valueRange]).trimmingCharacters(in: .whitespaces)
+            if !value.isEmpty { return value }
+        }
+        return nil
+    }
+
+    /// 编码名 → Foundation 编码（先查常见别名，再交给 CoreFoundation 的 IANA 映射）。
+    private static func stringEncoding(named name: String) -> String.Encoding? {
+        let normalized = name.lowercased()
+            .trimmingCharacters(in: CharacterSet(charactersIn: "\"' ;"))
+        func cf(_ encoding: CFStringEncodings) -> String.Encoding {
+            String.Encoding(rawValue: CFStringConvertEncodingToNSStringEncoding(
+                CFStringEncoding(encoding.rawValue)))
+        }
+        switch normalized {
+        case "utf-8", "utf8", "unicode-1-1-utf-8": return .utf8
+        case "gb2312", "gbk", "gb18030", "x-gbk", "csgb2312", "hz-gb-2312":
+            return cf(.GB_18030_2000)
+        case "big5", "big-5", "big5-hkscs", "csbig5", "x-x-big5": return cf(.big5)
+        case "shift_jis", "shift-jis", "sjis", "x-sjis", "windows-31j", "ms_kanji":
+            return .shiftJIS
+        case "euc-jp", "x-euc-jp", "eucjp": return cf(.EUC_JP)
+        case "euc-kr", "x-euc-kr", "ks_c_5601-1987", "windows-949":
+            return cf(.EUC_KR)
+        case "iso-8859-1", "latin1", "latin-1", "iso8859-1": return .isoLatin1
+        case "windows-1252", "cp1252": return .windowsCP1252
+        case "utf-16", "utf-16le", "utf-16be": return .utf16
+        case "koi8-r": return cf(.KOI8_R)
+        default: break
+        }
+        let cfEncoding = CFStringConvertIANACharSetNameToEncoding(normalized as CFString)
+        guard cfEncoding != kCFStringEncodingInvalidId else { return nil }
+        return String.Encoding(rawValue: CFStringConvertEncodingToNSStringEncoding(cfEncoding))
+    }
+
+    private static let declaredEncodingRegexes: [NSRegularExpression] = [
+        try! NSRegularExpression(pattern: #"(?i)charset\s*=\s*["']?\s*([A-Za-z0-9_\-:.]+)"#),
+        try! NSRegularExpression(pattern: #"(?i)encoding\s*=\s*["']\s*([A-Za-z0-9_\-:.]+)"#),
+    ]
 }
 
 /// 纯文本 / Markdown / CSV 等解析器。
@@ -77,7 +147,8 @@ public final class PlainTextParser: DocumentParser {
                                                        "structure_restored": "true",
                                                        "toc_lines_removed":
                                                         String(restored.tocLinesRemoved)])
-                parsed = finish(parsed, options: options)
+                parsed = finish(parsed, options: options,
+                                profile: DocumentProfile.defaultProfile(for: url))
                 return parsed
             }
         }
@@ -92,7 +163,8 @@ public final class PlainTextParser: DocumentParser {
                                     metadata: ["engine": "text", "format": ext])
         // JSON 保留原始结构，避免清洗破坏字符串内容。
         if ext != "json" && ext != "jsonl" {
-            parsed = finish(parsed, options: options)
+            parsed = finish(parsed, options: options,
+                            profile: DocumentProfile.defaultProfile(for: url))
         }
         return parsed
     }

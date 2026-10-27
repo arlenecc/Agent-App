@@ -15,7 +15,8 @@ private final class PartialFailureParser: DocumentParser {
                                     source: url.lastPathComponent,
                                     metadata: ["engine": "partial",
                                                "failed_pages": failed])
-        parsed = finish(parsed, options: options)
+        // 模拟 OCR 路径：走激进清洗档。
+        parsed = finish(parsed, options: options, profile: .ocr)
         return parsed
     }
 }

@@ -669,7 +669,9 @@ public final class RAGEngine {
             ? config.ragEmbeddingModel : config.localEmbeddingModel
         let fields: [(String, String)] = [
             // 渲染/清洗逻辑变化时递增，强制旧缓存文件重建。
-            ("pipeline_version", "7"),
+            // 8：结构化清洗档（HTML/Office/EPUB 保真）+ HTML 本地框架接力 +
+            //    Office 备注/列表/脚注/日期格式完善。
+            ("pipeline_version", "8"),
             ("pdf_engine", config.ragPDFEngine.rawValue),
             ("epub_ocr_engine", config.ragEPUBOCREngine.rawValue),
             ("ocr_engine", config.ragOCREngine),
@@ -826,7 +828,10 @@ public final class RAGEngine {
             // 标准解析器已在 finish() 中清洗；仅对自定义解析器兜底清洗一次。
             let text = parsed.metadata["cleaned"] == "1"
                 ? parsed.text
-                : DocumentCleaner.clean(parsed.text, keepHeadersFooters: false)
+                : DocumentCleaner.clean(
+                    parsed.text, keepHeadersFooters: false,
+                    profile: DocumentProfile.defaultProfile(
+                        for: URL(fileURLWithPath: file.path)))
             guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 throw AgentError.parse("解析结果为空")
             }

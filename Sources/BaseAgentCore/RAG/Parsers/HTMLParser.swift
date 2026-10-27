@@ -13,9 +13,17 @@ enum HTMLMarkdown {
 
         // 网页解析去掉导航/页脚；EPUB 只去掉脚本样式，避免误删章节页眉内容。
         let selectors = removeBoilerplate
-            ? "script,style,noscript,nav,footer,header"
+            ? "script,style,noscript,nav,footer"
             : "script,style,noscript"
         _ = try? root.select(selectors).remove()
+        if removeBoilerplate {
+            // `<header>` 常包着文章主标题（h1）与作者信息，整块删除会丢标题；
+            // 只删不含标题的页头（logo / 导航条）。
+            for header in ((try? root.select("header").array()) ?? []) {
+                let hasHeading = !((try? header.select("h1,h2,h3").array()) ?? []).isEmpty
+                if !hasHeading { _ = try? header.remove() }
+            }
+        }
 
         var blocks: [String] = []
         var headings: [OutlineEntry] = []
@@ -35,8 +43,16 @@ enum HTMLMarkdown {
                                        blocks: inout [String],
                                        headings: inout [OutlineEntry],
                                        listDepth: Int) {
-        for child in element.children() {
-            renderBlock(child, blocks: &blocks, headings: &headings, listDepth: listDepth)
+        // 只遍历元素会丢掉裸文本（手写 HTML、导出页常把正文直接写在
+        // `<body>`/`<div>` 下而没有 `<p>` 包裹），按节点顺序逐个处理。
+        for node in element.getChildNodes() {
+            if let textNode = node as? TextNode {
+                let text = normalizeInlineWhitespace(textNode.text())
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !text.isEmpty { blocks.append(text) }
+            } else if let child = node as? Element {
+                renderBlock(child, blocks: &blocks, headings: &headings, listDepth: listDepth)
+            }
         }
     }
 
@@ -86,7 +102,12 @@ enum HTMLMarkdown {
                 blocks.append(prefixLines(text, prefix: "> "))
             }
 
-        case "br", "hr", "script", "style", "noscript", "nav":
+        case "br", "hr", "script", "style", "noscript", "nav",
+             // 文档元信息与嵌入式容器：`<title>` 不是正文（frameset 页面没有
+             // body，若不跳过会把标题文本当成正文），框架/多媒体的回退内容
+             // 也不是正文——框架正文由本地框架接力单独读取。
+             "head", "title", "meta", "link", "base", "template",
+             "iframe", "frame", "frameset", "embed", "object", "svg", "canvas":
             break
 
         default:
@@ -147,16 +168,9 @@ enum HTMLMarkdown {
         let indent = String(repeating: "  ", count: max(0, depth))
 
         for item in element.children() where item.tagName().lowercased() == "li" {
-            var pieces: [String] = []
-            for node in item.getChildNodes() {
-                if let child = node as? Element {
-                    let tag = child.tagName().lowercased()
-                    if tag == "ul" || tag == "ol" { continue }
-                }
-                pieces.append(inlineText(of: node, skipNestedLists: true))
-            }
-            let text = normalizeInlineWhitespace(pieces.joined())
-                .trimmingCharacters(in: .whitespacesAndNewlines)
+            // 列表项内部允许出现块级子元素（`<li><p>…</p></li>`），但列表项
+            // 必须是单行，否则 Markdown 列表会被拆断，这里按行内方式取文本。
+            let text = liText(item)
             let prefix = ordered ? "\(index). " : "- "
             lines.append(indent + prefix + text)
 
@@ -170,6 +184,34 @@ enum HTMLMarkdown {
             index += 1
         }
         return lines.joined(separator: "\n")
+    }
+
+    /// 列表项文本：拼成单行（块级子元素之间用空格分隔、忽略换行），
+    /// 跳过嵌套列表。
+    private static func liText(_ item: Element) -> String {
+        func collect(_ element: Element) -> String {
+            var result = ""
+            for node in element.getChildNodes() {
+                if let textNode = node as? TextNode {
+                    result += textNode.text()
+                    continue
+                }
+                guard let child = node as? Element else { continue }
+                let tag = child.tagName().lowercased()
+                if tag == "ul" || tag == "ol" { continue }
+                if tag == "br" {
+                    result += " "
+                    continue
+                }
+                // 块级子元素之间补空格，避免「Item one」+「detail」粘成一个词。
+                if blockTags.contains(tag) { result += " " }
+                result += collect(child)
+            }
+            return result
+        }
+        return normalizeInlineWhitespace(
+            collect(item).replacingOccurrences(of: "\n", with: " "))
+            .trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
     private static func renderTable(_ element: Element) -> String {
@@ -236,7 +278,8 @@ enum HTMLMarkdown {
         switch tag {
         case "br":
             return "\n"
-        case "script", "style", "noscript":
+        case "script", "style", "noscript", "head", "title", "meta", "link",
+             "template", "iframe", "frame", "embed", "object", "svg", "canvas":
             return ""
         case "code":
             let code = rawText(element).trimmingCharacters(in: .newlines)
@@ -322,13 +365,51 @@ public final class HTMLParser: DocumentParser {
 
     public init() {}
 
+    /// 单次解析的中间结果。
+    private struct RenderedHTML {
+        var markdown = ""
+        var headings: [OutlineEntry] = []
+        var title = ""
+        /// 正文来自哪个本地框架文件（非空表示发生了框架接力）。
+        var embeddedSource: String?
+        /// 正文为空时的原因说明。
+        var emptyReason = ""
+    }
+
     public func parse(url: URL,
                       options: ParserOptions,
                       progress: ((ParserProgress) -> Void)?) async throws -> ParsedDocument {
+        let rendered = try render(url.standardizedFileURL, depth: 0, visited: [])
+        let markdown = rendered.markdown.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard !markdown.isEmpty else {
+            throw AgentError.parse("HTML 未解析出正文：\(url.lastPathComponent)——\(rendered.emptyReason)")
+        }
+
+        var metadata: [String: String] = ["engine": "html"]
+        if !rendered.title.isEmpty { metadata["title"] = rendered.title }
+        if let embedded = rendered.embeddedSource {
+            metadata["embedded_source"] = embedded
+        }
+
+        var parsed = ParsedDocument(text: markdown,
+                                    source: url.lastPathComponent,
+                                    outline: MarkdownOutline.build(rendered.headings),
+                                    metadata: metadata)
+        parsed = finish(parsed, options: options, profile: .structured)
+        return parsed
+    }
+
+    // MARK: - 渲染（含本地 frame 接力）
+
+    /// 解析单个 HTML 文件。页面正文过短时，自动接力到被保存网页同目录下的
+    /// 本地 `iframe` / `frame` / `object` 内容（浏览器「网页另存为」会把正文
+    /// 框架单独存成 `<页面>_files/N.html`，只读主文件会得到空正文）。
+    private func render(_ url: URL, depth: Int, visited: Set<String>) throws -> RenderedHTML {
         guard let data = try? Data(contentsOf: url) else {
             throw AgentError.parse("无法读取文件：\(url.lastPathComponent)")
         }
-        let html = DocumentTextDecoder.decode(data)
+        let html = DocumentTextDecoder.decodeHTML(data)
 
         let document: Document
         do {
@@ -337,17 +418,123 @@ public final class HTMLParser: DocumentParser {
             throw AgentError.parse("HTML 解析失败（\(url.lastPathComponent)）：\(error.localizedDescription)")
         }
 
-        let title = (try? document.title()) ?? ""
+        var result = RenderedHTML()
+        result.title = (try? document.title())?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let (markdown, headings) = HTMLMarkdown.convert(document, removeBoilerplate: true)
+        result.markdown = markdown
+        result.headings = headings
 
-        var metadata: [String: String] = ["engine": "html"]
-        if !title.isEmpty { metadata["title"] = title }
+        // 正文过短：优先从本地框架文件里取真正的正文。
+        if depth < Self.maxFrameDepth, markdown.count < Self.frameFallbackThreshold,
+           let embedded = renderEmbedded(document, base: url, currentLength: markdown.count,
+                                         depth: depth, visited: visited),
+           !embedded.markdown.isEmpty {
+            var merged = embedded
+            if merged.title.isEmpty { merged.title = result.title }
+            return merged
+        }
 
-        var parsed = ParsedDocument(text: markdown,
-                                    source: url.lastPathComponent,
-                                    outline: MarkdownOutline.build(headings),
-                                    metadata: metadata)
-        parsed = finish(parsed, options: options)
-        return parsed
+        if markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            result.emptyReason = emptyReason(document)
+        }
+        return result
     }
+
+    /// 在候选的本地框架文档里挑正文最多的一份。
+    private func renderEmbedded(_ document: Document, base: URL, currentLength: Int,
+                                depth: Int, visited: Set<String>) -> RenderedHTML? {
+        var visited = visited
+        visited.insert(base.standardizedFileURL.path)
+
+        var references: [String] = []
+        for selector in Self.frameSelectors {
+            for element in ((try? document.select(selector).array()) ?? []) {
+                let value = selector.contains("object")
+                    ? (try? element.attr("data")) ?? ""
+                    : (try? element.attr("src")) ?? ""
+                if !value.isEmpty { references.append(value) }
+                if references.count >= Self.maxFrameCandidates { break }
+            }
+        }
+
+        var best: RenderedHTML?
+        var bestSource: String?
+        for reference in references.prefix(Self.maxFrameCandidates) {
+            guard let target = localFrameURL(reference, base: base),
+                  !visited.contains(target.path),
+                  FileManager.default.fileExists(atPath: target.path) else { continue }
+            do {
+                var candidate = try render(target, depth: depth + 1, visited: visited)
+                candidate.markdown = candidate.markdown
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !candidate.markdown.isEmpty else { continue }
+                if best == nil || candidate.markdown.count > (best?.markdown.count ?? 0) {
+                    best = candidate
+                    bestSource = target.lastPathComponent
+                }
+            } catch {
+                // 单个框架文件解析失败不影响其他候选。
+                continue
+            }
+        }
+
+        guard let best, best.markdown.count > currentLength else { return nil }
+        var result = best
+        result.embeddedSource = bestSource
+        return result
+    }
+
+    /// 框架引用 → 本地文件 URL：只接受本地路径（不联网抓取），
+    /// 忽略 data:/javascript:/about: 与 http(s) 引用。
+    private func localFrameURL(_ reference: String, base: URL) -> URL? {
+        let cleaned = RAGArchivePath.stripFragmentAndQuery(reference)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !cleaned.isEmpty else { return nil }
+        let lowered = cleaned.lowercased()
+        for scheme in ["http://", "https://", "data:", "javascript:", "about:", "blob:",
+                       "mailto:", "ftp://", "//"] where lowered.hasPrefix(scheme) {
+            return nil
+        }
+        let decoded = cleaned.removingPercentEncoding ?? cleaned
+        let extensionName = (decoded as NSString).pathExtension.lowercased()
+        guard Self.frameExtensions.contains(extensionName) else { return nil }
+
+        if decoded.hasPrefix("file://") {
+            guard let url = URL(string: decoded), url.isFileURL else { return nil }
+            return url.standardizedFileURL
+        }
+        let baseDirectory = base.deletingLastPathComponent()
+        return URL(fileURLWithPath: decoded, relativeTo: baseDirectory).standardizedFileURL
+    }
+
+    /// 空正文的原因说明：区分「正文在框架里」「依赖 JavaScript 渲染」与真空白页。
+    private func emptyReason(_ document: Document) -> String {
+        let frames = (try? document.select("iframe,frame,object,embed").array().count) ?? 0
+        if frames > 0 {
+            return "正文在被保存网页的本地 iframe/frame 中，但未找到可读的本地文件（共 \(frames) 个框架引用）"
+        }
+        let scripts = (try? document.select("script").array().count) ?? 0
+        // 只看 body：<title> 与 <meta> 的文本不算正文。
+        let bodyText = ((try? document.body()?.text()) ?? "")?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if bodyText.isEmpty && scripts > 0 {
+            return "页面依赖 JavaScript 渲染，静态解析无正文（含 \(scripts) 个脚本）"
+        }
+        if bodyText.isEmpty {
+            return "页面没有可提取的文本内容"
+        }
+        return "页面文本全部被判定为导航/样式噪声"
+    }
+
+    // MARK: - 常量
+
+    private static let frameSelectors = ["iframe", "frame", "object"]
+    /// 只接力文档类型框架文件，避免把图片/脚本当成正文解析。
+    private static let frameExtensions: Set<String> = [
+        "html", "htm", "xhtml", "shtml", "php", "asp", "aspx", "jsp", "txt",
+    ]
+    /// 正文短于该长度时尝试框架接力。
+    private static let frameFallbackThreshold = 400
+    private static let maxFrameDepth = 2
+    private static let maxFrameCandidates = 8
 }

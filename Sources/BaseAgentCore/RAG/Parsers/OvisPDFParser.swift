@@ -382,7 +382,7 @@ public final class OvisPDFParser: DocumentParser, VLMBackedParser {
                                     outline: MarkdownOutline.build(outlineEntries),
                                     metadata: metadata,
                                     pageCount: pageLimit)
-        parsed = finish(parsed, options: options)
+        parsed = finish(parsed, options: options, profile: .ocr)
         return parsed
     }
 

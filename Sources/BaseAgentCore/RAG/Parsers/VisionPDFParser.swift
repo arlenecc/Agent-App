@@ -152,7 +152,7 @@ public final class VisionPDFParser: DocumentParser {
                                     outline: MarkdownOutline.build(outlineEntries),
                                     metadata: metadata,
                                     pageCount: pageLimit)
-        parsed = finish(parsed, options: options)
+        parsed = finish(parsed, options: options, profile: .ocr)
         return parsed
     }
 
