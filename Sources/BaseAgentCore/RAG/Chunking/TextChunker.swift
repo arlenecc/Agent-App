@@ -64,8 +64,9 @@ public final class TextChunker: TextChunkingStrategy {
     // MARK: Section
 
     /// 单个章节的切分结果。
-    /// `mergeable` 表示片段是否允许与相邻片段合并：整章/语义切片是完整语义单元，
-    /// 绝不能再被 `minChunkTokens` 合并回去，否则语义边界会被抹掉。
+    /// `mergeable` 表示片段是否允许与相邻片段合并：整章/语义切片是完整语义单元
+    /// （过短的语义片已在 `SemanticChunker` 内部沿弱边界合并），绝不能再被
+    /// `minChunkTokens` 合并回去，否则语义边界会被抹掉。
     private struct SectionPieces {
         var texts: [String]
         var mergeable: Bool

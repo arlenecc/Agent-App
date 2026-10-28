@@ -840,7 +840,8 @@ public final class RAGEngine {
             // 渲染/清洗逻辑变化时递增，强制旧缓存文件重建。
             // 8：结构化清洗档（HTML/Office/EPUB 保真）+ HTML 本地框架接力 +
             //    Office 备注/列表/脚注/日期格式完善。
-            ("pipeline_version", "8"),
+            // 9：语义切片改为 CJK 无空格拼接 + 弱边界短片合并。
+            ("pipeline_version", "9"),
             ("pdf_engine", config.ragPDFEngine.rawValue),
             ("epub_ocr_engine", config.ragEPUBOCREngine.rawValue),
             ("ocr_engine", config.ragOCREngine),
@@ -1327,11 +1328,21 @@ public final class RAGEngine {
 
     /// 单条检索结果的字符上限：不得小于一个切片的实际长度，否则用户把切片
     /// 调大后，检索结果仍按固定的 1500 字符截短（切了长块却只看到前半段）。
-    /// 按估算器最保守的一档换算（中文 1 token/字、英文 1 token ≈ 1.43 字符），
-    /// 取 1 token ≈ 1.5 字符并留 64 字符余量。
+    /// 按英文安全换算（1 token ≈ 4 字符）估算并留 64 字符余量：英文最坏
+    /// 情况约 4 字符/token，中文按字切分时上限更宽松，不会截断。
     static func resultCharLimit(configured: Int, chunkTokens: Int) -> Int {
-        let estimated = Int(Double(max(0, chunkTokens)) * 1.5) + 64
+        let estimated = max(0, chunkTokens) * 4 + 64
         return max(200, max(configured, estimated))
+    }
+
+    /// 格式化输出的总字符上限：不得超过内核单次工具结果上限
+    /// （`kernelMaxToolChars`）。否则 RAG 认为自己输出了 12000 字符，
+    /// 内核拼接对话时又会静默截到 6000，用户看到的截断位置与提示不一致。
+    /// `maxTotalChars` 为调用方显式指定的上限（测试/内部用途）。
+    static func outputCharLimit(config: AgentConfig, maxTotalChars: Int? = nil) -> Int {
+        if let maxTotalChars { return max(1_000, maxTotalChars) }
+        let kernelCap = config.kernelMaxToolChars > 0 ? config.kernelMaxToolChars : 8_000
+        return max(1_000, min(config.ragSearchMaxTotalChars, kernelCap))
     }
 
     // MARK: ANN 索引
@@ -1448,6 +1459,34 @@ public final class RAGEngine {
 
     // MARK: Search
 
+    /// 多来源子串一次最多定向检索的来源数；超过时回退全局召回 + 过滤。
+    private static let maxSourceGroups = 8
+
+    /// 跨来源融合：每个来源内部已经做过 RRF，这里按组内名次再做一次 RRF，
+    /// 避免按来源顺序拼接导致后面的来源永远排最后。
+    static func fuseSourceGroups(_ groups: [[SearchHit]], topK: Int,
+                                 rrfK: Int = 60) -> [SearchHit] {
+        guard topK > 0, !groups.isEmpty else { return [] }
+        var scores: [Int64: Double] = [:]
+        var hits: [Int64: SearchHit] = [:]
+        let k = Double(max(1, rrfK))
+        for group in groups {
+            for (rank, hit) in group.enumerated() {
+                scores[hit.rowID, default: 0] += 1.0 / (k + Double(rank + 1))
+                if hits[hit.rowID] == nil { hits[hit.rowID] = hit }
+            }
+        }
+        var output = hits.values.map { hit -> SearchHit in
+            var copy = hit
+            let score = scores[hit.rowID] ?? 0
+            copy.rrfScore = score
+            copy.score = score
+            return copy
+        }
+        output.sort { ($0.rrfScore ?? 0) > ($1.rrfScore ?? 0) }
+        return Array(output.prefix(topK))
+    }
+
     public func search(query: String, topK: Int = 3,
                        source: String? = nil,
                        timeout: Double? = nil) async throws -> [SearchHit] {
@@ -1468,14 +1507,52 @@ public final class RAGEngine {
 
         let fetched: [SearchHit]? = try withStoreBounded(timeout: limit) { store in
             guard store.hasChunks else { return nil }
-            return try store.hybridSearch(
-                vector: queryVector, query: query, topK: candidateCount,
-                sourceContains: source, rrfK: config.ragRRFK,
-                overfetch: config.ragVectorOverfetch,
-                // ANN 索引就绪时向量通道走分块 IVF；不可用（未构建/尾块超预算/
-                // 维度不符）时 VectorStore 内部自动回退精确路径。
-                ann: annQueryOptions
-            )
+            func run(sourceFilter: String? = nil,
+                     sourceContains: String? = nil) throws -> [SearchHit] {
+                try store.hybridSearch(
+                    vector: queryVector, query: query, topK: candidateCount,
+                    sourceFilter: sourceFilter, sourceContains: sourceContains,
+                    rrfK: config.ragRRFK,
+                    overfetch: config.ragVectorOverfetch,
+                    // ANN 索引就绪时向量通道走分块 IVF；不可用（未构建/
+                    // 尾块超预算/维度不符）时内部自动回退精确路径。
+                    ann: annQueryOptions
+                )
+            }
+            // source 是「来源子串」而不是 SQL 过滤条件：先解析成真实来源，
+            // 再在该来源内部定向检索。直接全局召回后过滤，在大库上会因为
+            // 候选池被其他来源占满而返回空。
+            guard let needle = source?.trimmingCharacters(in: .whitespacesAndNewlines),
+                  !needle.isEmpty else {
+                return try run()
+            }
+            // 来源名单优先取 manifest：千万级切片的库上
+            // `SELECT DISTINCT source ... LIMIT` 实测 13.7 秒，会占住
+            // searchLock；manifest 每次同步/去重后都会更新。
+            // 只有旧库没有 manifest（或 manifest 为空）时才回退到索引扫描。
+            let manifestSources = manifestStore.load()
+                .filter { ($0.value.duplicateOf ?? "").isEmpty }
+                .map(\.key)
+            let knownSources = manifestSources.isEmpty ? store.listSources() : manifestSources
+            let matches = knownSources.filter {
+                $0.localizedCaseInsensitiveContains(needle)
+            }
+            switch matches.count {
+            case 0:
+                // 明确指定了来源却没有任何匹配：不能退化成全局检索，
+                // 否则其他文件的内容会被误认为来自该来源。
+                return []
+            case 1:
+                return try run(sourceFilter: matches[0])
+            case 2...Self.maxSourceGroups:
+                return Self.fuseSourceGroups(
+                    try matches.map { try run(sourceFilter: $0) },
+                    topK: candidateCount, rrfK: config.ragRRFK)
+            default:
+                // 子串过宽（命中太多来源）：保留全局召回 + 过滤，
+                // 避免一次检索打开几十个来源。
+                return try run(sourceContains: needle)
+            }
         }
         guard var hits = fetched else {
             AgentLog.info("RAG: 向量库为空，未检索")
@@ -1515,11 +1592,10 @@ public final class RAGEngine {
         let perResultLimit = max(200, maxCharsPerResult ?? Self.resultCharLimit(
             configured: config.ragSearchMaxCharsPerResult,
             chunkTokens: effectiveChunkSizeTokens))
-        // 总上限随切片放大：配置值是下限，长切片时按「本次返回条数的完整切片」
-        // 放大，但不超过 L0 硬上限（20k 字符，超过也会被内核先截断）。
-        let fitAll = min(20_000, perResultLimit * hits.count)
-        let totalLimit = max(1_000,
-                             maxTotalChars ?? max(config.ragSearchMaxTotalChars, fitAll))
+        // 总上限必须与内核的单次工具结果上限对齐：超出部分会被内核静默截掉，
+        // RAG 自己的截断提示反而失真。
+        let totalLimit = Self.outputCharLimit(config: config,
+                                              maxTotalChars: maxTotalChars)
         var lines = ["从知识库检索到 \(hits.count) 条相关内容（混合检索 + RRF\(config.ragRerankEnabled ? " + 重排序" : "")）：", ""]
         var total = lines.joined().count
         for (index, hit) in hits.enumerated() {

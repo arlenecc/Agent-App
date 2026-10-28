@@ -115,7 +115,9 @@ public struct AgentConfig: Sendable {
     public var kernelMaxContextTokens: Int = 30_000
     public var kernelRawTurns: Int = 2
     public var kernelConsolidateEvery: Int = 4
-    public var kernelMaxToolChars: Int = 6_000
+    /// L1 工具结果字符上限。与 RAG 输出总上限（ragSearchMaxTotalChars=12000）
+    /// 取较小值生效：默认 8000 让 RAG 结果不会被内核二次静默截断。
+    public var kernelMaxToolChars: Int = 8_000
     public var kernelMaxDigestLines: Int = 40
 
     // RAG

@@ -74,18 +74,41 @@ final class ChunkParameterConsistencyTests: XCTestCase {
                        "后端未声明窗口时保持用户设置，不能私自切短")
     }
 
-    func testResultCharLimitNeverShorterThanChunk() {
-        // 默认 1500 字符/条在 500 token 切片下仍然生效（行为不变）。
-        XCTAssertEqual(RAGEngine.resultCharLimit(configured: 1_500, chunkTokens: 500), 1_500)
-        // 切片调大后上限必须随之上抬，否则长切片只呈现前半段。
-        XCTAssertGreaterThan(RAGEngine.resultCharLimit(configured: 1_500, chunkTokens: 2_000),
-                             1_500)
-        XCTAssertGreaterThanOrEqual(
-            RAGEngine.resultCharLimit(configured: 1_500, chunkTokens: 1_200),
-            1_200 * 1 + 64,
-            "取最保守换算（中文 1 token ≈ 1 字）也须容下整个切片")
+    func testResultCharLimitCoversLongEnglishChunks() {
+        // 英文安全换算按 4 字符/token：500 token 切片至少 2064 字符，
+        // 默认 1500 字符不能把完整切片截短。
+        XCTAssertEqual(RAGEngine.resultCharLimit(configured: 1_500, chunkTokens: 500), 2_064)
+        XCTAssertEqual(RAGEngine.resultCharLimit(configured: 1_500, chunkTokens: 800), 3_264)
+        XCTAssertEqual(RAGEngine.resultCharLimit(configured: 1_500, chunkTokens: 1_200), 4_864)
         // 用户显式配置更大的呈现上限时不得被压缩。
         XCTAssertEqual(RAGEngine.resultCharLimit(configured: 8_000, chunkTokens: 500), 8_000)
+    }
+
+    func testOutputCharLimitAlignsWithKernelToolBudget() {
+        var config = AgentConfig()
+        config.ragSearchMaxTotalChars = 12_000
+
+        config.kernelMaxToolChars = 6_000
+        XCTAssertEqual(RAGEngine.outputCharLimit(config: config, maxTotalChars: nil), 6_000,
+                       "RAG 输出不能超过内核工具结果上限，否则会被二次静默截断")
+
+        config.kernelMaxToolChars = 8_000
+        XCTAssertEqual(RAGEngine.outputCharLimit(config: config, maxTotalChars: nil), 8_000)
+
+        // RAG 自身更小的上限优先。
+        config.ragSearchMaxTotalChars = 5_000
+        XCTAssertEqual(RAGEngine.outputCharLimit(config: config, maxTotalChars: nil), 5_000)
+
+        // 内核未配置时使用与默认值一致的 8000 兜底。
+        config.kernelMaxToolChars = 0
+        config.ragSearchMaxTotalChars = 20_000
+        XCTAssertEqual(RAGEngine.outputCharLimit(config: config, maxTotalChars: nil), 8_000)
+
+        // 调用方显式指定时优先；但不得低于 1000 字符的最低可用上下文。
+        XCTAssertEqual(RAGEngine.outputCharLimit(config: config, maxTotalChars: 3_000), 3_000)
+        config.ragSearchMaxTotalChars = 500
+        config.kernelMaxToolChars = 8_000
+        XCTAssertEqual(RAGEngine.outputCharLimit(config: config, maxTotalChars: nil), 1_000)
     }
 
     func testGGUFEmbeddingDeclaresItsContentWindow() {

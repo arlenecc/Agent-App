@@ -40,6 +40,55 @@ private final class RagFakeEmbedding: EmbeddingProvider {
     }
 }
 
+/// 声明精确 token 计数的假 embedding：英文按 4 字符/token，
+/// 用于构造「一个切片超过旧 1500 字符呈现上限」的真实场景。
+private final class RagExactTokenEmbedding: EmbeddingProvider, EmbeddingTokenCounting {
+    let identifier = "rag-exact-token"
+    let dimension = 8
+
+    var maxContentTokens: Int { 8_000 }
+
+    func makeTokenCounter() async -> (@Sendable (String) -> Int)? {
+        { max(1, $0.count / 4) }
+    }
+
+    func embedDocuments(_ texts: [String]) async throws -> [[Float]] {
+        texts.map { text in
+            var vector = [Float](repeating: 0, count: dimension)
+            for (index, scalar) in text.unicodeScalars.enumerated() {
+                vector[Int(scalar.value + UInt32(index)) % dimension] += 1
+            }
+            return VectorCodec.normalize(vector)
+        }
+    }
+
+    func embedQuery(_ text: String) async throws -> [Float] {
+        try await embedDocuments([text])[0]
+    }
+}
+
+/// 关键词假 embedding：把 apple / zebra / volcano 映射到互不相关的基向量，
+/// 用于验证定向来源检索时不受哈希碰撞干扰。
+private final class RagKeywordEmbedding: EmbeddingProvider {
+    let identifier = "rag-keyword"
+    let dimension = 8
+
+    func embedDocuments(_ texts: [String]) async throws -> [[Float]] {
+        texts.map { text in
+            var vector = [Float](repeating: 0, count: dimension)
+            if text.localizedCaseInsensitiveContains("apple") { vector[0] = 1 }
+            if text.localizedCaseInsensitiveContains("zebra") { vector[5] = 1 }
+            if text.localizedCaseInsensitiveContains("volcano") { vector[6] = 1 }
+            if vector.allSatisfy({ $0 == 0 }) { vector[7] = 1 }
+            return VectorCodec.normalize(vector)
+        }
+    }
+
+    func embedQuery(_ text: String) async throws -> [Float] {
+        try await embedDocuments([text])[0]
+    }
+}
+
 /// 确定性的假 reranker：按候选顺序给递减分数，全部高于默认阈值，
 /// 用于验证「重排序后的 TopN 截断」而不是分数过滤。
 private final class RagFakeReranker: RerankProvider {
@@ -735,6 +784,132 @@ final class RAGEngineTests: XCTestCase {
         XCTAssertEqual(refreshed["chunks_stored"]?.intValue, stats.chunks)
         XCTAssertEqual(refreshed["source_count"]?.intValue, 1)
         XCTAssertEqual(refreshed["sources"]?.arrayValue?.count, 1)
+        engine.close()
+    }
+
+    /// source 子串必须先解析成真实来源，再在该来源内部定向检索；
+    /// 不能拿子串去全局召回后过滤——大库上全局候选被其他来源占满就返回空。
+    func testSourceSubstringUsesExactSourceForScopedRecall() async throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("base-agent-rag-scoped-source-\(UUID().uuidString)")
+        let kb = root.appendingPathComponent("kb")
+        try FileManager.default.createDirectory(at: kb, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        // 其他来源制造超过 maxVectorK(4096) 的全局候选，把目标来源挤出
+        // 精确 KNN 的候选池。每行带唯一编号：清洗会折叠完全重复的行，
+        // 纯重复文本只剩一个切片。
+        let other = (0..<5_000).map { "apple banana fruit \($0).\n" }.joined()
+        try other.write(to: kb.appendingPathComponent("other.md"),
+                        atomically: true, encoding: .utf8)
+        try "zebra quokka".write(to: kb.appendingPathComponent("target-a.md"),
+                                 atomically: true, encoding: .utf8)
+        try "volcano glacier".write(to: kb.appendingPathComponent("target-b.md"),
+                                    atomically: true, encoding: .utf8)
+
+        var config = AgentConfig()
+        config.workspace = root.path
+        config.knowledgeBase = kb.path
+        config.ragRerankEnabled = false
+        config.ragSemanticChunking = false
+        config.ragChunkSize = 20
+        config.ragChunkOverlap = 0
+
+        let engine = RAGEngine(config: config, knowledgeBase: kb.path,
+                               embedding: RagKeywordEmbedding(), reranker: nil)
+        let stats = await engine.ingest()
+        XCTAssertEqual(stats.processed, 3)
+        XCTAssertGreaterThan(stats.chunks, 4_096,
+                             "需要超过 maxVectorK 的其他来源切片挤占全局召回")
+
+        // 唯一匹配：直接解析成精确来源，绕开全局 KNN 截断。
+        let scoped = try await engine.search(query: "apple", topK: 1, source: "target-a")
+        XCTAssertEqual(scoped.count, 1, "来源子串必须在该来源内定向召回")
+        XCTAssertEqual(scoped.first.map { ($0.source as NSString).lastPathComponent },
+                       "target-a.md")
+        XCTAssertTrue(scoped.first?.text.contains("zebra") == true)
+
+        // 多个匹配：每个来源各自定向检索，再按 RRF 合并。
+        let grouped = try await engine.search(query: "apple", topK: 2, source: "target")
+        XCTAssertEqual(Set(grouped.map { ($0.source as NSString).lastPathComponent }),
+                       ["target-a.md", "target-b.md"],
+                       "多来源子串必须覆盖所有匹配来源")
+        engine.close()
+    }
+
+    /// 英文正文按更安全的 4 字符/token 换算：旧实现按 1.5 字符/token
+    /// 估算，会把 2k+ 字符的长切片截在 1500 字符处。
+    func testEnglishChunkNotTruncatedAtLegacyCharLimit() async throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("base-agent-rag-english-limit-\(UUID().uuidString)")
+        let kb = root.appendingPathComponent("kb")
+        try FileManager.default.createDirectory(at: kb, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let body = String(repeating: "retrieval augmented generation ", count: 70)
+            + "TAILMARKERXYZ"
+        XCTAssertGreaterThan(body.count, 1_500, "正文必须超过旧的 1500 字符上限")
+        XCTAssertLessThan(body.count, 800 * 4, "正文必须能放进一个 800 token 切片")
+        try body.write(to: kb.appendingPathComponent("english.md"),
+                       atomically: true, encoding: .utf8)
+
+        var config = AgentConfig()
+        config.workspace = root.path
+        config.knowledgeBase = kb.path
+        config.ragRerankEnabled = false
+        config.ragSemanticChunking = false
+        config.ragChunkSize = 800
+        config.ragChunkOverlap = 0
+
+        let engine = RAGEngine(config: config, knowledgeBase: kb.path,
+                               embedding: RagExactTokenEmbedding(), reranker: nil)
+        let stats = await engine.ingest()
+        XCTAssertEqual(stats.chunks, 1, "英文正文应完整落入一个切片")
+
+        let formatted = try await engine.searchFormatted(query: "retrieval", topK: 1,
+                                                         maxTotalChars: 20_000)
+        XCTAssertTrue(formatted.contains("TAILMARKERXYZ"),
+                      "长英文切片不得被固定的 1500 字符上限截短")
+        engine.close()
+    }
+
+    /// 旧库/外部清理可能没有 manifest：来源子串解析要能回退到索引内的来源名单，
+    /// 不能因为读不到 manifest 就把真实存在的来源判成不存在。
+    func testSourceSearchFallsBackToIndexWhenManifestMissing() async throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("base-agent-rag-source-fallback-\(UUID().uuidString)")
+        let kb = root.appendingPathComponent("kb")
+        try FileManager.default.createDirectory(at: kb, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        try "zebra quokka".write(to: kb.appendingPathComponent("target-a.md"),
+                                 atomically: true, encoding: .utf8)
+        try "apple banana".write(to: kb.appendingPathComponent("other.md"),
+                                 atomically: true, encoding: .utf8)
+
+        var config = AgentConfig()
+        config.workspace = root.path
+        config.knowledgeBase = kb.path
+        config.ragRerankEnabled = false
+        config.ragSemanticChunking = false
+        config.ragChunkSize = 20
+        config.ragChunkOverlap = 0
+
+        let engine = RAGEngine(config: config, knowledgeBase: kb.path,
+                               embedding: RagKeywordEmbedding(), reranker: nil)
+        let stats = await engine.ingest()
+        XCTAssertEqual(stats.chunks, 2)
+
+        // 模拟旧库：库内切片仍在，manifest 完全缺失。
+        let manifestURL = URL(fileURLWithPath: config.ragIndexDirectory)
+            .appendingPathComponent("manifest.json")
+        try FileManager.default.removeItem(at: manifestURL)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: manifestURL.path))
+
+        let hit = try await engine.search(query: "zebra", topK: 1, source: "target-a")
+        XCTAssertEqual(hit.count, 1, "manifest 缺失时必须回退到索引来源名单")
+        XCTAssertEqual(hit.first.map { ($0.source as NSString).lastPathComponent },
+                       "target-a.md")
         engine.close()
     }
 }

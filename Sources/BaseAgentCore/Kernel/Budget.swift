@@ -122,7 +122,7 @@ public final class ContextBudget: @unchecked Sendable {
     ///
     /// RAW 区剩余额度按并发调用数平分后换算成字符数（粗算 3 chars/token），
     /// 再被 `maxChars` 钳住。
-    public func remainingForTool(_ nCalls: Int = 1, maxChars: Int = 6_000) -> Int {
+    public func remainingForTool(_ nCalls: Int = 1, maxChars: Int = 8_000) -> Int {
         let n = max(1, nCalls)
         let leftTokens = remainingForRaw()
         if leftTokens <= 0 {

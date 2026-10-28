@@ -253,4 +253,48 @@ final class ChunkingTests: XCTestCase {
         XCTAssertTrue(chunks.allSatisfy { $0.text.hasSuffix("。") },
                       "切片应在句子结束处断开：\(chunks.map { "\($0.text.suffix(6))[\(EmbeddingTokenEstimator.count($0.text))]" })")
     }
+
+    /// 中文句子之间不能因为语义切片而硬插空格，切片必须保持原文连续。
+    func testSemanticChunkerJoinsCJKSentencesWithoutSpaces() async {
+        let text = "苹果是一种水果。香蕉也是一种水果。今天天气晴朗。天空没有云朵。"
+        let options = ChunkingOptions(chunkSizeTokens: 1_000, overlapTokens: 0,
+                                      minChunkTokens: 1,
+                                      semanticThreshold: 0.55, enableSemantic: true,
+                                      tokenCounter: { $0.count })
+        let similarity: SemanticChunker.AdjacentSimilarity = { sentences in
+            Array(repeating: 1.0, count: max(0, sentences.count - 1))
+        }
+        let chunks = await SemanticChunker.split(text, options: options, similarity: similarity)
+        XCTAssertEqual(chunks?.count, 1)
+        XCTAssertEqual(chunks?.first, text, "中文句子拼接不得插入空格")
+    }
+
+    /// 短语义片在弱边界应合并到同一片，避免一本书被切成大量单句碎片。
+    func testSemanticChunkerMergesShortChunksAtWeakBoundary() async {
+        let text = "甲乙丙丁戊。己庚辛壬癸。子丑寅卯辰。巳午未申酉。"
+        let options = ChunkingOptions(chunkSizeTokens: 100, overlapTokens: 0,
+                                      minChunkTokens: 60,
+                                      semanticThreshold: 0.55, enableSemantic: true,
+                                      tokenCounter: { $0.count })
+        let similarity: SemanticChunker.AdjacentSimilarity = { sentences in
+            Array(repeating: 0.5, count: max(0, sentences.count - 1))
+        }
+        let chunks = await SemanticChunker.split(text, options: options, similarity: similarity)
+        XCTAssertEqual(chunks?.count, 1, "短语义片应在弱边界合并")
+        XCTAssertFalse(chunks?.first?.contains("。 ") == true, "合并后中文仍不应插入空格")
+    }
+
+    /// 强主题边界不能被长度合并抹掉：即使两侧都很短，也应保持独立语义单元。
+    func testSemanticChunkerKeepsShortChunksAcrossStrongBoundary() async {
+        let text = "甲乙丙丁戊。己庚辛壬癸。子丑寅卯辰。巳午未申酉。"
+        let options = ChunkingOptions(chunkSizeTokens: 100, overlapTokens: 0,
+                                      minChunkTokens: 60,
+                                      semanticThreshold: 0.55, enableSemantic: true,
+                                      tokenCounter: { $0.count })
+        let similarity: SemanticChunker.AdjacentSimilarity = { sentences in
+            Array(repeating: 0.0, count: max(0, sentences.count - 1))
+        }
+        let chunks = await SemanticChunker.split(text, options: options, similarity: similarity)
+        XCTAssertEqual(chunks?.count, 4, "强边界不得被短块合并越过")
+    }
 }

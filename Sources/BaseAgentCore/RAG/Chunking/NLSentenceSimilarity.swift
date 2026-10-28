@@ -44,11 +44,18 @@ struct NLSentenceSimilarity {
     }
 
     private static let cache = NSCache<NSString, NLEmbedding>()
+    /// 失败哨兵：本机没有该语言的词向量时只向系统查询一次。
+    /// 否则每个章节都会重新尝试加载，白白拖慢语义切片。
+    private static let unavailableCache = NSCache<NSString, NSNumber>()
 
     private static func embedding(for language: NLLanguage) -> NLEmbedding? {
         let key = language.rawValue as NSString
         if let cached = cache.object(forKey: key) { return cached }
-        guard let value = NLEmbedding.wordEmbedding(for: language) else { return nil }
+        if unavailableCache.object(forKey: key) != nil { return nil }
+        guard let value = NLEmbedding.wordEmbedding(for: language) else {
+            unavailableCache.setObject(NSNumber(value: true), forKey: key)
+            return nil
+        }
         cache.setObject(value, forKey: key)
         return value
     }

@@ -104,6 +104,35 @@ final class VectorStoreTests: XCTestCase {
         store.close()
     }
 
+    /// 精确来源过滤必须在该来源内部做向量检索：全局 KNN 的前 topK 被其他
+    /// 来源占满时，定向检索不能返回空。
+    func testExactSourceFilterUsesScopedVectorSearch() throws {
+        let store = try VectorStore(dbPath: directory.appendingPathComponent("scoped.sqlite").path,
+                                    dimension: 2, enableSQLiteVec: true)
+        XCTAssertTrue(store.vectorEnabled, "本测试需要 vec0 全局 KNN 才能复现召回截断")
+
+        // 旧实现只做全局 KNN 并按倍数放大 k（20 → 40 → … → maxVectorK=4096）。
+        // 其他来源的切片超过 4096 条时，目标块永远进不了候选池，过滤后为空。
+        let others = 4_100
+        var chunks: [Chunk] = []
+        var vectors: [[Float]] = []
+        chunks.reserveCapacity(others + 1)
+        vectors.reserveCapacity(others + 1)
+        for index in 0..<others {
+            chunks.append(Chunk(text: "apple \(index)", source: "other.md", chunkIndex: index))
+            vectors.append([1, 0])
+        }
+        chunks.append(Chunk(text: "zebra quokka", source: "target.md", chunkIndex: 0))
+        vectors.append([0.2, 0.98])
+        XCTAssertEqual(try store.add(chunks: chunks, vectors: vectors), others + 1)
+
+        // 目标块全局排名在第 4101 位，超出精确 KNN 的候选上限。
+        let hits = try store.search(vector: [1, 0], topK: 1, sourceFilter: "target.md")
+        XCTAssertEqual(hits.count, 1, "精确来源检索必须在该来源内召回")
+        XCTAssertEqual(hits.first?.source, "target.md")
+        store.close()
+    }
+
     func testCJKFTSTokenization() throws {
         let store = try VectorStore(dbPath: directory.appendingPathComponent("cjk.sqlite").path,
                                     dimension: 2)

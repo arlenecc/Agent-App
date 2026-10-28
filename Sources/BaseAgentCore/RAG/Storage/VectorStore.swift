@@ -45,6 +45,9 @@ public final class VectorStore: @unchecked Sendable {
     private let insertBatchSize = 200
     /// sqlite-vec 的 KNN k 上限为 4096；分批/过滤不能越过该值。
     private let maxVectorK = 4096
+    /// 精确来源定向检索一次最多读取的向量行数。超过后回退全局路径，
+    /// 避免单个超大来源把全部向量读进内存。
+    private static let scopedExactRowLimit = 50_000
     /// 维护的切片总数，持久化在 meta 表。写操作增量更新，避免在状态/检索
     /// 热路径上执行 `COUNT(*)`：千万级切片的库上实测需要数分钟。
     /// 旧库没有该键时用 `MAX(rowid)` 作为基线（O(1)，可能略高但不阻塞）。
@@ -741,6 +744,14 @@ public final class VectorStore: @unchecked Sendable {
             return []
         }
         guard hasChunks else { return [] }
+        // 精确来源：直接在该来源内部检索。全局 KNN 的候选池有上限
+        // （sqlite-vec k 最大 4096），大库里目标来源的切片可能永远排不进
+        // 前 k 名，过滤后就会返回空。
+        if let sourceFilter {
+            return try scopedSourceSearchLocked(vector: vector, topK: topK,
+                                                source: sourceFilter,
+                                                sourceContains: sourceContains)
+        }
         if let ann,
            let hits = try annSearchLocked(vector: vector, topK: topK, options: ann,
                                           sourceFilter: sourceFilter,
@@ -750,6 +761,25 @@ public final class VectorStore: @unchecked Sendable {
         return try bruteSearchLocked(vector: vector, topK: topK,
                                      sourceFilter: sourceFilter,
                                      sourceContains: sourceContains)
+    }
+
+    /// 精确来源检索：只读取该来源的向量并排序，绕开全局 KNN 的候选上限。
+    /// 调用方需已持有 `lock` 且确认库非空。
+    func scopedSourceSearchLocked(vector: [Float], topK: Int, source: String,
+                                  sourceContains: String?) throws -> [SearchHit] {
+        let rows = chunkCount(source: source)
+        guard rows > 0 else { return [] }
+        // 超大来源仍走精确扫描会一次性占用过多内存：退回原有路径，
+        // 由调用方的超时预算兜底。
+        guard rows <= Self.scopedExactRowLimit else {
+            return try bruteSearchLocked(vector: vector, topK: topK,
+                                         sourceFilter: source,
+                                         sourceContains: sourceContains)
+        }
+        let query = VectorCodec.normalize(vector)
+        let candidates = try knnExact(query: query, sourceFilter: source)
+        return try hydrate(candidates: candidates, sourceFilter: source,
+                           sourceContains: sourceContains, limit: topK)
     }
 
     /// 精确检索（vec0 KNN 或全表扫描）。调用方需已持有 `lock` 且确认库非空。
@@ -825,33 +855,46 @@ public final class VectorStore: @unchecked Sendable {
     }
 
     private func knnExact(query: [Float], sourceFilter: String?) throws -> [(Int64, Double)] {
-        var rows: [[String: SQLValue]]
-        if let sourceFilter {
-            // 仍然是两段式：先取该 source 的 rowid，再读向量，不做 JOIN。
-            let ids = try db.query("SELECT rowid FROM chunks WHERE source = ?", [.text(sourceFilter)])
-                .compactMap { $0["rowid"]?.intValue }
-            guard !ids.isEmpty else { return [] }
-            let placeholders = Array(repeating: "?", count: ids.count).joined(separator: ",")
-            rows = try db.query("SELECT rowid, embedding FROM \(Self.vectorTable) WHERE rowid IN (\(placeholders))",
-                                ids.map { SQLValue.int($0) })
-        } else {
-            rows = try db.query("SELECT rowid, embedding FROM \(Self.vectorTable)")
-        }
-        var scored: [(Int64, Double)] = []
-        scored.reserveCapacity(rows.count)
         let queryBits = elementType.isBinary ? VectorEncoder.encodeBits(query) : Data()
-        for row in rows {
-            guard let rowID = row["rowid"]?.intValue,
-                  let data = row["embedding"]?.dataValue else { continue }
-            if elementType.isBinary {
-                let distance = Double(VectorEncoder.hamming(data, queryBits))
-                scored.append((rowID, elementType.similarity(distance: distance,
-                                                             dimension: dimension)))
-            } else {
-                let candidate = VectorEncoder.decode(data, as: elementType,
-                                                     dimension: dimension)
-                scored.append((rowID, VectorCodec.cosine(query, candidate)))
+        var scored: [(Int64, Double)] = []
+
+        func appendScores(rows: [[String: SQLValue]]) {
+            for row in rows {
+                guard let rowID = row["rowid"]?.intValue,
+                      let data = row["embedding"]?.dataValue else { continue }
+                if elementType.isBinary {
+                    let distance = Double(VectorEncoder.hamming(data, queryBits))
+                    scored.append((rowID, elementType.similarity(distance: distance,
+                                                                 dimension: dimension)))
+                } else {
+                    let candidate = VectorEncoder.decode(data, as: elementType,
+                                                         dimension: dimension)
+                    scored.append((rowID, VectorCodec.cosine(query, candidate)))
+                }
             }
+        }
+
+        if let sourceFilter {
+            // 仍然是两段式：先取该 source 的 rowid，再按批读向量（不做 JOIN）。
+            // 单条 IN 语句的变量数有上限，大来源必须分批，否则会直接报错。
+            let ids = try rowIDs(source: sourceFilter)
+            guard !ids.isEmpty else { return [] }
+            scored.reserveCapacity(ids.count)
+            var index = 0
+            while index < ids.count {
+                let batch = Array(ids[index..<min(index + deleteBatchSize, ids.count)])
+                let placeholders = Array(repeating: "?", count: batch.count).joined(separator: ",")
+                let rows = try db.query(
+                    "SELECT rowid, embedding FROM \(Self.vectorTable) "
+                    + "WHERE rowid IN (\(placeholders))",
+                    batch.map { SQLValue.int($0) })
+                appendScores(rows: rows)
+                index += batch.count
+            }
+        } else {
+            let rows = try db.query("SELECT rowid, embedding FROM \(Self.vectorTable)")
+            scored.reserveCapacity(rows.count)
+            appendScores(rows: rows)
         }
         return scored.sorted { $0.1 > $1.1 }
     }

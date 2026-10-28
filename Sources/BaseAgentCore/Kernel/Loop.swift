@@ -217,7 +217,7 @@ public final class KernelLoop {
         // 避免每个用户回合都触发一次慢 prefill。
         self.consolidateEvery = max(8,
             config.kernelConsolidateEvery == 0 ? 8 : config.kernelConsolidateEvery)
-        self.maxToolChars = config.kernelMaxToolChars == 0 ? 6_000 : config.kernelMaxToolChars
+        self.maxToolChars = config.kernelMaxToolChars == 0 ? 8_000 : config.kernelMaxToolChars
         let fallbackTurns = config.maxIterations == 0 ? 15 : config.maxIterations
         self.maxTurns = max(1, maxTurns == 0 ? fallbackTurns : maxTurns)
     }
