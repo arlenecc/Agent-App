@@ -9,14 +9,16 @@ public final class LlamaCppEmbeddingProvider: EmbeddingProvider,
     /// 这个窗口解码，超出部分会被 `prefix()` 丢掉。声明出去后，切片环节
     /// 会据此收口，而不是等模型静默截掉切片尾部。
     static let contextWindow = 2_048
-    /// 单条输入的内容 token 上限：窗口减去 BOS/EOS。
-    public static var contentTokenLimit: Int { max(16, contextWindow - 2) }
+    /// 单条输入的内容 token 上限：窗口在推理前压到 1024 token，再减去 BOS/EOS。
+    public static var contentTokenLimit: Int {
+        max(16, EmbeddingInputLimits.cappedWindow(contextWindow) - 2)
+    }
 
     public let identifier: String
     public let modelPath: String
 
     private let modelName: String
-    private let usesNomicPrefix: Bool
+    private let prefixStrategy: EmbeddingPrefixStrategy
     private let gate = AsyncGate()
     private let stateLock = NSLock()
     private var runtime: LlamaCppEmbeddingRuntime?
@@ -30,8 +32,10 @@ public final class LlamaCppEmbeddingProvider: EmbeddingProvider,
         return storedDimension
     }
 
-    /// 单条文本可安全送入模型的内容 token 上限（已扣特殊 token）。
-    public var maxContentTokens: Int { Self.contentTokenLimit }
+    /// 单条文本可安全送入模型的内容 token 上限（已扣特殊 token 与模型前缀）。
+    public var maxContentTokens: Int {
+        max(16, Self.contentTokenLimit - prefixStrategy.documentPrefixTokenReserve)
+    }
 
     public func makeTokenCounter() async -> (@Sendable (String) -> Int)? { nil }
 
@@ -39,14 +43,15 @@ public final class LlamaCppEmbeddingProvider: EmbeddingProvider,
         self.modelPath = modelPath
         self.modelName = modelName
         self.identifier = "gguf:\(modelName)"
-        self.usesNomicPrefix = modelName.lowercased().contains("nomic")
-            || modelPath.lowercased().contains("nomic")
+        self.prefixStrategy = EmbeddingPrefixStrategy(
+            modelName: modelName,
+            modelPath: modelPath)
     }
 
     public func embedDocuments(_ texts: [String]) async throws -> [[Float]] {
         guard !texts.isEmpty else { return [] }
         let prefixed = texts.map {
-            usesNomicPrefix ? addPrefix($0, prefix: "search_document: ") : $0
+            prefixStrategy.apply($0, task: .retrievalDocument)
         }
         return try await gate.withLock {
             let runtime = try self.ensureRuntime()
@@ -63,7 +68,7 @@ public final class LlamaCppEmbeddingProvider: EmbeddingProvider,
     }
 
     public func embedQuery(_ text: String) async throws -> [Float] {
-        let prefixed = usesNomicPrefix ? addPrefix(text, prefix: "search_query: ") : text
+        let prefixed = prefixStrategy.apply(text, task: .retrievalQuery)
         return try await gate.withLock {
             let runtime = try self.ensureRuntime()
             let vector = try runtime.embed(prefixed)
@@ -104,10 +109,6 @@ public final class LlamaCppEmbeddingProvider: EmbeddingProvider,
         dimensionLock.lock()
         storedDimension = value
         dimensionLock.unlock()
-    }
-
-    private func addPrefix(_ text: String, prefix: String) -> String {
-        text.hasPrefix(prefix) ? text : prefix + text
     }
 }
 

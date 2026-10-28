@@ -6,19 +6,16 @@ import MLXLMCommon
 /// 基于 MLXEmbedders 的本地 Embedding 实现。
 ///
 /// 与 ONNX 实现保持同样的接口：document/query 前缀、pooling + L2 归一化。
-/// 模型专属处理：
-/// - nomic：`search_document:` / `search_query:` 前缀；
-/// - bge-zh：query 侧追加官方检索指令（document 不加），其余模型原样。
+/// 前缀按模型族统一处理（`EmbeddingPrefixStrategy`）。
 public final class MLXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCounting, @unchecked Sendable {
-    public static let bgeQueryInstruction = "为这个句子生成表示以用于检索相关文章："
+    public static let bgeQueryInstruction = EmbeddingPrefixStrategy.bgeQueryInstruction
 
     public let identifier: String
     public let modelName: String
     public let directory: URL
 
     private let maxLength: Int
-    private let usesNomicPrefix: Bool
-    private let usesBGEQueryInstruction: Bool
+    private let prefixStrategy: EmbeddingPrefixStrategy
     private let state = MLXEmbeddingLoadState()
     private let dimensionLock = NSLock()
     private var storedDimension = 768
@@ -33,10 +30,10 @@ public final class MLXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCounti
         self.directory = directory
         self.modelName = modelName
         self.identifier = "local:mlx-embedding:\(modelName)"
-        let lowerName = modelName.lowercased()
-        self.usesNomicPrefix = lowerName.contains("nomic")
-        // bge-zh 官方检索用法：短 query 加指令前缀以对齐检索任务（en 版与 m3 不加）。
-        self.usesBGEQueryInstruction = lowerName.contains("bge") && lowerName.contains("zh")
+        // bge 只有 bge-zh 在 query 侧加官方检索指令；en 版与 m3 不加。
+        self.prefixStrategy = EmbeddingPrefixStrategy(
+            modelName: modelName,
+            modelPath: directory.lastPathComponent)
         self.maxLength = Self.window(directory: directory)
 
         if let data = FileManager.default.contents(
@@ -53,17 +50,15 @@ public final class MLXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCounti
     public func embedDocuments(_ texts: [String]) async throws -> [[Float]] {
         guard !texts.isEmpty else { return [] }
         let prefixed = texts.map {
-            usesNomicPrefix ? addPrefix($0, prefix: "search_document: ") : $0
+            prefixStrategy.apply($0, task: .retrievalDocument)
         }
         return try await embed(prefixed)
     }
 
     public func embedQuery(_ text: String) async throws -> [Float] {
-        var prefixed = usesNomicPrefix ? addPrefix(text, prefix: "search_query: ") : text
-        if usesBGEQueryInstruction {
-            prefixed = addPrefix(prefixed, prefix: Self.bgeQueryInstruction)
-        }
-        return try await embed([prefixed]).first ?? []
+        return try await embed([
+            prefixStrategy.apply(text, task: .retrievalQuery)
+        ]).first ?? []
     }
 
     private func embed(_ texts: [String]) async throws -> [[Float]] {
@@ -98,17 +93,13 @@ public final class MLXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCounti
         return vectors
     }
 
-    private func addPrefix(_ text: String, prefix: String) -> String {
-        text.hasPrefix(prefix) ? text : prefix + text
-    }
-
     /// 释放 embedding 权重；provider 保留，下次 embed 时按需重载。
     public func unload() async {
         await state.unload()
     }
 
-    /// 单条输入上限：窗口减去 [CLS]/[SEP]；nomic 还要给 document 前缀留余量。
-    /// bge-zh 的 document 不加指令前缀（query 才加），内容预算为 512 - 2 = 510。
+    /// 单条输入上限：窗口减去 [CLS]/[SEP] 与当前模型族 document 前缀预留。
+    /// bge-zh 的 document 不加指令前缀（query 才加），内容预算仍为 512 - 2 = 510。
     public var maxContentTokens: Int {
         Self.contentTokenLimit(directory: directory, modelName: modelName)
     }
@@ -116,14 +107,16 @@ public final class MLXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCounti
     /// 与 `maxContentTokens` 同源的静态换算：设置界面不加载权重也能算出
     /// 「切片大小实际生效值」，两处口径不会漂移。
     public static func contentTokenLimit(directory: URL, modelName: String) -> Int {
-        let reserve = modelName.lowercased().contains("nomic") ? 10 : 2
-        return max(16, window(directory: directory) - reserve)
+        let reserve = EmbeddingPrefixStrategy(
+            modelName: modelName,
+            modelPath: directory.lastPathComponent).documentPrefixTokenReserve
+        return max(16, window(directory: directory) - 2 - reserve)
     }
 
-    /// 模型声明的最大序列长度（min 128 / max 8192 收口）。
+    /// 模型声明的最大序列长度（min 128；推理前统一压到 1024 token）。
     private static func window(directory: URL) -> Int {
-        min(max(LocalModelRegistry.resolveMaxSequenceLength(
-            directory: directory, defaultValue: 512), 128), 8_192)
+        EmbeddingInputLimits.cappedWindow(max(LocalModelRegistry.resolveMaxSequenceLength(
+            directory: directory, defaultValue: 512), 128))
     }
 
     /// 切片用的精确 token 计数（不含特殊 token）：只加载 tokenizer，不牵动模型权重。

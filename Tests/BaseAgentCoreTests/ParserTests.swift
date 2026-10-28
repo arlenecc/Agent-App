@@ -624,7 +624,7 @@ final class ParserTests: XCTestCase {
         let config = AgentConfig.load(path.path)
         // docling 已移除：未识别的旧值统一回退到 Apple Vision，避免默默走 Ovis。
         XCTAssertEqual(config.ragPDFEngine, .vision)
-        XCTAssertEqual(config.ragEmbeddingModel, "nomic-ai/nomic-embed-text-v1.5-Q")
+        XCTAssertEqual(config.ragEmbeddingModel, "jina-embeddings-v3-mlx-int4")
         // overlap 越界时按默认比例（chunk_size 的 10%）重置：500 / 10 = 50。
         XCTAssertEqual(config.ragChunkOverlap, 50)
     }
@@ -639,11 +639,16 @@ final class ParserTests: XCTestCase {
         XCTAssertEqual(config.ragChunkOverlap, 80)
     }
 
-    /// 新默认值：nomic embedding、800/80 切片、检索 5 条与辅助模型精简区间。
+    /// 新默认值：jina-v3 MLX int4 + Matryoshka 256 + int8、800/80 切片等。
     func testConfigNewRAGDefaults() throws {
         let config = AgentConfig()
-        XCTAssertEqual(config.ragEmbeddingModel, "nomic-embed-text-v1.5-mlx-int8")
-        XCTAssertEqual(config.localEmbeddingModelPath, "models/nomic-embed-text-v1.5-mlx-int8")
+        XCTAssertEqual(config.ragEmbeddingModel, "jina-embeddings-v3-mlx-int4")
+        XCTAssertEqual(config.localEmbeddingModel, "jina-embeddings-v3-mlx-int4")
+        XCTAssertEqual(config.localEmbeddingModelPath, "models/jina-embeddings-v3-mlx-int4")
+        XCTAssertEqual(config.localEmbeddingBackend, "mlx")
+        XCTAssertEqual(config.ragMatryoshka, .auto)
+        XCTAssertEqual(config.ragMatryoshkaDim, 256)
+        XCTAssertEqual(config.ragVectorElementType, .int8)
         XCTAssertEqual(config.ragChunkSize, 800)
         XCTAssertEqual(config.ragChunkOverlap, 80)
         XCTAssertEqual(config.ragSearchMaxTotalChars, 12_000)
@@ -664,6 +669,26 @@ final class ParserTests: XCTestCase {
         XCTAssertEqual(loaded.ragSearchMaxTotalChars, 10_000)
         XCTAssertEqual(loaded.ragRerankThreshold, 0.55)
         XCTAssertEqual(loaded.export()["rag_aux_summarize_min_chars"] as? Int, 3_000)
+    }
+
+    /// 旧默认 nomic MLX int8 应迁移到 jina-v3 MLX int4，并把旧默认 512 维收口到 256。
+    func testConfigMigratesNomicEmbeddingDefaultToJinaV3() throws {
+        let path = directory.appendingPathComponent("config-embedding-migration.json")
+        let json = """
+        {"local_embedding_backend":"mlx",
+         "local_embedding_model":"nomic-embed-text-v1.5-mlx-int8",
+         "local_embedding_model_path":"models/nomic-embed-text-v1.5-mlx-int8",
+         "rag_embedding_model":"nomic-embed-text-v1.5-mlx-int8",
+         "rag_matryoshka_dim":512}
+        """
+        try json.write(to: path, atomically: true, encoding: .utf8)
+        let config = AgentConfig.load(path.path)
+
+        XCTAssertEqual(config.ragEmbeddingModel, "jina-embeddings-v3-mlx-int4")
+        XCTAssertEqual(config.localEmbeddingModel, "jina-embeddings-v3-mlx-int4")
+        XCTAssertEqual(config.localEmbeddingModelPath, "models/jina-embeddings-v3-mlx-int4")
+        XCTAssertEqual(config.ragMatryoshkaDim, 256)
+        XCTAssertEqual(config.ragVectorElementType, .int8)
     }
 
     /// 跨轮 KV/前缀复用开关：默认开启、可关闭，且写入导出字典。
@@ -690,16 +715,21 @@ final class ParserTests: XCTestCase {
         XCTAssertFalse(ChunkingOptions(config: config).enableSemantic)
     }
 
-    /// MLX buffer cache 上限：默认 512MB，旧配置里的超大值加载时压回 1GB。
+    /// MLX buffer cache 上限：默认 512MB，允许试到 2GB，超大值加载时压回 2GB。
     func testConfigClampsMLXCacheLimit() throws {
         XCTAssertEqual(AgentConfig().mlxCacheLimitMB, 512)
 
         let path = directory.appendingPathComponent("config-mlx-cache.json")
-        try #"{"mlx_cache_limit_mb":4096,"mlx_memory_limit_mb":0}"#
+        try #"{"mlx_cache_limit_mb":2048,"mlx_memory_limit_mb":0}"#
             .write(to: path, atomically: true, encoding: .utf8)
         var config = AgentConfig.load(path.path)
-        XCTAssertEqual(config.mlxCacheLimitMB, 1_024)
-        XCTAssertEqual(config.export()["mlx_cache_limit_mb"] as? Int, 1_024)
+        XCTAssertEqual(config.mlxCacheLimitMB, 2_048)
+        XCTAssertEqual(config.export()["mlx_cache_limit_mb"] as? Int, 2_048)
+
+        try #"{"mlx_cache_limit_mb":4096}"#
+            .write(to: path, atomically: true, encoding: .utf8)
+        config = AgentConfig.load(path.path)
+        XCTAssertEqual(config.mlxCacheLimitMB, 2_048)
 
         try #"{"mlx_cache_limit_mb":128}"#
             .write(to: path, atomically: true, encoding: .utf8)
@@ -887,9 +917,9 @@ final class ParserTests: XCTestCase {
         XCTAssertEqual(config.auxLocalLLMBackend, "mlx-lm")
         XCTAssertEqual(config.auxLocalLLMModel, "models/Qwen3.5-2B-MLX-4bit")
         XCTAssertEqual(config.localEmbeddingBackend, "mlx")
-        // 旧 fp16 MLX 路径统一迁移到新的默认 nomic int8 模型。
+        // 旧 fp16 MLX 路径统一迁移到新的默认 jina-v3 int4 模型。
         XCTAssertEqual(config.localEmbeddingModelPath,
-                       "models/nomic-embed-text-v1.5-mlx-int8")
+                       "models/jina-embeddings-v3-mlx-int4")
         XCTAssertEqual(config.localRerankerBackend, "mlx")
         XCTAssertEqual(config.localRerankerModelPath,
                        "models/bge-reranker-v2-m3-mlx-mxfp8")

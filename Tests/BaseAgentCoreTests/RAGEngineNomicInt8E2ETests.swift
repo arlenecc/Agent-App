@@ -6,12 +6,8 @@ import MLX
 /// 真实 nomic-int8 模型的端到端验证：入库 → int8 + Matryoshka 检索，
 /// 并与 fp32 全维（768）基线对比召回。
 ///
-/// 默认跳过；需要本地 `models/nomic-embed-text-v1.5-mlx-int8` 并设置
-/// `RAG_E2E=1`：
-///
-/// ```bash
-/// RAG_E2E=1 swift test --disable-sandbox --filter RAGEngineNomicInt8E2ETests
-/// ```
+/// 随普通 `swift test` 一起运行；本机缺少
+/// `models/nomic-embed-text-v1.5-mlx-int8` 时自动跳过。
 final class RAGEngineNomicInt8E2ETests: XCTestCase {
     private struct RecallCase {
         let query: String
@@ -79,8 +75,6 @@ final class RAGEngineNomicInt8E2ETests: XCTestCase {
     private var root: URL!
 
     override func setUpWithError() throws {
-        try XCTSkipUnless(ProcessInfo.processInfo.environment["RAG_E2E"] == "1",
-                          "未设置 RAG_E2E=1，跳过真实模型端到端验证")
         root = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("base-agent-rag-e2e-\(UUID().uuidString)")
         try FileManager.default.createDirectory(at: root, withIntermediateDirectories: true)
@@ -112,11 +106,17 @@ final class RAGEngineNomicInt8E2ETests: XCTestCase {
             }
         }
 
-        // 生产默认值：nomic-int8 / MLX / int8 / auto / 512 / 800 / 80。
+        // nomic 基准配置（生产默认已切到 jina-v3 / 256，这里显式固定
+        // nomic-int8 / MLX / int8 / auto / 512，保留原有对比基线）。
         var int8Config = AgentConfig()
         int8Config.workspace = root.path
         int8Config.knowledgeBase = kbInt8.path
         int8Config.ragRerankEnabled = false
+        int8Config.localEmbeddingBackend = "mlx"
+        int8Config.localEmbeddingModel = "nomic-embed-text-v1.5-mlx-int8"
+        int8Config.localEmbeddingModelPath = "models/nomic-embed-text-v1.5-mlx-int8"
+        int8Config.ragEmbeddingModel = "nomic-embed-text-v1.5-mlx-int8"
+        int8Config.ragMatryoshkaDim = 512
         XCTAssertEqual(int8Config.ragVectorElementType, .int8)
         XCTAssertEqual(int8Config.ragMatryoshka, .auto)
         XCTAssertEqual(int8Config.ragMatryoshkaDim, 512)
@@ -128,6 +128,7 @@ final class RAGEngineNomicInt8E2ETests: XCTestCase {
             "无法加载 \(int8Config.localEmbeddingModelPath)")
         XCTAssertTrue(provider.identifier.contains("nomic"), provider.identifier)
         XCTAssertEqual(provider.dimension, 768, "nomic 原生维度")
+        addTeardownBlock { await provider.unload() }
 
         // 两个引擎共用同一个底层 provider；Matryoshka 包装各自独立。
         let int8Engine = RAGEngine(config: int8Config, knowledgeBase: kbInt8.path,

@@ -2,8 +2,9 @@ import Foundation
 
 /// Matryoshka（俄罗斯套娃）截断策略。
 ///
-/// - `auto`：仅对已知支持该特性的模型启用（目前是 nomic）；
-/// - `on`：任何 embedding 都截断（截断维超过模型原生维时按原生维处理）；
+/// - `auto`：对已知支持该特性的模型启用（nomic、jina-embeddings-v3），
+///   截断维跟随设置中的下拉框（128 / 256 / 512）；
+/// - `on`：任何 embedding 都按配置维截断（超过原生维时按原生维处理）；
 /// - `off`：不截断。
 public enum MatryoshkaMode: String, CaseIterable, Sendable {
     case auto
@@ -12,7 +13,7 @@ public enum MatryoshkaMode: String, CaseIterable, Sendable {
 
     public var displayName: String {
         switch self {
-        case .auto: return "自动（nomic 启用）"
+        case .auto: return "自动（nomic / jina-v3 启用）"
         case .on: return "始终启用"
         case .off: return "关闭"
         }
@@ -23,8 +24,15 @@ public enum MatryoshkaMode: String, CaseIterable, Sendable {
         switch self {
         case .on: return true
         case .off: return false
-        case .auto: return identifier.lowercased().contains("nomic")
+        case .auto:
+            return identifier.lowercased().contains("nomic")
+                || JinaV3Profile.matches(identifier)
         }
+    }
+
+    /// 实际截断维：统一使用设置中的下拉框值（auto / on 均如此）。
+    func effectiveDimension(for identifier: String, configured: Int) -> Int {
+        configured
     }
 }
 
@@ -54,7 +62,8 @@ public final class MatryoshkaEmbedding: EmbeddingProvider, EmbeddingTokenCountin
                             mode: MatryoshkaMode,
                             dimension: Int) -> EmbeddingProvider {
         guard mode.enabled(for: base.identifier) else { return base }
-        let target = max(1, dimension)
+        let target = max(1, mode.effectiveDimension(
+            for: base.identifier, configured: dimension))
         guard target < base.dimension else {
             // 目标维不小于原生维：没有可截掉的部分，但若模型未归一则仍需
             // 一个归一化步骤；底层 provider 都保证归一化，这里直接复用。

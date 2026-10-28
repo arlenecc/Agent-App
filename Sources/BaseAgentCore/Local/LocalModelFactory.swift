@@ -46,9 +46,10 @@ public final class LocalModelFactory: @unchecked Sendable {
     }
 
     /// 设置 MLX buffer cache 上限（MB）。只限制空闲 buffer，不限制权重与 KV。
-    /// 上限 1GB：再大只是多留可复用 buffer，收益有限却会抬高常驻 footprint。
+    /// 允许试到 2GB；实测 embedding 的复用 buffer 工作集约 1.2GB，1GB 已接近
+    /// 上限，2GB 基本没有额外提速，只是多留空闲 buffer。
     public func setCacheLimitMB(_ megabytes: Int) {
-        let clamped = max(256, min(1_024, megabytes))
+        let clamped = max(256, min(2_048, megabytes))
         MLX.Memory.cacheLimit = clamped * 1_024 * 1_024
     }
 
@@ -147,13 +148,13 @@ public final class LocalModelFactory: @unchecked Sendable {
         let name = config.localEmbeddingModel.isEmpty
             ? config.ragEmbeddingModel
             : config.localEmbeddingModel
-        // MLX 后端默认用独立的 MLX 权重目录名（nomic-embed-text-v1.5 int8，
-        // 768 维、8192 窗口、支持 Matryoshka 截断），与 ONNX 量化名区分；
+        // MLX 后端默认用独立的 MLX 权重目录名（jina-embeddings-v3 int4 混合量化，
+        // 1024 维、8192 窗口、支持 Matryoshka 截断），与 ONNX 量化名区分；
         // 显式配置了 local_embedding_model / _path 时以用户配置为准。
         let effectiveName = (backend == "mlx"
                              && config.localEmbeddingModel.isEmpty
                              && config.localEmbeddingModelPath.isEmpty)
-            ? "nomic-embed-text-v1.5-mlx-int8"
+            ? "jina-embeddings-v3-mlx-int4"
             : name
         let value = config.localEmbeddingModelPath.isEmpty
             ? effectiveName
@@ -192,7 +193,13 @@ public final class LocalModelFactory: @unchecked Sendable {
             // 实测多实例只是共享同一块 GPU，吞吐无收益且内存翻倍，
             // 因此固定单实例；并发由 AdaptiveEmbeddingScheduler 串行。
             return embeddings.value(for: key) {
-                MLXEmbeddingProvider(directory: directory, modelName: value)
+                // jina-v3-mlx 不在 MLXEmbedders 的工厂里，走自定义架构
+                //（RoPE + task LoRA + 混合量化）。
+                if JinaV3Profile.isJinaV3(directory: directory) {
+                    return JinaV3MLXEmbeddingProvider(
+                        directory: directory, modelName: value)
+                }
+                return MLXEmbeddingProvider(directory: directory, modelName: value)
             }
         }
         return embeddings.value(for: key) {

@@ -61,8 +61,8 @@ struct SettingsView: View {
 
     @State private var workspace = ""
     @State private var knowledgeBase = ""
-    @State private var embeddingBackend = "onnx"
-    @State private var embeddingPath = ""
+    @State private var embeddingBackend = "mlx"
+    @State private var embeddingPath = "models/jina-embeddings-v3-mlx-int4"
     @State private var rerankerBackend = "onnx"
     @State private var rerankerPath = ""
     /// 当前 Embedding 后端下「切片实际生效值」的 token 上限（nil = 无精确换算）。
@@ -82,7 +82,7 @@ struct SettingsView: View {
     /// 向量落盘元素类型与 Matryoshka 截断策略。
     @State private var vectorElementType: VectorElementType = .int8
     @State private var matryoshkaMode: MatryoshkaMode = .auto
-    @State private var matryoshkaDim = 512
+    @State private var matryoshkaDim = 256
     /// ANN 检索开关与同步后自动构建。
     @State private var annEnabled = true
     @State private var annAutoBuild = true
@@ -743,10 +743,10 @@ struct SettingsView: View {
             Stepper("切片大小：\(chunkSize) token", value: $chunkSize,
                     in: 100...4000, step: 50)
                 .help("含 overlap 的总预算，全链路（切分、入库、检索呈现）统一按它计算；"
-                    + "超过 embedding 模型输入窗口时会自动压到窗口上限。"
-                    + "纯中文约 1 字 ≈ 1 token，中英混排约 1.8 字符/token")
+                    + "超过 embedding 推理输入上限（1024 token，模型窗口更小时取更小值）"
+                    + "会自动压到该上限。纯中文约 1 字 ≈ 1 token，中英混排约 1.8 字符/token")
             if let limit = embeddingContentLimit, chunkSize > limit {
-                Text("实际生效：\(limit) token（受 embedding 模型输入窗口限制）")
+                Text("实际生效：\(limit) token（受 embedding 推理输入上限限制）")
                     .font(.caption2)
                     .foregroundStyle(.orange)
             }
@@ -792,9 +792,10 @@ struct SettingsView: View {
                 + "实测 4 路已接近吞吐拐点，再多不一定更快")
         Stepper("MLX 缓存：\(mlxCacheLimitMB)MB",
                 value: $mlxCacheLimitMB,
-                in: 256...1_024, step: 128)
+                in: 256...2_048, step: 128)
             .help("MLX 可复用 buffer 的上限，默认 512MB；"
-                + "运行时夹在 256...1024，只影响空闲缓存，不含模型权重与 KV")
+                + "运行时夹在 256...2048，只影响空闲缓存，不含模型权重与 KV。"
+                + "实测 1GB 已接近 embedding 工作集，2GB 基本没有额外提速")
         Stepper("MLX 上限：\(mlxMemoryLimitText)",
                 value: $mlxMemoryLimitMB,
                 in: 0...32_768, step: 512)
@@ -880,7 +881,7 @@ struct SettingsView: View {
         .labelsHidden()
         .frame(width: 135)
         .help("截断向量后强制重新归一化，入库与查询使用同一套变换。"
-            + "自动模式只对 nomic 等已知支持该特性的模型启用。")
+            + "自动模式只对 nomic / jina-v3 等已知支持该特性的模型启用。")
         Picker("", selection: $matryoshkaDim) {
             Text("128 维").tag(128)
             Text("256 维").tag(256)
@@ -889,7 +890,8 @@ struct SettingsView: View {
         .labelsHidden()
         .frame(width: 90)
         .disabled(matryoshkaMode == .off)
-        .help("Matryoshka 截断维：越小向量库越小、召回精度越低；默认 512。")
+        .help("Matryoshka 截断维：越小向量库越小、召回精度越低；默认 256。"
+            + "nomic / jina-v3 在自动模式下都按此维度截断。")
     }
 
     @ViewBuilder
@@ -1353,7 +1355,7 @@ struct SettingsView: View {
         config.repetitionPenalty = max(0, mainRepetitionPenalty)
         config.requestTimeout = max(10, mainTimeout)
         config.maxIterations = min(max(1, maxIterations), 50)
-        config.mlxCacheLimitMB = min(max(256, mlxCacheLimitMB), 1_024)
+        config.mlxCacheLimitMB = min(max(256, mlxCacheLimitMB), 2_048)
         config.mlxMemoryLimitMB = max(0, mlxMemoryLimitMB)
         config.promptBatchSize = max(0, mainPromptBatch)
         config.localLLMEnableThinking = mainThinking
@@ -1392,7 +1394,7 @@ struct SettingsView: View {
         config.localEmbeddingBackend = eb
         config.localEmbeddingModelPath = embeddingPath.trimmingCharacters(in: .whitespacesAndNewlines)
         // 模型名不再由用户编辑：填了本地路径时从目录名派生；
-        // 未填路径则保留配置文件里的既有名字（默认 8bit nomic）。
+        // 未填路径则保留配置文件里的既有名字（默认 jina-v3 int4）。
         if !config.localEmbeddingModelPath.isEmpty {
             let derived = URL(fileURLWithPath: config.localEmbeddingModelPath).lastPathComponent
             config.localEmbeddingModel = derived
@@ -1434,7 +1436,7 @@ struct SettingsView: View {
         config.ragVisionConcurrency = min(max(1, visionConcurrency), 8)
         config.ragVectorElementType = vectorElementType
         config.ragMatryoshka = matryoshkaMode
-        config.ragMatryoshkaDim = [128, 256, 512].contains(matryoshkaDim) ? matryoshkaDim : 512
+        config.ragMatryoshkaDim = [128, 256, 512].contains(matryoshkaDim) ? matryoshkaDim : 256
         config.ragANNEnabled = annEnabled
         config.ragANNAutoBuild = annAutoBuild
         config.ragEmbeddingMaxBatch = min(max(2, embeddingMaxBatch), 256)

@@ -273,7 +273,7 @@ public final class RAGEngine {
         self.manifestStore = ManifestStore(
             path: (self.ragDir as NSString).appendingPathComponent("manifest.json")
         )
-        // Matryoshka：nomic 等支持俄罗斯套娃的模型先截断、再重新归一化。
+        // Matryoshka：nomic / jina-v3 等支持俄罗斯套娃的模型先截断、再重新归一化。
         // 入库与查询必须共用同一实例，保证两侧变换完全一致。
         let baseEmbedding = embedding ?? LocalModelFactory.shared.makeEmbedding(config: config)
         self.embedding = baseEmbedding.map {

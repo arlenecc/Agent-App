@@ -11,7 +11,7 @@ public enum VectorElementType: String, CaseIterable, Sendable {
     case fp16
     case bin
 
-    /// 默认元素类型：int8（512 维每行 512B，是 fp32 的 1/4）。
+    /// 默认元素类型：int8（默认模型截断到 256 维，每行 256B，是 fp32 的 1/4）。
     public static let defaultValue: VectorElementType = .int8
 
     public var isSupported: Bool { self != .fp16 }

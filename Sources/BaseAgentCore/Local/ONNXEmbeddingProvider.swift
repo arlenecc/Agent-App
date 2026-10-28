@@ -1,8 +1,8 @@
 import Foundation
 
-/// nomic-embed-text-v1.5 的 ONNX 实现。
+/// 本地 ONNX Embedding 实现。
 ///
-/// - document 输入统一加 `search_document: ` 前缀，query 加 `search_query: ` 前缀；
+/// - 输入前缀按模型族统一处理（`EmbeddingPrefixStrategy`）；
 /// - 输出做 attention-mask 加权 mean pooling，再 L2 归一化；
 /// - 按子批执行，避免长文本批量推理一次性占用过多内存。
 public final class ONNXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCounting, @unchecked Sendable {
@@ -14,12 +14,14 @@ public final class ONNXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCount
     private let preflightError: Error?
     private let maxLength: Int
     private let batchSize: Int
+    let prefixStrategy: EmbeddingPrefixStrategy
+    private let isJinaV3: Bool
     private let state = EmbeddingLoadState()
 
     private let dimensionLock = NSLock()
     private var storedDimension = 768
 
-    /// nomic 的标准输出维度；实际值会在首次推理后按输出张量更新。
+    /// 标准输出维度；实际值会在首次推理后按输出张量更新。
     public var dimension: Int {
         dimensionLock.lock()
         defer { dimensionLock.unlock() }
@@ -30,15 +32,22 @@ public final class ONNXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCount
     /// 覆盖多文件并发 + 语义切片同时请求 embedding 的场景。
     public var maxConcurrentRuns: Int { 2 }
 
-    private static let documentPrefix = "search_document: "
-    private static let queryPrefix = "search_query: "
-
     public init(directory: URL, modelName: String, batchSize: Int = 32) {
         self.directory = directory
         self.modelName = modelName
         self.identifier = "local:onnx:\(modelName)"
-        self.maxLength = LocalModelRegistry.resolveMaxSequenceLength(directory: directory, defaultValue: 8192)
+        // 模型窗口可能很大（jina-v3 8192），推理前统一压到 1024 token。
+        self.maxLength = EmbeddingInputLimits.cappedWindow(
+            LocalModelRegistry.resolveMaxSequenceLength(directory: directory, defaultValue: 8192))
         self.batchSize = max(1, batchSize)
+        let isJina = JinaV3Profile.isJinaV3(directory: directory)
+        self.isJinaV3 = isJina
+        // config 已认出 jina-v3 时固定用 passage: / query: 前缀，
+        // 避免权重目录被改名后前缀族退化成 generic。
+        self.prefixStrategy = isJina
+            ? EmbeddingPrefixStrategy(family: .jina)
+            : EmbeddingPrefixStrategy(
+                modelName: modelName, modelPath: directory.lastPathComponent)
 
         var resolved: URL?
         var loadError: Error?
@@ -51,6 +60,10 @@ public final class ONNXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCount
         self.preflightError = loadError
 
         // 从 config.json 预读真实维度，避免非 768 模型建库时维度错配。
+        // Jina v3 的 ONNX config 没有 hidden_size，按模型族固定 1024。
+        if isJinaV3 {
+            self.storedDimension = JinaV3Profile.nativeDimension
+        }
         if let data = FileManager.default.contents(atPath: directory.appendingPathComponent("config.json").path),
            let config = JSONValue.parse(String(decoding: data, as: UTF8.self))?.objectValue {
             let hidden = config["hidden_size"]?.intValue
@@ -65,18 +78,22 @@ public final class ONNXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCount
 
     public func embedDocuments(_ texts: [String]) async throws -> [[Float]] {
         guard !texts.isEmpty else { return [] }
-        let prefixed = texts.map { addPrefix($0, prefix: Self.documentPrefix) }
-        return try await embed(prefixed)
+        let prefixed = texts.map {
+            prefixStrategy.apply($0, task: .retrievalDocument)
+        }
+        return try await embed(prefixed, task: .retrievalDocument)
     }
 
     public func embedQuery(_ text: String) async throws -> [Float] {
-        let result = try await embed([addPrefix(text, prefix: Self.queryPrefix)])
+        let result = try await embed([
+            prefixStrategy.apply(text, task: .retrievalQuery)
+        ], task: .retrievalQuery)
         return result.first ?? []
     }
 
     // MARK: - 推理
 
-    private func embed(_ texts: [String]) async throws -> [[Float]] {
+    private func embed(_ texts: [String], task: EmbeddingTask) async throws -> [[Float]] {
         if let preflightError { throw preflightError }
         guard let modelURL else {
             throw LocalModelError.runtime("Embedding 模型路径未解析：\(directory.path)")
@@ -96,7 +113,8 @@ public final class ONNXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCount
             let end = min(start + batchSize, texts.count)
             let batch = Array(texts[start..<end])
             let encoded = tokenizer.encodeBatch(batch, maxLength: maxLength)
-            let inputs = try makeInputs(encoded, inputNames: session.inputNames)
+            let inputs = try makeInputs(
+                encoded, inputNames: session.inputNames, task: task)
             let outputs = try session.run(inputs: inputs, outputNames: [outputName])
             guard let output = outputs[outputName] else {
                 throw ONNXRuntimeError.output("模型没有返回输出 \(outputName)")
@@ -110,7 +128,8 @@ public final class ONNXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCount
 
     private func makeInputs(
         _ encoded: TokenizedBatch,
-        inputNames: [String]
+        inputNames: [String],
+        task: EmbeddingTask
     ) throws -> [String: OrtValue] {
         let batch = encoded.batchSize
         let length = encoded.sequenceLength
@@ -134,6 +153,13 @@ public final class ONNXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCount
                     int64: Self.positionIDs(mask: encoded.attentionMask),
                     shape: [batch, length]
                 )
+            case "task_id":
+                // Jina v3 unified ONNX：0=retrieval.query，1=retrieval.passage；
+                // 图声明为标量 int64（shape []）。
+                let id = isJinaV3
+                    ? JinaV3Task.id(for: task)
+                    : (task == .retrievalQuery ? 0 : 1)
+                inputs[name] = try OrtValue(int64: [id], shape: [])
             default:
                 throw ONNXRuntimeError.input("Embedding 模型要求未知输入 `\(name)`，当前封装未实现")
             }
@@ -203,10 +229,6 @@ public final class ONNXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCount
         return session.outputNames[0]
     }
 
-    private func addPrefix(_ text: String, prefix: String) -> String {
-        text.hasPrefix(prefix) ? text : prefix + text
-    }
-
     private func updateDimension(_ value: Int) {
         guard value > 0 else { return }
         dimensionLock.lock()
@@ -249,17 +271,21 @@ public final class ONNXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCount
         await state.unload()
     }
 
-    /// 单条输入上限：窗口减去 [CLS]/[SEP] 与 `search_document:` 前缀（约 4 token）。
+    /// 单条输入上限：窗口减去 [CLS]/[SEP] 与当前模型族 document 前缀的预留。
     public var maxContentTokens: Int {
-        Self.contentTokenLimit(directory: directory)
+        Self.contentTokenLimit(directory: directory, modelName: modelName)
     }
 
     /// 与 `maxContentTokens` 同源的静态换算：设置界面不加载权重也能算出
     /// 「切片大小实际生效值」，两处口径不会漂移。
-    public static func contentTokenLimit(directory: URL) -> Int {
-        let window = LocalModelRegistry.resolveMaxSequenceLength(
-            directory: directory, defaultValue: 8_192)
-        return max(16, window - 2 - 8)
+    public static func contentTokenLimit(directory: URL, modelName: String) -> Int {
+        let window = EmbeddingInputLimits.cappedWindow(
+            LocalModelRegistry.resolveMaxSequenceLength(
+                directory: directory, defaultValue: 8_192))
+        let reserve = EmbeddingPrefixStrategy(
+            modelName: modelName,
+            modelPath: directory.lastPathComponent).documentPrefixTokenReserve
+        return max(16, window - 2 - reserve)
     }
 
     /// 切片用的精确 token 计数（不含特殊 token）：只加载 tokenizer，不牵动模型权重。

@@ -92,14 +92,20 @@ final class ChunkParameterConsistencyTests: XCTestCase {
         // GGUF 后端原先在 embed() 里静默 prefix(2046)：切片环节不知情，
         // 长切片的尾部会被模型丢掉。现在必须显式声明窗口。
         XCTAssertEqual(LlamaCppEmbeddingProvider.contentTokenLimit,
-                       LlamaCppEmbeddingProvider.contextWindow - 2)
+                       EmbeddingInputLimits.maxTokens - 2,
+                       "2048 上下文在推理前压到 1024 token，再扣 BOS/EOS")
         XCTAssertGreaterThan(LlamaCppEmbeddingProvider.contentTokenLimit, 1_000,
-                             "2048 上下文的容量应完整暴露给切片环节")
+                             "压到 1024 后仍应保留足够的长切片预算")
 
-        // 建实例不加载权重：maxContentTokens 必须与静态换算一致。
+        // 建实例不加载权重：maxContentTokens 必须与静态换算一致，
+        // 并扣除 nomic 的 document 前缀预留。
         let provider = LlamaCppEmbeddingProvider(modelPath: "/tmp/not-loaded.gguf",
                                                  modelName: "nomic-embed-text-v1.5")
-        XCTAssertEqual(provider.maxContentTokens, LlamaCppEmbeddingProvider.contentTokenLimit)
+        let reserve = EmbeddingPrefixStrategy(modelName: "nomic-embed-text-v1.5")
+            .documentPrefixTokenReserve
+        XCTAssertEqual(reserve, 8)
+        XCTAssertEqual(provider.maxContentTokens,
+                       LlamaCppEmbeddingProvider.contentTokenLimit - reserve)
     }
 
     func testAgentRebuildKeysSeparateLLMOnlyChanges() {

@@ -32,7 +32,7 @@ swift run BaseAgent
 swift test --disable-sandbox
 ```
 
-测试覆盖（共 211 个 XCTest，15 个需要模型/网络环境而默认跳过）：sqlite-vec 事务写入/回滚、两段式 KNN、FTS5 中文分词、RRF 混合检索、RAG 增量/删除清理、重排序 TopN 决定最终条数（关闭时回到调用方 top_k）、EPUB/DOCX/HTML 解析、扫描版 EPUB 归一化 + OCR、PDF 文本层、Ovis 文本页快路径、NaturalLanguage 切片、切片参数一致性（模型窗口收口、检索呈现上限随切片放大、切片参数变化触发重建）、配置迁移与旧键兼容（含 `auto_preload_main` / `aux_enabled` 默认值、主/辅助 KV 复用与量化键的缺省跟随与读写往返）、Agent 工具循环、ask_user 续跑、checkpoint 同步、code_run 写护栏、L3 去重、大纲围栏，以及摘要溢出保留、代码围栏/中文换行/正文数字保留、技能索引入口回退、空库维度自愈、`models/` 相对路径解析，以及 KV 复用增量与完整 prompt 的逐 token 模板对齐、预热前缀对齐、清空对话时失效 KV cache；GGUF 模型路径/mmproj 解析、进程内 llama.cpp 框架加载、ONNX 缺少权重时的明确报错，合成 ONNX decoder 图的 past/present 管线，简单 HTML 表格转 Markdown、复杂表格保留 HTML、Markdown 语法/缩进保留、纯文本 HTML/实体/噪声清理、空行与空格密度压缩、跨目录副本与 content_hash 去重、手动向量去重保留最早入库切片并写副本 tombstone，以及切片缺失/旧版 manifest/失败页文件的增量重建，以及真实 nomic-int8 模型下的入库与 int8 + Matryoshka 语义召回（与 fp32 全维基线对比）。
+测试覆盖（共 274 个 XCTest；真实模型 E2E 在本地权重存在时随每次测试自动运行，缺少权重或需要外网/GGUF 等环境的用例会跳过）：sqlite-vec 事务写入/回滚、两段式 KNN、FTS5 中文分词、RRF 混合检索、RAG 增量/删除清理、重排序 TopN 决定最终条数（关闭时回到调用方 top_k）、EPUB/DOCX/HTML 解析、扫描版 EPUB 归一化 + OCR、PDF 文本层、Ovis 文本页快路径、NaturalLanguage 切片、切片参数一致性（模型窗口收口、检索呈现上限随切片放大、切片参数变化触发重建）、配置迁移与旧键兼容（含 `auto_preload_main` / `aux_enabled` 默认值、主/辅助 KV 复用与量化键的缺省跟随与读写往返）、Agent 工具循环、ask_user 续跑、checkpoint 同步、code_run 写护栏、L3 去重、大纲围栏，以及摘要溢出保留、代码围栏/中文换行/正文数字保留、技能索引入口回退、空库维度自愈、`models/` 相对路径解析，以及 KV 复用增量与完整 prompt 的逐 token 模板对齐、预热前缀对齐、清空对话时失效 KV cache；GGUF 模型路径/mmproj 解析、进程内 llama.cpp 框架加载、ONNX 缺少权重时的明确报错，合成 ONNX decoder 图的 past/present 管线，简单 HTML 表格转 Markdown、复杂表格保留 HTML、Markdown 语法/缩进保留、纯文本 HTML/实体/噪声清理、空行与空格密度压缩、跨目录副本与 content_hash 去重、手动向量去重保留最早入库切片并写副本 tombstone，以及切片缺失/旧版 manifest/失败页文件的增量重建。每次普通测试都会执行真实模型链路：jina-v3 的切片 → embedding → 256 维 Matryoshka 截断 → 重新归一化 → int8 入库（256B/行）→ 查询 top1；以及 nomic-int8 的 int8 + Matryoshka 512 召回与 fp32 全维（768）基线对比。
 
 HTML 与 Office 解析另有专项覆盖：HTML 保存页的本地 iframe / frameset 接力（取正文最多的一份）、big5 等老编码嗅探、依赖 JavaScript 的页面给出明确失败原因、含 `h1` 的 `<header>` 保留、裸文本节点与 `<li>` 内块级元素、结构化清洗档保留 URL/IP 与段落空行；DOCX 编号列表与 `w:br`/`xml:space`、脚注编号与末尾列表、`styles.xml` 样式名解析标题；XLSX 日期与百分比格式、注音跳过、多行单元格不拆表；PPTX 演讲者备注与段内换行。独立 Markdown 转换另覆盖单文件输出、目录相对结构、同名后缀、单文件失败不中断整批、输出目录跳过与不支持格式拒绝。
 
@@ -89,7 +89,7 @@ HTML 与 Office 解析另有专项覆盖：HTML 保存页的本地 iframe / fram
 - MCP stdio 客户端：启动串行化；`shutdown()` 后不会被 `callTool` 复活；接收缓冲有界；服务端 `tools/list_changed` 会同步更新工具注册表与 schema 缓存。
 - `AtomicFile` 使用同目录临时文件 + 原子替换，不再「先删旧再 move」。
 - 所有 `URLSession`（OpenAI/Web/MCP 之外的 HTTP 工具）在 Agent 关闭或配置切换时 `invalidateAndCancel`。
-- MLX 缓存上限显式压到 1GB；配置切换时清理模型实例缓存，避免旧权重常驻。卸载/切换路径不再同步调用 `MLX.Memory.clearCache()`，防止与仍在 GPU 线程执行的 `asyncEval` 并发释放 command encoder 导致 SIGSEGV。
+- MLX 空闲 buffer cache 上限夹在 256MB...2GB（`mlx_cache_limit_mb`，默认 512MB）；实测 jina-v3 embedding 的复用 buffer 工作集约 1.27GB，1GB 已能覆盖，2GB 不会带来额外提速，只是多留空闲缓存。配置切换时清理模型实例缓存，避免旧权重常驻。卸载/切换路径不再同步调用 `MLX.Memory.clearCache()`，防止与仍在 GPU 线程执行的 `asyncEval` 并发释放 command encoder 导致 SIGSEGV。
 - SQLite 事务只在 COMMIT/RELEASE 成功后递减嵌套深度，提交失败也保持深度非负，避免后续事务被误判为 savepoint。
 - 流式回复每 50ms 合并一次；内容更新时滚动不再逐帧动画，日志窗口复用同一个 `DateFormatter`，长会话下重绘更稳定。
 - LLM 流带 200ms 取消看门狗：服务端静默时用户点「终止」也能立即退出，不必等到请求超时。
@@ -124,7 +124,7 @@ OvisOCR2 的 MLX 权重使用 `model_type=qwen3_5`（Qwen3.5-0.8B 后训练）�
 3. 递归回退：段落 → 换行 → 句号 → 空格 → token 窗口，严格遵守 token 预算；
 4. 块间按 token 数添加 overlap（计入总预算）。
 
-默认 `chunk_size=800 token`、`overlap=80 token`（10%，含在 800 内）。同步时优先用模型自带 `tokenizer.json` 做精确计数（不含特殊 token），分词器不可用时退回标定过的保守估算器（`EmbeddingTokenEstimator`）：纯中文约 1 字 ≈ 1 token，中英混排约 1.8 字符/token，英文约 3.5 字符/token；因此 800 token 大致对应 800 字中文或 1000–1400 字混排。默认 nomic-embed-text-v1.5 的有效窗口为 8192 token，800 token 不会被截断；若把切片大小调到超过当前模型窗口（如改用 bge 等 512 窗口模型），同步时会自动压到窗口上限，overlap 同步压到上限的 10%，设置面板会显示「实际生效：N token」。所有切分路径都在句子结束处断开；旧配置里的默认 500/50 会在加载时自动迁移到 800/80，自定义组合保持不变。
+默认 `chunk_size=800 token`、`overlap=80 token`（10%，含在 800 内）。同步时优先用模型自带 `tokenizer.json` 做精确计数（不含特殊 token），分词器不可用时退回标定过的保守估算器（`EmbeddingTokenEstimator`）：纯中文约 1 字 ≈ 1 token，中英混排约 1.8 字符/token，英文约 3.5 字符/token；因此 800 token 大致对应 800 字中文或 1000–1400 字混排。默认 jina-embeddings-v3 声明窗口为 8192 token，但 embedding 推理前会统一压到 1024 token，默认 800 token 的切片完整计算、不会被截断；若把切片大小调到超过推理输入上限（1024 token，或改用 bge 等更小的 512 窗口模型），同步时会自动压到该上限，overlap 同步压到上限的 10%，设置面板会显示「实际生效：N token」。所有切分路径都在句子结束处断开；旧配置里的默认 500/50 会在加载时自动迁移到 800/80，自定义组合保持不变。
 
 切片参数（大小 / overlap / 语义切片开关）只有设置面板一个来源，控件就排在「知识同步配置」的 Embedding 行里（模型类型 / 本地路径之后、「应用配置」之前）：切片环节统一读 `RAGEngine.resolvedChunkingOptions`，检索呈现的单条上限取 `max(配置值, 切片 token × 1.5 + 64)`（不再固定 1500 字符截短），而切片参数、embedding 后端与目录都进 manifest 的 ingest 签名，改任一项都会逐文件重建；「加载主/辅助模型」按钮在白名单（仅 LLM 参数）之外的配置有变化时会走完整 `applyConfig` 重建 Agent 与 RAGEngine，不会出现面板改了切片、运行时仍按旧快照切片。中途停止后已完成的文件保留，下次从剩余文件继续。
 
@@ -142,8 +142,8 @@ OvisOCR2 的 MLX 权重使用 `model_type=qwen3_5`（Qwen3.5-0.8B 后训练）�
 - **两段式 KNN**：先查 `chunk_vectors` 拿 rowid，再回 `chunks` 按 rowid 取正文，绝不 JOIN 虚拟表；
 - **过滤**：不依赖虚拟表过滤，统一 over-fetch 后在第二阶段过滤；定向检索自动放大召回；
 - **混合检索**：FTS5（预分词，含 CJK bigram） + 向量，RRF 融合；
-- **向量元素类型**：`rag_vector_element_type` 支持 int8（默认，512 维 512B/行）/ fp32 / bin（512 维 64B/行，汉明距离）；fp16 因 sqlite-vec 0.1.9 不支持，会在打开向量库时明确报错。int8 用对称量化 `round(x×127)`，入库与查询都包 `vec_int8(?)`；bin 用符号位 + LSB-first 位图，查询包 `vec_bit(?)`；
-- **nomic Matryoshka**：默认 `rag_matryoshka=auto`（仅 nomic 启用）、`rag_matryoshka_dim=512`；先截断到前 N 维，**强制重新归一化**，再按元素类型量化入库；查询侧执行完全相同的变换；
+- **向量元素类型**：`rag_vector_element_type` 支持 int8（默认，256 维 256B/行）/ fp32 / bin（256 维 32B/行，汉明距离）；fp16 因 sqlite-vec 0.1.9 不支持，会在打开向量库时明确报错。int8 用对称量化 `round(x×127)`，入库与查询都包 `vec_int8(?)`；bin 用符号位 + LSB-first 位图，查询包 `vec_bit(?)`；
+- **Matryoshka**：默认 `rag_matryoshka=auto`（nomic / jina-embeddings-v3 启用）；两者都使用 `rag_matryoshka_dim`（默认 256，可选 128 / 256 / 512）指定的截断维；先截断，**强制重新归一化**，再按元素类型量化入库；查询侧执行完全相同的变换；
 - sqlite-vec 静态编入进程（`SQLITE_CORE` 模式），无需安装扩展；若初始化失败则显式退化为精确余弦扫描，并在 `rag_status` 中标注。
 
 向量维度、元素类型与索引指纹（`embedding.identifier | dimension | matryoshkaDim | elementType`）写入 `meta`。配置变化时不再自动清空旧索引：非空库标记待重建，向量检索暂停、同步拒绝写入、全文检索仍可用，用户在设置面板执行「重建向量库」后才清空并按当前配置全量重新同步；空库直接采纳新配置。若向量库被删除但 manifest 残留，同步会自动识别并全量重建。空库遇到首次推理才发现的真实维度时会按实际输出维度重建。
@@ -163,6 +163,8 @@ manifest 条目同时记录 `chunkCount` 与 `complete`：增量跳过前会校�
   - GGUF：`LlamaCppLLMService` / `LlamaCppVLMService` 在进程内直接加载权重（Metal GPU offload、Jinja chat template、工具调用、mtmd 多模态），不启动 `llama-server`；Embedding 使用 pooled embedding，Reranker 要求 RANK pooling；
   - ONNX LLM：`ONNXLLMService` 用 onnxruntime-swift 直接运行 decoder 图（`input_ids` / `attention_mask` / `position_ids` + `past_key_values`），支持流式生成与工具调用；ONNX VLM 因缺少通用图适配暂未接入，会明确报错而不是回退 Python。
 - Embedding / Reranker：**onnxruntime-swift**（`OnnxRuntimeBindings`）+ `onnxruntime-swift-package-manager`，或 **mlx-swift-lm** 的 `MLXEmbedders` / `MLXRerankers`，或 GGUF（llama.cpp pooled embedding / RANK pooling）。类型支持 ONNX / FastEmbed / MLX / GGUF。
+  - jina-embeddings-v3：MLX unified 权重（RoPE + task LoRA）不在 `MLXEmbedders` 默认工厂中，由 `JinaV3MLXModel` 直接读取 `weights.safetensors` 推理；ONNX 单文件用标量 `task_id` 选择任务。两类后端统一加 `passage: ` / `query: ` 前缀，文档切片用 `retrieval.passage`（task_id=1），检索用 `retrieval.query`（task_id=0）。
+  - **输入上限 1024 token**：模型声明窗口（jina-v3 8192、GGUF 2048）远大于默认 800 token 的切片，所有本地 embedding 后端在推理前都统一压到 1024 token（含特殊 token；模型窗口更小时按更小值），切片收口也读同一上限，避免为用不到的窗口容量做无效计算。
 - Tokenizer：**swift-transformers** 的 `Tokenizers` 模块，读取模型目录内 `tokenizer.json`。
 - OpenAI 兼容 SSE 按事件边界聚合多行 `data:`（服务端把 JSON 拆成多行时不会丢增量），并忽略注释/心跳行。
 - 本地 MLX 的 `maxTokens` 会按「contextWindow - prompt 估算」动态收紧；文本兜底工具调用只接受本次请求声明过的工具名。
@@ -171,10 +173,10 @@ manifest 条目同时记录 `chunkCount` 与 `complete`：增量跳过前会校�
 - **重建前缀复用**：历史折叠、raw 窗口滑动、rollback 导致消息前缀变化时，从预热时保留的 system+tools 快照复制 KV cache，只 prefill 动态历史；system 前缀不再重复计算。实测 5471-token 重建从约 34s 降到 5.3s（805 token），另一次 626-token 重建约 4.1s。
 - **prefill 批量**：`prompt_batch_size` / `aux_prompt_batch_size`（默认 512，最小 64）映射到 `PrefillParameters.stepSize`，用于控制长 prompt prefill 每次前向的 token 数；调大通常能提高吞吐，但会占用更多内存。配置窗口的 `batch` 字段与 JSON 键一一对应。
 - **投机解码**：当前主/辅模型均为 Qwen3.5 hybrid（GDN/Mamba 层），`MambaCache.isTrimmable == false`，mlx-swift-lm 的 `SpeculativeTokenIterator` 会在初始化时直接拒绝；两个模型的实际权重中也没有 MTP 头（config 虽写 `mtp_num_hidden_layers=1`，safetensors 中 `mtp` key 为 0），因此无法复用辅助模型起草。若后续换成全注意力、缓存可裁剪且共享 tokenizer 的主/辅模型，可再接入该路径。
-- **内存上限**：`mlx_memory_limit_mb`（默认 0 = min(物理内存 65%, 9.6GB)）是 MLX 权重+KV+buffer 的总闸门；`mlx_cache_limit_mb`（默认 512，运行时上限 1024）只限制 MLX 空闲 buffer。主模型 `kv_cache_max_tokens`（默认 32768，约 1GB KV）和辅助模型 `aux_kv_cache_max_tokens`（默认 16384，约 200MB）是 KV 硬上限，实际上下文取 `min(配置上下文, 上限)`，内核预算同步收紧。完整 prompt 超过预算时明确报错，不会继续分配 KV。辅助模型默认（`aux_llm_kv_reuse=false`）每次后台摘要/事实抽取后立即失效 KV，开启复用后改为保留前缀缓存跨调用复用；主模型 `llm_kv_reuse` 与辅助模型的复用/量化开关各自独立，量化默认都开（KV 内存约减半）。预热前缀快照只在 ≤8192 token 时保留。RAG 检索 `topK` 封顶 20，避免 reranker 批量被模型参数放大。
+- **内存上限**：`mlx_memory_limit_mb`（默认 0 = min(物理内存 65%, 9.6GB)）是 MLX 权重+KV+buffer 的总闸门；`mlx_cache_limit_mb`（默认 512，运行时夹在 256...2048）只限制 MLX 空闲 buffer；实测 8×784-token 的 jina-v3 embedding 批在 1GB 与 2GB 下耗时基本一致（cache 占用 995MB / 1266MB），512MB 则明显偏小。主模型 `kv_cache_max_tokens`（默认 32768，约 1GB KV）和辅助模型 `aux_kv_cache_max_tokens`（默认 16384，约 200MB）是 KV 硬上限，实际上下文取 `min(配置上下文, 上限)`，内核预算同步收紧。完整 prompt 超过预算时明确报错，不会继续分配 KV。辅助模型默认（`aux_llm_kv_reuse=false`）每次后台摘要/事实抽取后立即失效 KV，开启复用后改为保留前缀缓存跨调用复用；主模型 `llm_kv_reuse` 与辅助模型的复用/量化开关各自独立，量化默认都开（KV 内存约减半）。预热前缀快照只在 ≤8192 token 时保留。RAG 检索 `topK` 封顶 20，避免 reranker 批量被模型参数放大。
 - **模型常驻策略**：主模型与 Reranker 加载后常驻不自动卸载；辅助模型仅在 `aux_enabled=true` 时常驻，关闭时 Agent 的 `auxLLM` 保持 `nil`（RAG 精简跳过，后台记忆/总结回退主模型）；Embedding 与 OCR 只在检索/解析时使用，空闲 3 分钟后释放权重，下次按需重载。provider 对象保留，不影响任何工具调用。
 - 为提升缓存命中，system prompt 只保留稳定前缀（`BASE_SYSTEM_PROMPT`），工作记忆、当天事实、checkpoint、技能与知识库状态等动态内容拼在 user 消息尾部；同一轮内的动态上下文做缓存，避免工具循环中反复变化。运行日志会输出 `[mlx-kv] reuse=… cached=… delta=…` 与 `[mlx] prompt=… cached=… generated=…`，可直接确认本轮复用了多少 token。
-- nomic embedding 使用 `search_document: ` / `search_query: ` 前缀，mean pooling + L2 归一化；MLX embedding 从 `config.json` 读取隐藏维度。
+- Embedding 输入前缀按模型族统一处理（`EmbeddingPrefixStrategy`，ONNX / MLX / GGUF 行为一致）：nomic 使用 `search_document: ` / `search_query: `；bge-zh 只在 query 侧加 `为这个句子生成表示以用于检索相关文章：`，document 不加，bge-en / bge-m3 不加；jina 使用 `passage: ` / `query: `，并保留 `clustering: ` / `classification: ` 任务前缀；E5 使用 `passage: ` / `query: `；其他模型原样。前缀在 provider 内幂等添加，调用方不要重复拼；切片预算会按 document 前缀预留 token。mean pooling + L2 归一化；MLX embedding 从 `config.json` 读取隐藏维度。
 - 模型查找顺序：配置显式路径 → `<workspace>/models/<name>` → `~/base-agent/models/<name>` → HuggingFace / FastEmbed 缓存。旧配置的 `models/<name>` 相对写法会自动去掉 `models/` 前缀后在这些根目录下查找。
 - 主/辅模型支持**独立预加载与卸载**：启动时按 `auto_preload_main` 与 `llm_provider` 决定是否预加载主模型，辅助模型仅在 `aux_enabled=true` 时预加载；「加载模型」只替换对应槽位的模型实例并读入权重，另一个模型保持常驻；「卸载」只作用于当前模型。加载参数（context / temp / top_p / min_p / top_k / repeat / batch / thinking）进入模型实例缓存键，修改后会创建新实例。
 - 生成、加载、预热、知识同步期间禁用模型加载/卸载/同步按钮与消息发送；配置切换会等待旧请求结束后丢弃其流式缓冲，迟到的 50ms flush 也不会写进新气泡。
@@ -201,13 +203,13 @@ PDF Ovis 引擎按 `rag_ocr_model_path` / `rag_ocr_model_name` 加载，不受 `
   "aux_max_context_tokens": 32768,
   "embedding_provider": "local",
   "local_embedding_backend": "mlx",
-  "local_embedding_model": "nomic-embed-text-v1.5-mlx-int8",
-  "local_embedding_model_path": "models/nomic-embed-text-v1.5-mlx-int8",
+  "local_embedding_model": "jina-embeddings-v3-mlx-int4",
+  "local_embedding_model_path": "models/jina-embeddings-v3-mlx-int4",
   "rag_chunk_size": 800,
   "rag_chunk_overlap": 80,
   "rag_vector_element_type": "int8",
   "rag_matryoshka": "auto",
-  "rag_matryoshka_dim": 512,
+  "rag_matryoshka_dim": 256,
   "reranker_provider": "local",
   "local_reranker_backend": "onnx",
   "local_reranker_model": "jina-reranker-v2-base-multilingual-onnx",
