@@ -1,6 +1,7 @@
 import XCTest
 import CoreGraphics
 import ImageIO
+import PDFKit
 import UniformTypeIdentifiers
 @testable import BaseAgentCore
 
@@ -110,6 +111,132 @@ final class PDFMemorySafetyTests: XCTestCase {
         XCTAssertNil(image)
     }
 
+    // MARK: - 图片密集页的文本层提取
+
+    /// 图片 XObject 很多的页面必须跳过 PDFKit 文本行布局，
+    /// 否则 `PDFPage.string` 会在 CRCTLD 空白区域分析里爆炸。
+    func testImageHeavyPageUsesBoundedTextScanner() throws {
+        let url = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("pdf-image-heavy-\(UUID().uuidString).pdf")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try makeTextAndImagePDF(at: url,
+                                text: Self.textLayerSample,
+                                imageCount: PDFTextExtractor.imageHeavyThreshold + 8)
+
+        let document = try XCTUnwrap(PDFDocument(url: url))
+        let page = try XCTUnwrap(document.page(at: 0))
+        let cgPage = try XCTUnwrap(page.pageRef)
+
+        let imageCount = PDFTextExtractor.imageObjectCount(for: cgPage)
+        XCTAssertGreaterThanOrEqual(imageCount, PDFTextExtractor.imageHeavyThreshold,
+                                    "合成页面应包含足够多的图片 XObject")
+
+        let extraction = PDFTextExtractor.text(for: page)
+        XCTAssertTrue(extraction.usedScanner, "图片密集页不能调用 PDFPage.string")
+        XCTAssertTrue(extraction.text.contains("image-heavy layout"), extraction.text)
+    }
+
+    /// 低图片页继续使用 PDFKit，保持原有阅读顺序与分段行为。
+    func testLowImagePageKeepsPDFKitExtraction() throws {
+        let url = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("pdf-text-only-\(UUID().uuidString).pdf")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try makeTextAndImagePDF(at: url, text: Self.textLayerSample, imageCount: 0)
+
+        let document = try XCTUnwrap(PDFDocument(url: url))
+        let page = try XCTUnwrap(document.page(at: 0))
+        let cgPage = try XCTUnwrap(page.pageRef)
+
+        XCTAssertEqual(PDFTextExtractor.imageObjectCount(for: cgPage), 0)
+        let extraction = PDFTextExtractor.text(for: page)
+        XCTAssertFalse(extraction.usedScanner, "普通文字页应继续走 PDFKit 文本层")
+        XCTAssertTrue(extraction.text.contains("image-heavy layout"), extraction.text)
+    }
+
+    /// 解析器集成：图片密集的文字页不应要求 VLM，也不应回退 OCR。
+    func testOvisParserExtractsImageHeavyTextPageWithoutVLM() throws {
+        let url = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("pdf-image-heavy-parse-\(UUID().uuidString).pdf")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try makeTextAndImagePDF(at: url,
+                                text: Self.textLayerSample,
+                                imageCount: PDFTextExtractor.imageHeavyThreshold + 8)
+
+        let parsed = try awaitSync {
+            try await OvisPDFParser(vlm: nil).parse(
+                url: url,
+                options: ParserOptions(pdfEngine: .ovis),
+                progress: nil)
+        }
+        XCTAssertEqual(parsed.metadata["scanner_pages"], "1")
+        XCTAssertEqual(parsed.metadata["text_pages"], "1")
+        XCTAssertEqual(parsed.metadata["ocr_pages"], "0")
+        XCTAssertTrue(parsed.text.contains("image-heavy layout"), parsed.text)
+    }
+
+    /// 真实大文件回归（可选）：`BASE_AGENT_PDF_MEMORY_TEST=/path/to.pdf`
+    /// 指向 300MB 级图片密集 PDF，完整走一遍 Ovis 文本层提取。
+    /// 修复前会在第 18 页附近涨到数十 GB 内存并卡死。
+    func testRealPDFTextLayerStaysBoundedWhenEnabled() throws {
+        guard let path = ProcessInfo.processInfo.environment["BASE_AGENT_PDF_MEMORY_TEST"],
+              !path.isEmpty else {
+            throw XCTSkip("设置 BASE_AGENT_PDF_MEMORY_TEST 指向测试 PDF 后运行")
+        }
+        let url = URL(fileURLWithPath: path)
+        guard FileManager.default.fileExists(atPath: path) else {
+            throw XCTSkip("测试 PDF 不存在：\(path)")
+        }
+
+        let parsed = try awaitSync(timeout: 900) {
+            try await OvisPDFParser(vlm: nil).parse(
+                url: url,
+                options: ParserOptions(pdfEngine: .ovis),
+                progress: nil)
+        }
+        XCTAssertGreaterThan(parsed.text.count, 10_000,
+                             "真实 PDF 应提取出完整正文")
+        XCTAssertGreaterThan(Int(parsed.metadata["scanner_pages"] ?? "0") ?? 0, 0,
+                             "图片密集页应走有界扫描器")
+    }
+
+    /// 真实大文件走「转换工具」完整链路（默认 vision 引擎）：
+    /// 写 Markdown、苹果 Vision 兜底扫描页，验证不因文本层布局爆内存。
+    func testRealPDFConversionToolStaysBoundedWhenEnabled() throws {
+        guard let path = ProcessInfo.processInfo.environment["BASE_AGENT_PDF_MEMORY_TEST"],
+              !path.isEmpty else {
+            throw XCTSkip("设置 BASE_AGENT_PDF_MEMORY_TEST 指向测试 PDF 后运行")
+        }
+        let source = URL(fileURLWithPath: path)
+        guard FileManager.default.fileExists(atPath: path) else {
+            throw XCTSkip("测试 PDF 不存在：\(path)")
+        }
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("pdf-real-convert-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let output = root.appendingPathComponent("out")
+
+        var config = AgentConfig()
+        config.ragPDFEngine = .vision
+        let report = try awaitSync(timeout: 1_800) {
+            try await MarkdownConversionService().convert(
+                request: MarkdownConversionRequest(sourceURL: source,
+                                                   outputDirectory: output,
+                                                   config: config))
+        }
+
+        XCTAssertFalse(report.wasCancelled)
+        XCTAssertEqual(report.succeededCount, 1,
+                       report.results.first?.error ?? "真实 PDF 转换应成功")
+        let markdownURL = try XCTUnwrap(report.results.first?.outputURL)
+        let markdown = try String(contentsOf: markdownURL, encoding: .utf8)
+        XCTAssertGreaterThan(markdown.count, 10_000)
+        XCTAssertTrue(markdown.contains("课堂讲解"), "图片密集页的正文应完整保留")
+        // 第 18 页是 TimesNewRoman + WinAnsi 的简单字体正文，扫描器必须
+        // 按单字节字符码解码，否则 "Excel 2016" 会被两两拼接而整段丢失。
+        XCTAssertTrue(markdown.contains("对于Excel 2016的初学者"),
+                      "图片密集页的英文正文不应丢字")
+    }
+
     // MARK: - 目录转换分批
 
     func testConversionBatchesIsolateHeavyFiles() {
@@ -176,6 +303,111 @@ final class PDFMemorySafetyTests: XCTestCase {
     }
 
     // MARK: - 工具
+
+    private static let textLayerSample =
+        "This page shows an image-heavy layout and still keeps a readable text layer for extraction."
+
+    private func awaitSync<T>(timeout: TimeInterval = 60,
+                              _ body: @escaping () async throws -> T) throws -> T {
+        let semaphore = DispatchSemaphore(value: 0)
+        var result: Result<T, Error>!
+        Task {
+            do { result = .success(try await body()) }
+            catch { result = .failure(error) }
+            semaphore.signal()
+        }
+        guard semaphore.wait(timeout: .now() + timeout) == .success else {
+            throw AgentError.parse("测试等待超时（\(timeout)s）")
+        }
+        return try XCTUnwrap(result).get()
+    }
+
+    /// 构造单页 PDF：一段 Helvetica 文本 + `imageCount` 个独立 DCTDecode 图片 XObject。
+    /// 图片对象刻意分开编号，确保页面的 `/XObject` 字典里有真实的图片数量。
+    private func makeTextAndImagePDF(at url: URL,
+                                     text: String,
+                                     imageCount: Int) throws {
+        let jpeg = try makeJPEG(width: 64, height: 64)
+        var data = Data()
+        var offsets: [Int] = []
+
+        func appendASCII(_ value: String) {
+            data.append(Data(value.utf8))
+        }
+
+        func addObject(_ body: String, stream: Data? = nil) {
+            offsets.append(data.count)
+            appendASCII("\(offsets.count) 0 obj\n")
+            appendASCII(body)
+            if let stream {
+                appendASCII("\nstream\n")
+                data.append(stream)
+                appendASCII("\nendstream")
+            }
+            appendASCII("\nendobj\n")
+        }
+
+        appendASCII("%PDF-1.4\n")
+        appendASCII("%\u{00E2}\u{00E3}\u{00CF}\u{00D3}\n")
+
+        addObject("<< /Type /Catalog /Pages 2 0 R >>")
+        addObject("<< /Type /Pages /Kids [3 0 R] /Count 1 >>")
+
+        let imageObjectStart = 4
+        let fontObject = imageObjectStart + imageCount
+        let contentObject = fontObject + 1
+        var xobjects = ""
+        for index in 0..<imageCount {
+            xobjects += " /Im\(index) \(imageObjectStart + index) 0 R"
+        }
+        addObject("""
+        << /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792]
+           /Resources << /XObject <<\(xobjects) >> /Font << /F1 \(fontObject) 0 R >> >>
+           /Contents \(contentObject) 0 R >>
+        >>
+        """)
+
+        for _ in 0..<imageCount {
+            addObject("""
+            << /Type /XObject /Subtype /Image /Width 64 /Height 64
+               /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode
+               /Length \(jpeg.count) >>
+            """, stream: jpeg)
+        }
+
+        addObject("""
+        << /Type /Font /Subtype /Type1 /BaseFont /Helvetica
+           /Encoding /WinAnsiEncoding >>
+        """)
+
+        let escaped = text
+            .replacingOccurrences(of: "\\", with: "\\\\")
+            .replacingOccurrences(of: "(", with: "\\(")
+            .replacingOccurrences(of: ")", with: "\\)")
+        var content = "BT /F1 24 Tf 40 720 Td (\(escaped)) Tj ET\n"
+        for index in 0..<imageCount {
+            let column = index % 10
+            let row = index / 10
+            content += "q 32 0 0 32 \(20 + column * 48) \(520 - row * 48) cm /Im\(index) Do Q\n"
+        }
+        addObject("<< /Length \(content.utf8.count) >>", stream: Data(content.utf8))
+
+        let xrefOffset = data.count
+        appendASCII("xref\n0 \(offsets.count + 1)\n")
+        appendASCII("0000000000 65535 f \n")
+        for offset in offsets {
+            appendASCII(String(format: "%010d 00000 n \n", offset))
+        }
+        appendASCII("""
+        trailer
+        << /Size \(offsets.count + 1) /Root 1 0 R >>
+        startxref
+        \(xrefOffset)
+        %%EOF
+
+        """)
+        try data.write(to: url)
+    }
 
     private func makeJPEG(width: Int, height: Int) throws -> Data {
         let colorSpace = CGColorSpace(name: CGColorSpace.sRGB)

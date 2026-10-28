@@ -7,6 +7,7 @@ import Vision
 private struct VisionTextLayerOutcome: Sendable {
     var texts: [(index: Int, text: String)] = []
     var ocrPages: [Int] = []
+    var scannerPages = 0
     var textSeconds = 0.0
 }
 
@@ -45,6 +46,7 @@ public final class VisionPDFParser: DocumentParser {
 
         var pageTexts = [String?](repeating: nil, count: pageLimit)
         var pagesNeedingOCR: [Int] = []
+        var scannerPages = 0
         var textSeconds = 0.0
         var renderSeconds = 0.0
         var ocrSeconds = 0.0
@@ -73,17 +75,21 @@ public final class VisionPDFParser: DocumentParser {
                         let textStarted = Date()
                         // 每页排空一次 autorelease pool：PDFPage 由 PDFKit 惰性
                         // 解析，整本书的页对象若一直挂在池里会累积到数 GB。
-                        let text: String? = autoreleasepool {
+                        // 图片 XObject 多的页面由 PDFTextExtractor 改用
+                        // CGPDFScanner，避免 PDFKit 文本行布局内存爆炸。
+                        let extraction: PDFPageTextExtraction? = autoreleasepool {
                             guard let page = workerDocument.page(at: index) else {
                                 return nil
                             }
-                            return (page.string ?? "")
-                                .trimmingCharacters(in: .whitespacesAndNewlines)
+                            return PDFTextExtractor.text(for: page)
                         }
-                        guard let text else {
+                        guard let extraction else {
                             outcome.texts.append((index, ""))
                             continue
                         }
+                        if extraction.usedScanner { outcome.scannerPages += 1 }
+                        let text = extraction.text
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
                         outcome.textSeconds += Date().timeIntervalSince(textStarted)
                         if DocumentCleaner.effectiveCharacterCount(text)
                             >= Self.textLayerMinCharacters {
@@ -104,10 +110,14 @@ public final class VisionPDFParser: DocumentParser {
 
         for outcome in textOutcomes {
             textSeconds += outcome.textSeconds
+            scannerPages += outcome.scannerPages
             for (index, text) in outcome.texts { pageTexts[index] = text }
             pagesNeedingOCR.append(contentsOf: outcome.ocrPages)
         }
         pagesNeedingOCR.sort()
+        if scannerPages > 0 {
+            AgentLog.info("PDF 文本层：\(scannerPages) 页图片过多，改用有界扫描器提取")
+        }
 
         // 2. 扫描页：多 worker 并行产图（提取/渲染）+ Vision OCR 流水线重叠，
         //    结果按页序收集。空白页直接置空。
@@ -148,6 +158,7 @@ public final class VisionPDFParser: DocumentParser {
         var outlineEntries = bookmarkEntries
         var metadata: [String: String] = ["engine": "vision",
                                           "ocr_pages": String(pagesNeedingOCR.count),
+                                          "scanner_pages": String(scannerPages),
                                           "timing_text": String(format: "%.2f", textSeconds),
                                           "timing_render": String(format: "%.2f", renderSeconds),
                                           "timing_ocr": String(format: "%.2f", ocrSeconds)]

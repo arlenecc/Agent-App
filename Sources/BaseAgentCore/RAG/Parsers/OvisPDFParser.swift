@@ -8,6 +8,7 @@ private struct TextLayerOutcome: Sendable {
     var scanPages: [Int] = []
     var textPages = 0
     var tableRegions = 0
+    var scannerPages = 0
     var textSeconds = 0.0
     var ocrSeconds = 0.0
 }
@@ -82,6 +83,7 @@ public final class OvisPDFParser: DocumentParser, VLMBackedParser {
         var failedPages = 0
         var textPages = 0
         var tableRegions = 0
+        var scannerPages = 0
         var missingOCRPages = 0
         var textSeconds = 0.0
         var renderSeconds = 0.0
@@ -122,10 +124,14 @@ public final class OvisPDFParser: DocumentParser, VLMBackedParser {
                         }
                         // 每页排空 autorelease pool：PDFPage 对象与 PDFKit
                         // 解析缓存不随循环自动释放，整本书会持续累积。
+                        // 图片 XObject 多的页面由 PDFTextExtractor 改用
+                        // CGPDFScanner，避免 PDFKit 文本行布局内存爆炸。
                         let textStarted = Date()
-                        let rawText: String = autoreleasepool {
-                            page.string ?? ""
+                        let extraction: PDFPageTextExtraction = autoreleasepool {
+                            PDFTextExtractor.text(for: page)
                         }
+                        let rawText = extraction.text
+                        if extraction.usedScanner { outcome.scannerPages += 1 }
                         let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
                         outcome.textSeconds += Date().timeIntervalSince(textStarted)
                         if DocumentCleaner.effectiveCharacterCount(text)
@@ -134,7 +140,10 @@ public final class OvisPDFParser: DocumentParser, VLMBackedParser {
                             // 出来交给 OvisOCR3 转 Markdown，再拼回原位置，其余文本不动。
                             var pageText = text
                             let tableStarted = Date()
-                            if let replaced = await Self.replacingTables(
+                            // 扫描器文本的行号/偏移与 PDFKit 的 page.string 不同，
+                            // `page.selection(for:)` 无法映射，跳过表格替换。
+                            if !extraction.usedScanner,
+                               let replaced = await Self.replacingTables(
                                 in: page, text: rawText, pageNumber: pageNumber,
                                 options: options, vlm: tableVLM) {
                                 pageText = replaced.text
@@ -163,10 +172,14 @@ public final class OvisPDFParser: DocumentParser, VLMBackedParser {
             ocrSeconds += outcome.ocrSeconds
             textPages += outcome.textPages
             tableRegions += outcome.tableRegions
+            scannerPages += outcome.scannerPages
             for (index, text) in outcome.texts { pageTexts[index] = text }
             scanPages.append(contentsOf: outcome.scanPages)
         }
         scanPages.sort()
+        if scannerPages > 0 {
+            AgentLog.info("PDF 文本层：\(scannerPages) 页图片过多，改用有界扫描器提取")
+        }
 
         var firstOCRMessage = true
         if hybrid {
@@ -362,6 +375,7 @@ public final class OvisPDFParser: DocumentParser, VLMBackedParser {
             "vision_pages": String(visionPages),
             "failed_pages": String(failedPages),
             "table_regions": String(tableRegions),
+            "scanner_pages": String(scannerPages),
             "timing_text": String(format: "%.2f", textSeconds),
             "timing_render": String(format: "%.2f", renderSeconds),
             "timing_ocr": String(format: "%.2f", ocrSeconds),
