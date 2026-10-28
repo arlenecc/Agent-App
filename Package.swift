@@ -65,6 +65,10 @@ let package = Package(
                 .product(name: "SwiftSoup", package: "SwiftSoup"),
             ],
             path: "Sources/BaseAgentCore",
+            resources: [
+                // 语义切片专用：bge-small-zh-v1.5 int8 ONNX（约 24 MB），随 App 固化分发。
+                .copy("Resources/bge-small-zh-v1.5-int8"),
+            ],
             swiftSettings: [.swiftLanguageMode(.v5)],
             linkerSettings: [.linkedLibrary("sqlite3")]
         ),

@@ -297,4 +297,21 @@ final class ChunkingTests: XCTestCase {
         let chunks = await SemanticChunker.split(text, options: options, similarity: similarity)
         XCTAssertEqual(chunks?.count, 4, "强边界不得被短块合并越过")
     }
+
+    /// 真实内置模型集成：三主题各三句，应在两个主题切换处切成 3 段。
+    func testSemanticChunkerUsesBundledModelToSplitTopics() async throws {
+        let text = "公司今天发布了第三季度财报。财报显示营收同比增长百分之二十。财报还显示净利润创下历史新高。"
+            + "研究人员在深海发现了一种新的鱼类。这种新鱼类生活在四千米深的海底。新鱼类的身体几乎完全透明。"
+            + "球队在主场赢得了比赛。球迷们在看台为球队高声欢呼。教练称赞了球员们比赛中的表现。"
+        let options = ChunkingOptions(
+            chunkSizeTokens: 500,
+            overlapTokens: 0,
+            minChunkTokens: 0,
+            semanticThreshold: 0.55,
+            enableSemantic: true
+        )
+        let result = await SemanticChunker.split(text, options: options)
+        let chunks = try XCTUnwrap(result)
+        XCTAssertEqual(chunks.count, 3, "\(chunks)")
+    }
 }

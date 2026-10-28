@@ -1,8 +1,8 @@
 import Foundation
 
 /// 句子级语义切片：在相邻句相似度低谷处断开。
-/// 相似度默认由 Apple NaturalLanguage 词向量（本地 CPU）计算，
-/// 不调用 embedding 模型；不可用时退化为词重叠相似度（仍可用，只是更粗糙）。
+/// 相似度由内置 bge-small-zh-v1.5（int8 ONNX，纯 CPU）计算；
+/// 不可用时退化为词重叠相似度（仍可用，只是更粗糙）。
 struct SemanticChunker {
 
     /// 可注入的相邻句相似度（测试用）；返回 nil 表示不可用。
@@ -18,7 +18,7 @@ struct SemanticChunker {
 
     static func split(_ text: String, options: ChunkingOptions,
                       similarity: @escaping AdjacentSimilarity = {
-                          NLSentenceSimilarity().adjacentCosines($0)
+                          BGESentenceSimilarity().adjacentCosines($0)
                       }) async -> [String]? {
         let sentences = TextAnalyzer.sentences(text)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -173,8 +173,8 @@ struct SemanticChunker {
         return union > 0 ? Double(intersection) / Double(union) : 0
     }
 
-    /// 词向量不可用时只警告一次：NL 在本机不支持中文词向量时，
-    /// 每个章节都会失败，逐节告警会刷屏。
+    /// 词向量不可用时只警告一次：模型缺失/解码失败时每个章节都会失败，
+    /// 逐节告警会刷屏。
     private static let fallbackWarningLock = NSLock()
     private static var fallbackWarningLogged = false
 
@@ -184,7 +184,7 @@ struct SemanticChunker {
         if shouldLog { fallbackWarningLogged = true }
         fallbackWarningLock.unlock()
         if shouldLog {
-            AgentLog.warning("语义切片 Apple NL 词向量不可用，回退词法相似度（仅提示一次）")
+            AgentLog.warning("语义切片内置模型不可用，回退词法相似度（仅提示一次）")
         }
     }
 

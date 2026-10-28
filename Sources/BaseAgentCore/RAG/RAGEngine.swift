@@ -841,7 +841,8 @@ public final class RAGEngine {
             // 8：结构化清洗档（HTML/Office/EPUB 保真）+ HTML 本地框架接力 +
             //    Office 备注/列表/脚注/日期格式完善。
             // 9：语义切片改为 CJK 无空格拼接 + 弱边界短片合并。
-            ("pipeline_version", "9"),
+            // 10：语义切片相似度改用内置 bge-small-zh-v1.5 int8 ONNX（CPU）。
+            ("pipeline_version", "10"),
             ("pdf_engine", config.ragPDFEngine.rawValue),
             ("epub_ocr_engine", config.ragEPUBOCREngine.rawValue),
             ("ocr_engine", config.ragOCREngine),

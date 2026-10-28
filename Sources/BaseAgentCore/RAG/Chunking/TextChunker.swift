@@ -8,10 +8,10 @@ public final class TextChunker: TextChunkingStrategy {
 
     public init(options: ChunkingOptions) {
         self.options = options
-        self.similarity = { NLSentenceSimilarity().adjacentCosines($0) }
+        self.similarity = { BGESentenceSimilarity().adjacentCosines($0) }
     }
 
-    /// 测试注入相似度实现，避免依赖系统词向量。
+    /// 测试注入相似度实现，避免依赖内置模型。
     init(options: ChunkingOptions,
          similarity: @escaping SemanticChunker.AdjacentSimilarity) {
         self.options = options
