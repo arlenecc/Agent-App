@@ -8,6 +8,8 @@ public struct IngestStats: Sendable {
     public var processed: Int = 0
     public var skipped: Int = 0
     public var removed: Int = 0
+    /// 正文过短、整份丢弃的文件数量。
+    public var discarded: Int = 0
     /// 按内容哈希清理掉的重复副本数量。
     public var deduplicated: Int = 0
     public var chunks: Int = 0
@@ -19,6 +21,7 @@ public struct IngestStats: Sendable {
     public var summary: String {
         var parts = ["已处理 \(processed) 个文件", "跳过 \(skipped)", "删除 \(removed)",
                      "去重 \(deduplicated)", "写入 \(chunks) 个切片"]
+        if discarded > 0 { parts.append("丢弃过短 \(discarded)") }
         if !errors.isEmpty { parts.append("失败 \(errors.count)") }
         if cancelled { parts.append("已取消") }
         return parts.joined(separator: "，")
@@ -72,6 +75,8 @@ struct RAGManifestEntry: Codable, Sendable {
     var complete: Bool?
     /// 内容重复副本指向的保留来源。该条目没有自己的向量，增量同步会跳过。
     var duplicateOf: String?
+    /// 正文过短、已整体丢弃的来源。内容未变化时增量同步不再解析。
+    var discarded: Bool? = nil
 }
 
 struct RAGManifest: Codable, Sendable {
@@ -328,6 +333,8 @@ private struct IngestOutcome: Sendable {
     var source: String
     var skipped = false
     var processed = false
+    /// 正文过短、整份丢弃（不切片/向量化）。
+    var discarded = false
     var cancelled = false
     /// 命中正文哈希、只写 tombstone 的副本（没有切片/向量化）。
     var deduplicated = false
@@ -964,10 +971,23 @@ public final class RAGEngine {
             IngestJob(index: index, total: total, file: file,
                       label: "[\(index + 1)/\(total)] \(file.relativePath)")
         }
-        let queue = IngestJobQueue(jobs)
         let accumulator = IngestAccumulator()
         let concurrency = min(max(1, config.ragIngestConcurrency), 6,
                               max(1, uniqueFiles.count))
+        // 与转换工具同一套分批策略：≥16MB 的 PDF 单独成批、批间串行，
+        // 避免「一个文件夹里大批大文件」同时解析导致内存叠加。
+        // 文件内部仍按 PDFProcessingPlan 收紧页级窗口。
+        let fileSizes = jobs.map {
+            PDFProcessingPlan.fileSize(of: URL(fileURLWithPath: $0.file.path))
+        }
+        let batches = PDFProcessingPlan.batchIndices(
+            fileSizes: fileSizes,
+            baseConcurrency: concurrency,
+            heavyFileBytes: PDFProcessingPlan.largeFileBytes)
+        let heavyCount = fileSizes.filter { $0 >= PDFProcessingPlan.largeFileBytes }.count
+        if heavyCount > 0 {
+            logFn("RAG: \(heavyCount)/\(total) 个大文件将逐个解析，避免并发叠加内存")
+        }
         let registry = parserRegistry
         let storeRef = store
         let manifestStoreRef = manifestStore
@@ -991,40 +1011,48 @@ public final class RAGEngine {
             return self.isCancelled
         }
 
-        await withTaskGroup(of: Void.self) { group in
-            for _ in 0..<concurrency {
-                group.addTask {
-                    while let job = await queue.next() {
-                        if Task.isCancelled || cancelledCheck() { break }
-                        let outcome = await Self.process(
-                            job: job,
-                            force: force,
-                            config: configRef,
-                            registry: registry,
-                            contentRegistry: contentRegistry,
-                            store: storeRef,
-                            embedding: scheduler,
-                            manifestStore: manifestStoreRef,
-                            manifestSnapshot: manifestSnapshot,
-                            signatureHash: signature,
-                            markdownDir: markdownDirRef,
-                            knowledgeBase: knowledgeBaseRef,
-                            isCancelled: cancelledCheck,
-                            log: logFn,
-                            progress: progress
-                        )
-                        await accumulator.record(outcome)
-                        if outcome.cancelled { break }
+        // 批间串行、批内并发：轻文件最多 concurrency 个同时处理，
+        // 大文件所在批次只有它自己。
+        for batch in batches {
+            if Task.isCancelled || cancelledCheck() { break }
+            let batchJobs = batch.map { jobs[$0] }
+            let queue = IngestJobQueue(batchJobs)
+            await withTaskGroup(of: Void.self) { group in
+                for _ in 0..<batchJobs.count {
+                    group.addTask {
+                        while let job = await queue.next() {
+                            if Task.isCancelled || cancelledCheck() { break }
+                            let outcome = await Self.process(
+                                job: job,
+                                force: force,
+                                config: configRef,
+                                registry: registry,
+                                contentRegistry: contentRegistry,
+                                store: storeRef,
+                                embedding: scheduler,
+                                manifestStore: manifestStoreRef,
+                                manifestSnapshot: manifestSnapshot,
+                                signatureHash: signature,
+                                markdownDir: markdownDirRef,
+                                knowledgeBase: knowledgeBaseRef,
+                                isCancelled: cancelledCheck,
+                                log: logFn,
+                                progress: progress
+                            )
+                            await accumulator.record(outcome)
+                            if outcome.cancelled { break }
+                        }
                     }
                 }
+                await group.waitForAll()
             }
-            await group.waitForAll()
         }
         // 兜底唤醒：worker 在异常路径退出时也不能让等待同一正文的任务永久挂起。
         contentRegistry.cancelAll()
 
         if isCancelled { stats.cancelled = true }
         for outcome in await accumulator.snapshot() {
+            if outcome.discarded { stats.discarded += 1 }
             if outcome.skipped { stats.skipped += 1 }
             if outcome.processed {
                 stats.processed += 1
@@ -1228,6 +1256,20 @@ public final class RAGEngine {
                 // 配置签名变化：顶部已汇总，逐文件不再刷屏。
             } else if entry.complete != true {
                 redoReason = "上次未完整完成"
+            } else if entry.discarded == true {
+                // 正文过短、已在之前同步中整份丢弃：文件未变化就不再解析。
+                if abs(entry.mtime - signature.mtime) >= 0.001 {
+                    redoReason = "文件已变更"
+                } else if entry.size != signature.size {
+                    redoReason = "文件大小已变更"
+                } else if config.ragVerifyFingerprint,
+                          Self.sourceFingerprint(source, size: signature.size) != entry.fingerprint {
+                    redoReason = "文件内容已变更"
+                } else {
+                    outcome.skipped = true
+                    log("RAG: \(job.label) 跳过（内容过短，已丢弃）")
+                    return outcome
+                }
             } else if entry.chunkCount == nil || (entry.chunkCount ?? 0) <= 0 {
                 redoReason = "缺少切片完成标记"
             } else if abs(entry.mtime - signature.mtime) >= 0.001 {
@@ -1284,6 +1326,35 @@ public final class RAGEngine {
                         for: URL(fileURLWithPath: file.path)))
             guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
                 throw AgentError.parse("解析结果为空")
+            }
+            // 正文过短：多半是抽取失败遗留的书名/目录名或图片元数据，
+            // 整份丢弃，不切片、不向量化，避免碎片污染检索结果。
+            // 标题/目录行（DocumentOutline 能识别的行）整行不计入正文。
+            let outlineNodes = DocumentOutline.extract(text, source: file.relativePath)
+            let bodyCharacters = Self.bodyCharacterCount(
+                text, headingStarts: Set(outlineNodes.map(\.start)))
+            if bodyCharacters < Self.minBodyCharacters {
+                let previous = manifestSnapshot[source]
+                let marker = RAGManifestEntry(
+                    mtime: signature?.mtime ?? 0,
+                    size: signature?.size ?? 0,
+                    fingerprint: Self.sourceFingerprint(source, size: signature?.size),
+                    digest: "",
+                    docName: file.relativePath,
+                    mdPath: "",
+                    ingestSignature: signatureHash,
+                    chunkCount: 0,
+                    complete: true,
+                    discarded: true)
+                // 没有切片/向量，下次同步内容不变时按 manifest 标记直接跳过。
+                manifestStore.merge(updated: [source: marker], removed: [])
+                // 该来源此前可能已入库（例如文件被改短）：旧切片、缓存 Markdown
+                // 与文档记录/摘要必须一起清掉，避免继续命中旧内容。
+                removeIndexedSource(source: source, entry: previous, store: store,
+                                    markdownDir: markdownDir, knowledgeBase: knowledgeBase)
+                outcome.discarded = true
+                log("RAG: \(job.label) 丢弃（正文仅 \(bodyCharacters) 字，视为无效碎片）")
+                return outcome
             }
             let parseBreakdown = Self.parseTimingText(parsed.metadata)
             let parseSeconds = Date().timeIntervalSince(parseStarted)
@@ -1384,8 +1455,9 @@ public final class RAGEngine {
                                                 knowledgeBase: knowledgeBase)
             try AtomicFile.write(text, to: mdPath)
 
-            let digestInfo = Self.buildDigest(text: text, parsed: parsed,
-                                              docName: file.relativePath)
+            // 复用上面丢弃判定时已抽取的大纲，避免再跑一遍正则。
+            let digestInfo = Self.buildDigest(parsed: parsed, docName: file.relativePath,
+                                              nodes: outlineNodes)
             try store.upsertDocument(docName: file.relativePath,
                                      digest: digestInfo.digest,
                                      chapters: digestInfo.chapters,
@@ -1427,7 +1499,8 @@ public final class RAGEngine {
                 + "（子批 \(embedding.currentBatchSize)）"
                 + "，入库 \(String(format: "%.1fs", writeSeconds))"
                 + "，缓存/摘要 \(String(format: "%.1fs", cacheSeconds))"
-                + "，总 \(Self.elapsedText(fileStarted))")
+                + "，总 \(Self.elapsedText(fileStarted))"
+                + "，内存 \(Int(ProcessMemory.footprintMB()))MB")
             return outcome
         } catch AgentError.cancelled {
             // 用户主动停止：不是解析失败，不能清掉该文件已有的索引。
@@ -1435,7 +1508,8 @@ public final class RAGEngine {
             return outcome
         } catch {
             outcome.error = "\(file.relativePath): \(error.localizedDescription)"
-            log("RAG: ✗ \(file.relativePath): \(error.localizedDescription)")
+            log("RAG: ✗ \(file.relativePath): \(error.localizedDescription)"
+                + "（内存 \(Int(ProcessMemory.footprintMB()))MB）")
             // 文件已变更但处理失败：清掉旧索引，避免继续命中过期内容；
             // 同时移除 manifest 条目，让下次同步重试。
             if let old = manifestSnapshot[source] {
@@ -1481,9 +1555,25 @@ public final class RAGEngine {
 
     // MARK: Digest
 
-    private static func buildDigest(text: String, parsed: ParsedDocument,
-                                    docName: String) -> (digest: String, chapters: String) {
-        let nodes = DocumentOutline.extract(text, source: docName)
+    /// 只统计正文文字：标题/目录行（`DocumentOutline.extract` 识别的行）整行不计，
+    /// 其余行忽略空白后累加，含标点与数字。
+    static func bodyCharacterCount(_ text: String, headingStarts: Set<Int>) -> Int {
+        var count = 0
+        var location = 0
+        for raw in text.components(separatedBy: "\n") {
+            let lineStart = location
+            location += (raw as NSString).length + 1
+            guard !headingStarts.contains(lineStart) else { continue }
+            count += DocumentCleaner.effectiveCharacterCount(raw)
+        }
+        return count
+    }
+
+    /// 正文文字少于该值时整份丢弃（抽取失败遗留的书名/目录名/图片元数据）。
+    static let minBodyCharacters = 100
+
+    private static func buildDigest(parsed: ParsedDocument, docName: String,
+                                    nodes: [OutlineNode]) -> (digest: String, chapters: String) {
         // 正则识别与解析器自带大纲（EPUB 目录、Office 标题等）取条目多的一方：
         // 任一来源都可能严重缺失，只命中一两条时不应覆盖完整目录。
         let parsedEntries = parsed.outline.split(separator: "\n")

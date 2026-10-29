@@ -8,6 +8,7 @@ private struct VisionTextLayerOutcome: Sendable {
     var texts: [(index: Int, text: String)] = []
     var ocrPages: [Int] = []
     var scannerPages = 0
+    var failedPages = 0
     var textSeconds = 0.0
 }
 
@@ -47,6 +48,7 @@ public final class VisionPDFParser: DocumentParser {
         var pageTexts = [String?](repeating: nil, count: pageLimit)
         var pagesNeedingOCR: [Int] = []
         var scannerPages = 0
+        var failedPages = 0
         var textSeconds = 0.0
         var renderSeconds = 0.0
         var ocrSeconds = 0.0
@@ -73,18 +75,14 @@ public final class VisionPDFParser: DocumentParser {
                         if Task.isCancelled { throw AgentError.cancelled }
                         progress?(.page(index: index + 1, total: pageLimit, stage: "text"))
                         let textStarted = Date()
-                        // 每页排空一次 autorelease pool：PDFPage 由 PDFKit 惰性
-                        // 解析，整本书的页对象若一直挂在池里会累积到数 GB。
-                        // 图片 XObject 多的页面由 PDFTextExtractor 改用
-                        // CGPDFScanner，避免 PDFKit 文本行布局内存爆炸。
-                        let extraction: PDFPageTextExtraction? = autoreleasepool {
-                            guard let page = workerDocument.page(at: index) else {
-                                return nil
-                            }
-                            return PDFTextExtractor.text(for: page)
-                        }
+                        // 每页在全局闸门内创建/释放 PDFPage：多文件并发时
+                        // 不会同时有过多页面进入 PDFKit 文本行布局。
+                        // 图片多/像素大的页面由提取器改用 CGPDFScanner。
+                        let extraction = try await PDFTextExtractor.extract(
+                            for: workerDocument, pageIndex: index)
                         guard let extraction else {
                             outcome.texts.append((index, ""))
+                            outcome.failedPages += 1
                             continue
                         }
                         if extraction.usedScanner { outcome.scannerPages += 1 }
@@ -111,6 +109,7 @@ public final class VisionPDFParser: DocumentParser {
         for outcome in textOutcomes {
             textSeconds += outcome.textSeconds
             scannerPages += outcome.scannerPages
+            failedPages += outcome.failedPages
             for (index, text) in outcome.texts { pageTexts[index] = text }
             pagesNeedingOCR.append(contentsOf: outcome.ocrPages)
         }
@@ -137,6 +136,14 @@ public final class VisionPDFParser: DocumentParser {
                 return (text: result.text, needsVLM: false, busySeconds: result.busySeconds)
             }
         for outcome in outcomes {
+            if outcome.renderFailed {
+                // 产图失败不是空白页：计入失败页，下次同步会重试该文件。
+                failedPages += 1
+                AgentLog.warning("PDF 第 \(outcome.index + 1) 页渲染失败，已跳过")
+            } else if outcome.text == nil, !outcome.isBlank {
+                failedPages += 1
+                AgentLog.warning("OCR 第 \(outcome.index + 1) 页识别失败，已跳过")
+            }
             pageTexts[outcome.index] = outcome.text ?? ""
             ocrSeconds += outcome.ocrSeconds
         }
@@ -159,6 +166,7 @@ public final class VisionPDFParser: DocumentParser {
         var metadata: [String: String] = ["engine": "vision",
                                           "ocr_pages": String(pagesNeedingOCR.count),
                                           "scanner_pages": String(scannerPages),
+                                          "failed_pages": String(failedPages),
                                           "timing_text": String(format: "%.2f", textSeconds),
                                           "timing_render": String(format: "%.2f", renderSeconds),
                                           "timing_ocr": String(format: "%.2f", ocrSeconds)]
@@ -205,7 +213,8 @@ public final class VisionPDFParser: DocumentParser {
                         preprocess: preprocess,
                         binarize: binarize,
                         languages: languages)
-                    return (item.pageIndex, result.text)
+                    // 单页失败时返回空文本，保持调用方（扫描版 EPUB）行为不变。
+                    return (item.pageIndex, result.text ?? "")
                 }
             }
 
@@ -219,27 +228,31 @@ public final class VisionPDFParser: DocumentParser {
     }
 
     /// 单页识别：预处理（归一化/锐化/可选二值化）在闸门外做（纯 CPU），
-    /// Vision OCR 受全局并发闸门约束；单页失败返回空文本，取消向上传播。
+    /// Vision OCR 受全局并发闸门约束；单页失败返回 nil（区别于空白页的
+    /// 空字符串），取消向上传播。
     /// 返回 `busySeconds` 为闸门内实际识别耗时（不含排队等待）。
     static func recognizeSingle(image: CGImage,
                                 preprocess: Bool,
                                 binarize: Bool,
-                                languages: [String]) async throws -> (text: String, busySeconds: Double) {
+                                languages: [String]) async throws -> (text: String?, busySeconds: Double) {
         do {
             let source = preprocess
                 ? (OCRImagePreprocessor.normalize(image, binarize: binarize) ?? image)
                 : image
             return try await Self.visionGate.withPermit {
                 let started = Date()
-                let text = try Self.recognizeText(image: source, languages: languages)
+                let text = try autoreleasepool {
+                    try Self.recognizeText(image: source, languages: languages)
+                }
                 return (text, Date().timeIntervalSince(started))
             }
         } catch {
             // 用户停止同步时必须向上传播取消，不能把剩余页当成失败页。
             if Task.isCancelled { throw AgentError.cancelled }
-            // 单页失败不影响整份文档：记录并返回空页。
+            // 单页失败不影响整份文档，但必须让上层统计为失败页，
+            // 否则整份文件会被标记 complete，失败的页再也不会重试。
             AgentLog.warning("Vision OCR 失败，已跳过该页: \(error.localizedDescription)")
-            return (text: "", busySeconds: 0)
+            return (text: nil, busySeconds: 0)
         }
     }
 
@@ -247,23 +260,27 @@ public final class VisionPDFParser: DocumentParser {
 
     /// 供 PDF 与扫描版 EPUB 共用的 Vision OCR 入口。
     static func recognizeText(image: CGImage, languages: [String]) throws -> String {
-        let request = VNRecognizeTextRequest()
-        request.recognitionLevel = .accurate
-        request.usesLanguageCorrection = true
+        // Vision 每次识别都会产生大量 autoreleased 对象；多页长循环里
+        // 没有逐页排空池时，峰值内存会随页数持续上涨。
+        try autoreleasepool {
+            let request = VNRecognizeTextRequest()
+            request.recognitionLevel = .accurate
+            request.usesLanguageCorrection = true
 
-        if !languages.isEmpty,
-           let supported = try? request.supportedRecognitionLanguages() {
-            let filtered = languages.filter { supported.contains($0) }
-            if !filtered.isEmpty {
-                request.recognitionLanguages = filtered
+            if !languages.isEmpty,
+               let supported = try? request.supportedRecognitionLanguages() {
+                let filtered = languages.filter { supported.contains($0) }
+                if !filtered.isEmpty {
+                    request.recognitionLanguages = filtered
+                }
             }
+
+            let handler = VNImageRequestHandler(cgImage: image, options: [:])
+            try handler.perform([request])
+
+            let observations = request.results ?? []
+            return layoutText(from: observations)
         }
-
-        let handler = VNImageRequestHandler(cgImage: image, options: [:])
-        try handler.perform([request])
-
-        let observations = request.results ?? []
-        return layoutText(from: observations)
     }
 
     private struct RecognizedLine {

@@ -57,6 +57,7 @@ final class RAGEngineANNTests: XCTestCase {
 
             Apple banana orange fruit \(index). 苹果 香蕉 橙子 水果 \(index)。
             涡轮 发动机 机械 设备 编号 \(index)。turbine engine machine \(index)。
+            Additional sentences make the body long enough for indexing, so the document is kept in the knowledge base.
             """
             try text.write(to: kb.appendingPathComponent("doc\(index).md"),
                            atomically: true, encoding: .utf8)
@@ -181,6 +182,7 @@ final class RAGEngineANNTests: XCTestCase {
         # 文档 4
 
         Apple banana orange fruit 4. 苹果 香蕉 橙子 水果 4。
+        Additional sentences make the body long enough for indexing, so the document is kept in the knowledge base.
         """
         try extra.write(to: kb.appendingPathComponent("doc4.md"),
                         atomically: true, encoding: .utf8)

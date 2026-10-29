@@ -434,27 +434,9 @@ public actor MarkdownConversionService {
     /// 因此永远不会多份大 PDF 同时解析）；轻文件按 `baseConcurrency`
     /// （最多 6）打包，批内并发。返回的下标始终保持发现顺序。
     static func batchIndices(fileSizes: [Int64], baseConcurrency: Int) -> [[Int]] {
-        let concurrency = max(1, min(baseConcurrency, 6))
-        var batches: [[Int]] = []
-        var light: [Int] = []
-
-        func flushLight() {
-            guard !light.isEmpty else { return }
-            batches.append(light)
-            light.removeAll(keepingCapacity: true)
-        }
-
-        for (index, size) in fileSizes.enumerated() {
-            if size >= heavyFileBytes {
-                flushLight()
-                batches.append([index])
-            } else {
-                light.append(index)
-                if light.count >= concurrency { flushLight() }
-            }
-        }
-        flushLight()
-        return batches
+        PDFProcessingPlan.batchIndices(fileSizes: fileSizes,
+                                       baseConcurrency: baseConcurrency,
+                                       heavyFileBytes: heavyFileBytes)
     }
 
     // MARK: - 文件发现与输出路径

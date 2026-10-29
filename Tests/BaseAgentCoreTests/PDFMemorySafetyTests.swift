@@ -136,6 +136,86 @@ final class PDFMemorySafetyTests: XCTestCase {
         XCTAssertTrue(extraction.text.contains("image-heavy layout"), extraction.text)
     }
 
+    /// 单张全页扫描图（常见扫描书每页只有 1 张大图）也必须走有界扫描器：
+    /// PDFKit 文本行布局只要遇到大图就可能病态膨胀，不能只按图片数量判断。
+    func testSingleLargeImagePageUsesBoundedTextScanner() throws {
+        let url = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("pdf-single-large-image-\(UUID().uuidString).pdf")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try makeTextAndImagePDF(at: url,
+                                text: Self.textLayerSample,
+                                imageCount: 1,
+                                imageWidth: 4_000,
+                                imageHeight: 3_000)
+
+        let document = try XCTUnwrap(PDFDocument(url: url))
+        let page = try XCTUnwrap(document.page(at: 0))
+        let cgPage = try XCTUnwrap(page.pageRef)
+
+        let profile = PDFTextExtractor.imageProfile(for: cgPage)
+        XCTAssertEqual(profile.count, 1)
+        XCTAssertGreaterThanOrEqual(profile.pixelCount,
+                                    PDFTextExtractor.riskySingleImagePixels,
+                                    "4000×3000 的全页图应触发有界扫描器")
+
+        let extraction = PDFTextExtractor.text(for: page)
+        XCTAssertTrue(extraction.usedScanner,
+                      "大图页不能交给 PDFKit 做文本行布局")
+        XCTAssertTrue(extraction.text.contains("image-heavy layout"), extraction.text)
+    }
+
+    /// 大量中等图片的总像素同样危险：单张不大、总量很大时也必须走扫描器。
+    func testManyMediumImagesUseBoundedTextScanner() throws {
+        let url = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("pdf-many-medium-images-\(UUID().uuidString).pdf")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try makeTextAndImagePDF(at: url,
+                                text: Self.textLayerSample,
+                                imageCount: 10,
+                                imageWidth: 1_200,
+                                imageHeight: 900)
+
+        let document = try XCTUnwrap(PDFDocument(url: url))
+        let page = try XCTUnwrap(document.page(at: 0))
+        let cgPage = try XCTUnwrap(page.pageRef)
+
+        let profile = PDFTextExtractor.imageProfile(for: cgPage)
+        XCTAssertEqual(profile.count, 10)
+        XCTAssertGreaterThanOrEqual(profile.pixelCount,
+                                    PDFTextExtractor.riskyTotalImagePixels,
+                                    "10 张 1.08MP 图片合计已超过安全阈值")
+
+        let extraction = PDFTextExtractor.text(for: page)
+        XCTAssertTrue(extraction.usedScanner,
+                      "总像素过大的页面不能交给 PDFKit")
+    }
+
+    /// 小图标/小装饰图不影响阅读顺序，继续走 PDFKit，避免无谓降低文本质量。
+    func testSmallImagePageKeepsPDFKitExtraction() throws {
+        let url = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("pdf-small-image-\(UUID().uuidString).pdf")
+        defer { try? FileManager.default.removeItem(at: url) }
+        try makeTextAndImagePDF(at: url,
+                                text: Self.textLayerSample,
+                                imageCount: 1,
+                                imageWidth: 64,
+                                imageHeight: 64)
+
+        let document = try XCTUnwrap(PDFDocument(url: url))
+        let page = try XCTUnwrap(document.page(at: 0))
+        let cgPage = try XCTUnwrap(page.pageRef)
+
+        let profile = PDFTextExtractor.imageProfile(for: cgPage)
+        XCTAssertEqual(profile.count, 1)
+        XCTAssertLessThan(profile.pixelCount,
+                          PDFTextExtractor.riskySingleImagePixels)
+
+        let extraction = PDFTextExtractor.text(for: page)
+        XCTAssertFalse(extraction.usedScanner,
+                       "小图页应继续使用 PDFKit 文本层")
+        XCTAssertTrue(extraction.text.contains("image-heavy layout"), extraction.text)
+    }
+
     /// 低图片页继续使用 PDFKit，保持原有阅读顺序与分段行为。
     func testLowImagePageKeepsPDFKitExtraction() throws {
         let url = URL(fileURLWithPath: NSTemporaryDirectory())
@@ -326,7 +406,9 @@ final class PDFMemorySafetyTests: XCTestCase {
     /// 图片对象刻意分开编号，确保页面的 `/XObject` 字典里有真实的图片数量。
     private func makeTextAndImagePDF(at url: URL,
                                      text: String,
-                                     imageCount: Int) throws {
+                                     imageCount: Int,
+                                     imageWidth: Int = 64,
+                                     imageHeight: Int = 64) throws {
         let jpeg = try makeJPEG(width: 64, height: 64)
         var data = Data()
         var offsets: [Int] = []
@@ -369,7 +451,7 @@ final class PDFMemorySafetyTests: XCTestCase {
 
         for _ in 0..<imageCount {
             addObject("""
-            << /Type /XObject /Subtype /Image /Width 64 /Height 64
+            << /Type /XObject /Subtype /Image /Width \(imageWidth) /Height \(imageHeight)
                /ColorSpace /DeviceRGB /BitsPerComponent 8 /Filter /DCTDecode
                /Length \(jpeg.count) >>
             """, stream: jpeg)

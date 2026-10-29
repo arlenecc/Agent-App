@@ -15,20 +15,45 @@ struct PDFPageTextExtraction {
 ///
 /// PDFKit 的 `PDFPage.string` 最终走 `CGPDFPageCopyString` →
 /// `PageLayout::getOrderedLayout` → `CRCTLD::findWhitespaceRegions`。
-/// 图片 XObject 很多的页面（教材/杂志/图文混排常见 100+ 张）会让这套
-/// 文本行布局的病态空白区域分析持续膨胀：实测 383 页 319MB 的 PDF 中，
-/// 第 18 页（392 张图）单页物理内存涨到 42GB 且长时间不返回。
+/// 页面里的图片 XObject 会让这套文本行布局的病态空白区域分析持续膨胀：
+/// 实测 383 页 319MB 的 PDF 中，第 18 页（392 张图）单页物理内存涨到 42GB
+/// 且长时间不返回。
 ///
-/// 这里的策略：
-/// - 图片 XObject 达到 `imageHeavyThreshold` 的页面不再调用 PDFKit，
+/// 因此不能只按图片数量判断：扫描书常见「每页只有 1 张 2000×3000 的全页图」，
+/// 图片少但像素极大，同样可能触发 PDFKit 布局爆炸。这里的策略：
+/// - 图片数量 ≥ `imageHeavyThreshold`、单图 ≥ `riskySingleImagePixels`、
+///   或页面图片总像素 ≥ `riskyTotalImagePixels` 的页面不再调用 PDFKit，
 ///   改用 `CGPDFScanner` 逐操作符读取文本（字体 + ToUnicode + 文本状态），
-///   不触发布局与障碍物分析，页级内存与图片数量无关；
+///   不触发布局与障碍物分析，页级内存与图片数量/像素数无关；
 /// - 低图片页继续走 `PDFPage.string`，保持原有成熟的阅读顺序与分段行为；
 /// - 扫描器输出为空时由解析器自然进入 OCR 路径，绝不回退到 PDFKit 文本层。
 enum PDFTextExtractor {
 
     /// 图片 XObject 达到该数量后不再调用 PDFKit 文本层。
     static let imageHeavyThreshold = 16
+    /// 单张图片像素数达到该值时不再调用 PDFKit（覆盖每页一张全页扫描图）。
+    static let riskySingleImagePixels: Int64 = 2_000_000
+    /// 页面图片总像素达到该值时不再调用 PDFKit（覆盖多张中等图片叠加）。
+    static let riskyTotalImagePixels: Int64 = 6_000_000
+    /// 跨文件同时进行的文本层提取上限。多文件并发时每个文件仍有 2-4 个
+    /// worker，若不设全局闸门，6 个文件会同时有 20 多页进入 PDFKit 布局；
+    /// 一旦某页触发病态分析，内存会成倍叠加。文本提取远快于 OCR，
+    /// 固定 3 路足以维持吞吐，又能把峰值乘数压住。
+    static var requestedConcurrency: Int?
+    static var maxConcurrentExtractions: Int { requestedConcurrency ?? 3 }
+    private static let extractionGate = AsyncSemaphore(value: maxConcurrentExtractions)
+
+    struct ImageProfile: Equatable {
+        let count: Int
+        let pixelCount: Int64
+        let largestPixelCount: Int64
+
+        var isMemoryRisky: Bool {
+            count >= PDFTextExtractor.imageHeavyThreshold
+                || largestPixelCount >= PDFTextExtractor.riskySingleImagePixels
+                || pixelCount >= PDFTextExtractor.riskyTotalImagePixels
+        }
+    }
     /// 单页输出上限：防御异常 PDF 无限输出文本。
     static let maxCharactersPerPage = 1_000_000
     /// Form XObject 递归深度上限（同时防御自引用循环）。
@@ -51,24 +76,63 @@ enum PDFTextExtractor {
                                          imageObjectCount: 0,
                                          usedScanner: false)
         }
-        let imageCount = imageObjectCount(for: cgPage)
-        guard imageCount >= imageHeavyThreshold else {
-            return PDFPageTextExtraction(text: page.string ?? "",
-                                         imageObjectCount: imageCount,
-                                         usedScanner: false)
+        let profile = imageProfile(for: cgPage)
+        guard !profile.isMemoryRisky else {
+            return PDFPageTextExtraction(text: scanText(for: cgPage),
+                                         imageObjectCount: profile.count,
+                                         usedScanner: true)
         }
-        return PDFPageTextExtraction(text: scanText(for: cgPage),
-                                     imageObjectCount: imageCount,
-                                     usedScanner: true)
+        return PDFPageTextExtraction(text: page.string ?? "",
+                                     imageObjectCount: profile.count,
+                                     usedScanner: false)
+    }
+
+    /// 跨文件限流的文本层提取：页面对象创建、PDFKit 布局与 autorelease
+    /// 都在闸门内完成，避免多文件并发时同时进入病态页面。
+    ///
+    /// PDFPage 由 PDFDocument 惰性创建；必须每页在池内创建并释放，
+    /// 否则整本书的页对象会一直挂在线程的自动释放池里。
+    static func extract(for document: PDFDocument,
+                        pageIndex: Int) async throws -> PDFPageTextExtraction? {
+        guard await extractionGate.acquire() else { throw AgentError.cancelled }
+        defer { extractionGate.release() }
+        guard !Task.isCancelled else { throw AgentError.cancelled }
+
+        let beforeMB = ProcessMemory.footprintMB()
+        let extraction: PDFPageTextExtraction? = autoreleasepool {
+            guard let page = document.page(at: pageIndex) else { return nil }
+            return text(for: page)
+        }
+        let afterMB = ProcessMemory.footprintMB()
+        // 单页文本提取正常只有几十 MB 波动；一旦某页出现 42GB 级病态布局，
+        // 这条日志会直接指出页码，避免再次靠猜定位。
+        // 只看单页增量：进程本来已占用较高（如 MLX 权重）时不应逐页刷屏。
+        if afterMB - beforeMB >= 256 {
+            let route = extraction?.usedScanner == true ? "scanner" : "PDFKit"
+            AgentLog.warning(
+                "[pdf] 第 \(pageIndex + 1) 页文本提取内存异常："
+                    + "+\(Int(afterMB - beforeMB))MB，当前 \(Int(afterMB))MB"
+                    + "（\(route)，图片 \(extraction?.imageObjectCount ?? 0) 个）")
+        }
+        return extraction
     }
 
     /// 统计页面资源里的图片 XObject 数量（含 Form XObject 内的图片）。
     static func imageObjectCount(for page: CGPDFPage) -> Int {
+        imageProfile(for: page).count
+    }
+
+    /// 页面图片画像：数量 + 像素总量，用于判断 PDFKit 文本布局是否安全。
+    static func imageProfile(for page: CGPDFPage) -> ImageProfile {
         guard let pageDictionary = page.dictionary,
-              let resources = resources(in: pageDictionary) else { return 0 }
+              let resources = resources(in: pageDictionary) else {
+            return ImageProfile(count: 0, pixelCount: 0, largestPixelCount: 0)
+        }
         let counter = ImageObjectCounter()
         counter.scan(resources: resources, depth: 0)
-        return counter.total
+        return ImageProfile(count: counter.total,
+                            pixelCount: counter.pixelCount,
+                            largestPixelCount: counter.largestPixelCount)
     }
 
     /// 用 `CGPDFScanner` 提取单页文本，不依赖页面布局。
@@ -126,6 +190,10 @@ enum PDFTextExtractor {
 
 private final class ImageObjectCounter {
     var total = 0
+    /// 页面图片声明的像素总数（Width × Height 累加，含 Form XObject 内图片）。
+    var pixelCount: Int64 = 0
+    /// 单张图片的最大像素数，用于识别「每页一张全页大图」的扫描书。
+    var largestPixelCount: Int64 = 0
     private var visitedForms: Set<CGPDFStreamRef> = []
 
     func scan(resources: CGPDFDictionaryRef, depth: Int) {
@@ -143,6 +211,9 @@ private final class ImageObjectCounter {
             switch String(cString: subtypePointer) {
             case "Image":
                 self.total += 1
+                let pixels = Self.pixelCount(of: dictionary)
+                self.pixelCount += pixels
+                self.largestPixelCount = max(self.largestPixelCount, pixels)
             case "Form" where depth < PDFTextExtractor.maxFormDepth:
                 guard self.visitedForms.insert(stream).inserted else { return true }
                 var formResources: CGPDFDictionaryRef?
@@ -154,6 +225,18 @@ private final class ImageObjectCounter {
             }
             return true
         }, nil)
+    }
+
+    /// 只读声明的 `/Width`、`/Height`，不解码图片数据。
+    /// 尺寸缺失或异常时按 0 计，仍由图片数量阈值兜底。
+    private static func pixelCount(of dictionary: CGPDFDictionaryRef) -> Int64 {
+        var width: CGPDFInteger = 0
+        var height: CGPDFInteger = 0
+        guard CGPDFDictionaryGetInteger(dictionary, "Width", &width),
+              CGPDFDictionaryGetInteger(dictionary, "Height", &height),
+              width > 0, height > 0 else { return 0 }
+        let (pixels, overflow) = Int64(width).multipliedReportingOverflow(by: Int64(height))
+        return overflow ? Int64.max : pixels
     }
 }
 

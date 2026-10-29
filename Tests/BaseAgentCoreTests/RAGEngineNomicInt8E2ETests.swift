@@ -22,6 +22,7 @@ final class RAGEngineNomicInt8E2ETests: XCTestCase {
 
         番茄炒蛋是一道常见的家常菜。先把鸡蛋打散，加少许盐，在热油中炒到凝固后盛出。
         锅里留底油，放入切块的番茄翻炒出汁，再把鸡蛋倒回锅中，加糖和盐调味，翻匀即可出锅。
+        这道菜酸甜开胃，适合搭配米饭，是很多家庭餐桌上的常见选择，营养也很均衡。
         """),
         ("sqlite-vec.md", """
         # sqlite-vec
@@ -57,6 +58,7 @@ final class RAGEngineNomicInt8E2ETests: XCTestCase {
         MLX 是 Apple 为自家芯片设计的机器学习框架。它使用统一内存，
         数组运算可以在 CPU 与 GPU 之间共享，不必显式拷贝。
         通过 mlx-swift 可以在 macOS 应用里直接加载量化后的大语言模型和嵌入模型。
+        框架同时提供神经网络算子与自动微分，方便在本地进行推理和微调实验，也支持把训练好的模型导出给其它应用调用。
         """),
     ]
 

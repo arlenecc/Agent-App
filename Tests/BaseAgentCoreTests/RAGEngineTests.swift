@@ -111,10 +111,12 @@ final class RAGEngineTests: XCTestCase {
         # 第一章 水果
 
         Apple and banana are common fruits. 苹果和香蕉都是常见水果。
+        Apple is a common fruit in daily meals. 苹果是日常饮食中的常见水果.
 
         # 第二章 机械
 
         Turbines and engines are machines. 涡轮和发动机属于机械。
+        Apple sentences keep the document clear of the short-body guard.
         """
         try markdown.write(to: kb.appendingPathComponent("fruits.md"),
                            atomically: true, encoding: .utf8)
@@ -161,6 +163,124 @@ final class RAGEngineTests: XCTestCase {
         engine.close()
     }
 
+    func testShortDocumentIsDiscardedAndSkippedNextRun() async throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("base-agent-rag-short-\(UUID().uuidString)")
+        let kb = root.appendingPathComponent("kb")
+        try FileManager.default.createDirectory(at: kb, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        // 只有书名与目录名：去掉标题/目录行后正文几乎为空。
+        try "# 书名\n\n目录\n\n第一章 绪论 1\n第二章 方法 5\n"
+            .write(to: kb.appendingPathComponent("junk.md"),
+                   atomically: true, encoding: .utf8)
+        try """
+        # 第一章 水果
+
+        Apple and banana are common fruits. 苹果和香蕉都是常见水果。
+        Turbines and engines are machines. 涡轮和发动机属于机械。
+        Additional sentences make the body long enough for indexing, so the document is kept in the knowledge base.
+        """
+            .write(to: kb.appendingPathComponent("fruits.md"),
+                   atomically: true, encoding: .utf8)
+
+        var config = AgentConfig()
+        config.workspace = root.path
+        config.knowledgeBase = kb.path
+        config.ragRerankEnabled = false
+        config.ragChunkSize = 40
+        config.ragChunkOverlap = 5
+
+        let engine = RAGEngine(config: config, knowledgeBase: kb.path,
+                               embedding: RagFakeEmbedding(), reranker: nil)
+        let first = await engine.ingest()
+        XCTAssertEqual(first.discarded, 1)
+        XCTAssertEqual(first.processed, 1)
+        XCTAssertTrue(first.errors.isEmpty, first.errors.joined(separator: "; "))
+        XCTAssertEqual(engine.listDocuments(), ["fruits.md"])
+
+        // 内容未变化时不再重新解析，直接按 manifest 标记跳过。
+        let second = await engine.ingest()
+        XCTAssertEqual(second.discarded, 0)
+        XCTAssertEqual(second.processed, 0)
+        XCTAssertEqual(second.skipped, 2)
+        engine.close()
+    }
+
+    func testShortenedDocumentRemovesPreviousIndex() async throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("base-agent-rag-shorten-\(UUID().uuidString)")
+        let kb = root.appendingPathComponent("kb")
+        try FileManager.default.createDirectory(at: kb, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let file = kb.appendingPathComponent("book.md")
+        try """
+        # 第一章 水果
+
+        Apple and banana are common fruits. 苹果和香蕉都是常见水果。
+        Turbines and engines are machines. 涡轮和发动机属于机械。
+        Additional sentences make the body long enough for indexing, so the document is kept in the knowledge base.
+        """
+            .write(to: file, atomically: true, encoding: .utf8)
+
+        var config = AgentConfig()
+        config.workspace = root.path
+        config.knowledgeBase = kb.path
+        config.ragRerankEnabled = false
+        config.ragChunkSize = 40
+        config.ragChunkOverlap = 5
+
+        let engine = RAGEngine(config: config, knowledgeBase: kb.path,
+                               embedding: RagFakeEmbedding(), reranker: nil)
+        let first = await engine.ingest()
+        XCTAssertEqual(first.processed, 1)
+        XCTAssertEqual(engine.listDocuments().count, 1)
+        let indexedHits = try await engine.search(query: "apple", topK: 3)
+        XCTAssertFalse(indexedHits.isEmpty)
+
+        // 文件被改短（大小变化触发重新解析）：旧切片/文档/缓存必须一起清掉。
+        try "# 书名\n\n目录\n".write(to: file, atomically: true, encoding: .utf8)
+        let second = await engine.ingest()
+        XCTAssertEqual(second.discarded, 1)
+        XCTAssertTrue(engine.listDocuments().isEmpty)
+        XCTAssertNil(engine.getDocumentOutline(docName: "book.md"))
+        let remainingHits = try await engine.search(query: "apple", topK: 3)
+        XCTAssertTrue(remainingHits.isEmpty)
+        engine.close()
+    }
+
+    func testShortBodyThresholdKeepsOneHundredCharacters() async throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("base-agent-rag-threshold-\(UUID().uuidString)")
+        let kb = root.appendingPathComponent("kb")
+        try FileManager.default.createDirectory(at: kb, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        // 标题行不计入正文：正文 99 字丢弃，100 字正常入库。
+        try "# 标题\n\n\(String(repeating: "a", count: 99))\n"
+            .write(to: kb.appendingPathComponent("drop.md"),
+                   atomically: true, encoding: .utf8)
+        try "# 标题\n\n\(String(repeating: "a", count: 100))\n"
+            .write(to: kb.appendingPathComponent("keep.md"),
+                   atomically: true, encoding: .utf8)
+
+        var config = AgentConfig()
+        config.workspace = root.path
+        config.knowledgeBase = kb.path
+        config.ragRerankEnabled = false
+        config.ragChunkSize = 40
+        config.ragChunkOverlap = 5
+
+        let engine = RAGEngine(config: config, knowledgeBase: kb.path,
+                               embedding: RagFakeEmbedding(), reranker: nil)
+        let stats = await engine.ingest()
+        XCTAssertEqual(stats.discarded, 1)
+        XCTAssertEqual(stats.processed, 1)
+        XCTAssertEqual(engine.listDocuments(), ["keep.md"])
+        engine.close()
+    }
+
     func testCancelledFullRebuildResumesFromUnfinishedFiles() async throws {
         let root = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("base-agent-rag-resume-\(UUID().uuidString)")
@@ -174,6 +294,7 @@ final class RAGEngineTests: XCTestCase {
 
             Apple banana orange fruit \(index). 苹果 香蕉 橙子 水果 \(index)。
             这是一段用于验证中断续跑的文件内容，编号 \(index)。
+            Additional sentences make the body long enough for indexing, so the document is kept in the knowledge base.
             """
             try text.write(to: kb.appendingPathComponent("doc\(index).md"),
                            atomically: true, encoding: .utf8)
@@ -236,6 +357,7 @@ final class RAGEngineTests: XCTestCase {
 
         Apple banana orange fruit. 苹果 香蕉 橙子 水果。
         这是用于验证跨目录重复文件的正文。
+        Additional sentences make the body long enough for indexing, so the document is kept in the knowledge base.
         """
         try content.write(to: dirA.appendingPathComponent("book.md"),
                           atomically: true, encoding: .utf8)
@@ -275,8 +397,9 @@ final class RAGEngineTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
 
         let path = kb.appendingPathComponent("note.md")
-        let contentA = "# 标题\n\n版本一正文。"
-        let contentB = "# 标题\n\n版本二正文。"
+        // 两个版本长度一致（同尺寸改动），正文都超过过短丢弃阈值。
+        let contentA = "# 标题\n\n" + String(repeating: "版本一正文。", count: 20)
+        let contentB = "# 标题\n\n" + String(repeating: "版本二正文。", count: 20)
         XCTAssertEqual(contentA.utf8.count, contentB.utf8.count,
                        "构造同尺寸改动，才需要指纹兜底")
         try contentA.write(to: path, atomically: true, encoding: .utf8)
@@ -326,10 +449,11 @@ final class RAGEngineTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: root) }
 
         // 原始字节不同（空行/结尾不同），清洗后的正文完全一致。
-        try "# 同一本书\n\n正文内容。" .write(
+        let body = String(repeating: "正文内容。", count: 30)
+        try "# 同一本书\n\n\(body)".write(
             to: dirA.appendingPathComponent("book.md"),
             atomically: true, encoding: .utf8)
-        try "# 同一本书\n\n\n正文内容。\n".write(
+        try "# 同一本书\n\n\n\(body)\n".write(
             to: dirB.appendingPathComponent("book.md"),
             atomically: true, encoding: .utf8)
 
@@ -366,10 +490,10 @@ final class RAGEngineTests: XCTestCase {
         try FileManager.default.createDirectory(at: kb, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
 
-        try "# 甲\n\n这是甲文档独有的正文。".write(
+        try "# 甲\n\n\(String(repeating: "这是甲文档独有的正文。", count: 12))".write(
             to: kb.appendingPathComponent("a.md"),
             atomically: true, encoding: .utf8)
-        try "# 乙\n\n这是乙文档独有的正文。".write(
+        try "# 乙\n\n\(String(repeating: "这是乙文档独有的正文。", count: 12))".write(
             to: kb.appendingPathComponent("b.md"),
             atomically: true, encoding: .utf8)
 
@@ -377,7 +501,8 @@ final class RAGEngineTests: XCTestCase {
         config.workspace = root.path
         config.knowledgeBase = kb.path
         config.ragRerankEnabled = false
-        config.ragChunkSize = 40
+        // 每个文档保持单切片，便于按切片数验证重复清理。
+        config.ragChunkSize = 500
         config.ragChunkOverlap = 2
 
         let engine = RAGEngine(config: config, knowledgeBase: kb.path,
@@ -455,6 +580,7 @@ final class RAGEngineTests: XCTestCase {
             # 文档 \(index)
 
             这是用于验证切片缺失后增量同步会重建的第 \(index) 个文件。
+            Additional sentences make the body long enough for indexing, so the document is kept in the knowledge base.
             """.write(to: kb.appendingPathComponent("doc\(index).md"),
                       atomically: true, encoding: .utf8)
         }
@@ -508,6 +634,7 @@ final class RAGEngineTests: XCTestCase {
             # 文档 \(index)
 
             这是用于验证失败页重试的第 \(index) 个文件。
+            Additional sentences make the body long enough for indexing, so the document is kept in the knowledge base.
             """.write(to: kb.appendingPathComponent("doc\(index).md"),
                       atomically: true, encoding: .utf8)
         }
@@ -549,6 +676,7 @@ final class RAGEngineTests: XCTestCase {
             # 文档 \(index)
 
             旧版 manifest 缺少完成标记时，增量同步应重新处理该文件。
+            Additional sentences make the body long enough for indexing, so the document is kept in the knowledge base.
             """.write(to: kb.appendingPathComponent("doc\(index).md"),
                       atomically: true, encoding: .utf8)
         }
@@ -602,10 +730,10 @@ final class RAGEngineTests: XCTestCase {
         try FileManager.default.createDirectory(at: kbB, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
 
-        try "# 甲\n\n甲库独有正文，用于验证切库后索引保留。".write(
-            to: kbA.appendingPathComponent("a.md"), atomically: true, encoding: .utf8)
-        try "# 乙\n\n乙库独有正文，用于验证切库后索引保留。".write(
-            to: kbB.appendingPathComponent("b.md"), atomically: true, encoding: .utf8)
+        try "# 甲\n\n甲库独有正文，用于验证切库后索引保留。\nAdditional sentences make the body long enough for indexing, so the document is kept in the knowledge base."
+            .write(to: kbA.appendingPathComponent("a.md"), atomically: true, encoding: .utf8)
+        try "# 乙\n\n乙库独有正文，用于验证切库后索引保留。\nAdditional sentences make the body long enough for indexing, so the document is kept in the knowledge base."
+            .write(to: kbB.appendingPathComponent("b.md"), atomically: true, encoding: .utf8)
 
         var config = AgentConfig()
         config.workspace = root.path
@@ -702,6 +830,7 @@ final class RAGEngineTests: XCTestCase {
 
         这是用于验证切片参数变化会触发重建的正文内容，多个句子。
         第二句用于让切片边界随参数变化。第三句补齐长度。
+        Additional sentences make the body long enough for indexing, so the document is kept in the knowledge base.
         """.write(to: kb.appendingPathComponent("doc.md"),
                   atomically: true, encoding: .utf8)
 
@@ -808,9 +937,9 @@ final class RAGEngineTests: XCTestCase {
         let kb = root.appendingPathComponent("kb")
         try FileManager.default.createDirectory(at: kb, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
-        try "# 标题\n\n用于验证状态快照失效的正文。".write(
-            to: kb.appendingPathComponent("a.md"),
-            atomically: true, encoding: .utf8)
+        try "# 标题\n\n用于验证状态快照失效的正文。\nAdditional sentences make the body long enough for indexing, so the document is kept in the knowledge base."
+            .write(to: kb.appendingPathComponent("a.md"),
+                   atomically: true, encoding: .utf8)
 
         var config = AgentConfig()
         config.workspace = root.path
@@ -854,10 +983,12 @@ final class RAGEngineTests: XCTestCase {
         let other = (0..<5_000).map { "apple banana fruit \($0).\n" }.joined()
         try other.write(to: kb.appendingPathComponent("other.md"),
                         atomically: true, encoding: .utf8)
-        try "zebra quokka".write(to: kb.appendingPathComponent("target-a.md"),
-                                 atomically: true, encoding: .utf8)
-        try "volcano glacier".write(to: kb.appendingPathComponent("target-b.md"),
-                                    atomically: true, encoding: .utf8)
+        try String(repeating: "zebra quokka ", count: 10)
+            .write(to: kb.appendingPathComponent("target-a.md"),
+                   atomically: true, encoding: .utf8)
+        try String(repeating: "volcano glacier ", count: 10)
+            .write(to: kb.appendingPathComponent("target-b.md"),
+                   atomically: true, encoding: .utf8)
 
         var config = AgentConfig()
         config.workspace = root.path
@@ -934,17 +1065,20 @@ final class RAGEngineTests: XCTestCase {
         try FileManager.default.createDirectory(at: kb, withIntermediateDirectories: true)
         defer { try? FileManager.default.removeItem(at: root) }
 
-        try "zebra quokka".write(to: kb.appendingPathComponent("target-a.md"),
-                                 atomically: true, encoding: .utf8)
-        try "apple banana".write(to: kb.appendingPathComponent("other.md"),
-                                 atomically: true, encoding: .utf8)
+        try String(repeating: "zebra quokka ", count: 10)
+            .write(to: kb.appendingPathComponent("target-a.md"),
+                   atomically: true, encoding: .utf8)
+        try String(repeating: "apple banana ", count: 10)
+            .write(to: kb.appendingPathComponent("other.md"),
+                   atomically: true, encoding: .utf8)
 
         var config = AgentConfig()
         config.workspace = root.path
         config.knowledgeBase = kb.path
         config.ragRerankEnabled = false
         config.ragSemanticChunking = false
-        config.ragChunkSize = 20
+        // 每个来源单切片，便于直接按切片数断言。
+        config.ragChunkSize = 500
         config.ragChunkOverlap = 0
 
         let engine = RAGEngine(config: config, knowledgeBase: kb.path,

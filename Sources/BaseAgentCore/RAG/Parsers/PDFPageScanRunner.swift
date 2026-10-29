@@ -18,8 +18,11 @@ enum PDFPageScanRunner {
 
     struct Outcome {
         let index: Int
-        /// 空白页 / 产图失败为 true：调用方按空文本处理。
+        /// 空白页为 true：调用方按空文本处理，不计为失败。
         let isBlank: Bool
+        /// 产图失败为 true。与空白页分开记录，调用方必须计入 failed_pages，
+        /// 否则整份文件会被标记 complete，失败页再也不会重试。
+        var renderFailed: Bool = false
         /// perPage 产出的文本；nil 表示该页识别失败（或需调用方另行处理）。
         let text: String?
         let needsVLM: Bool
@@ -152,8 +155,14 @@ enum PDFPageScanRunner {
                                     dpi: dpi)
                             }
                             let renderSeconds = Date().timeIntervalSince(renderStarted)
-                            guard let image,
-                                  !PDFPageRenderer.isNearlyBlank(image) else {
+                            guard let image else {
+                                outcomes.append(Outcome(index: pageIndex, isBlank: true,
+                                                        renderFailed: true,
+                                                        text: nil, needsVLM: false,
+                                                        renderSeconds: renderSeconds))
+                                return true
+                            }
+                            guard !PDFPageRenderer.isNearlyBlank(image) else {
                                 outcomes.append(Outcome(index: pageIndex, isBlank: true,
                                                         text: nil, needsVLM: false,
                                                         renderSeconds: renderSeconds))

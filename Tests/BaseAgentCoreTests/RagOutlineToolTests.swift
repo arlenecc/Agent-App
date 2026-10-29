@@ -123,6 +123,7 @@ final class RagOutlineToolTests: XCTestCase {
         # 第一章 水果
 
         苹果和香蕉都是常见水果。
+        Additional sentences make the body long enough for indexing, so the document is kept in the knowledge base.
 
         # 第二章 机械
 
@@ -166,6 +167,7 @@ final class RagOutlineToolTests: XCTestCase {
         # 第一章 水果
 
         苹果和香蕉都是常见水果。
+        Additional sentences make the body long enough for indexing, so the document is kept in the knowledge base.
 
         # 第二章 机械
 
@@ -184,8 +186,18 @@ final class RagOutlineToolTests: XCTestCase {
     }
 
     func testDocumentLookupPrefersExactFullPath() async throws {
-        try write("# 第一章 甲报告\n\nbookA 的独有正文。", relativePath: "bookA/report.md")
-        try write("# 第一章 乙报告\n\nbookB 的独有正文。", relativePath: "bookB/report.md")
+        try write("""
+        # 第一章 甲报告
+
+        bookA 的独有正文。
+        Additional sentences make the body long enough for indexing, so the document is kept in the knowledge base.
+        """, relativePath: "bookA/report.md")
+        try write("""
+        # 第一章 乙报告
+
+        bookB 的独有正文。
+        Additional sentences make the body long enough for indexing, so the document is kept in the knowledge base.
+        """, relativePath: "bookB/report.md")
         let engine = makeEngine()
         _ = await engine.ingest()
 

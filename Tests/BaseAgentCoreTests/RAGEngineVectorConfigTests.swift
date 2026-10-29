@@ -38,10 +38,12 @@ final class RAGEngineVectorConfigTests: XCTestCase {
         # 第一章 水果
 
         苹果香蕉和橙子是常见的水果。水果富含维生素，适合日常食用。
+        补充一段用于保证正文长度超过过短丢弃阈值的说明文字。
 
         # 第二章 机械
 
         发动机与涡轮机属于机械装置，用于把能量转换为动力。
+        补充一段用于保证正文长度超过过短丢弃阈值的说明文字。
         """.write(to: kb.appendingPathComponent("doc.md"),
                   atomically: true, encoding: .utf8)
     }

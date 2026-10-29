@@ -78,4 +78,35 @@ struct PDFProcessingPlan: Equatable, Sendable {
         let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
         return (attributes?[.size] as? NSNumber)?.int64Value ?? 0
     }
+
+    /// 按文件体积分批：达到 `heavyFileBytes` 的文件单独成批，批与批之间
+    /// 串行，因此多份大 PDF 永远不会同时解析；轻文件按 `baseConcurrency`
+    /// （最多 6）打包，批内并发。返回下标保持发现顺序。
+    ///
+    /// 供知识库同步与 Markdown 转换工具共用，避免两处分批策略漂移。
+    static func batchIndices(fileSizes: [Int64],
+                             baseConcurrency: Int,
+                             heavyFileBytes threshold: Int64 = PDFProcessingPlan.heavyFileBytes) -> [[Int]] {
+        let concurrency = max(1, min(baseConcurrency, 6))
+        var batches: [[Int]] = []
+        var light: [Int] = []
+
+        func flushLight() {
+            guard !light.isEmpty else { return }
+            batches.append(light)
+            light.removeAll(keepingCapacity: true)
+        }
+
+        for (index, size) in fileSizes.enumerated() {
+            if size >= threshold {
+                flushLight()
+                batches.append([index])
+            } else {
+                light.append(index)
+                if light.count >= concurrency { flushLight() }
+            }
+        }
+        flushLight()
+        return batches
+    }
 }

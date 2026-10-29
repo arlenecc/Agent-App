@@ -9,6 +9,7 @@ private struct TextLayerOutcome: Sendable {
     var textPages = 0
     var tableRegions = 0
     var scannerPages = 0
+    var failedPages = 0
     var textSeconds = 0.0
     var ocrSeconds = 0.0
 }
@@ -118,17 +119,16 @@ public final class OvisPDFParser: DocumentParser, VLMBackedParser {
                         if Task.isCancelled { throw AgentError.cancelled }
                         let pageNumber = index + 1
                         progress?(.page(index: pageNumber, total: pageLimit, stage: "text"))
-                        guard let page = workerDocument.page(at: index) else {
-                            outcome.texts.append((index, ""))
-                            continue
-                        }
-                        // 每页排空 autorelease pool：PDFPage 对象与 PDFKit
-                        // 解析缓存不随循环自动释放，整本书会持续累积。
-                        // 图片 XObject 多的页面由 PDFTextExtractor 改用
-                        // CGPDFScanner，避免 PDFKit 文本行布局内存爆炸。
+                        // 每页在全局闸门内创建/释放 PDFPage：多文件并发时
+                        // 不会同时有过多页面进入 PDFKit 文本行布局。
+                        // 图片多/像素大的页面由提取器改用 CGPDFScanner。
                         let textStarted = Date()
-                        let extraction: PDFPageTextExtraction = autoreleasepool {
-                            PDFTextExtractor.text(for: page)
+                        let extraction = try await PDFTextExtractor.extract(
+                            for: workerDocument, pageIndex: index)
+                        guard let extraction else {
+                            outcome.texts.append((index, ""))
+                            outcome.failedPages += 1
+                            continue
                         }
                         let rawText = extraction.text
                         if extraction.usedScanner { outcome.scannerPages += 1 }
@@ -144,7 +144,8 @@ public final class OvisPDFParser: DocumentParser, VLMBackedParser {
                             // `page.selection(for:)` 无法映射，跳过表格替换。
                             if !extraction.usedScanner,
                                let replaced = await Self.replacingTables(
-                                in: page, text: rawText, pageNumber: pageNumber,
+                                document: workerDocument, pageIndex: index,
+                                text: rawText, pageNumber: pageNumber,
                                 options: options, vlm: tableVLM) {
                                 pageText = replaced.text
                                     .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -173,6 +174,7 @@ public final class OvisPDFParser: DocumentParser, VLMBackedParser {
             textPages += outcome.textPages
             tableRegions += outcome.tableRegions
             scannerPages += outcome.scannerPages
+            failedPages += outcome.failedPages
             for (index, text) in outcome.texts { pageTexts[index] = text }
             scanPages.append(contentsOf: outcome.scanPages)
         }
@@ -209,7 +211,8 @@ public final class OvisPDFParser: DocumentParser, VLMBackedParser {
                         preprocess: options.ocrPreprocess,
                         binarize: options.ocrBinarize,
                         languages: options.ocrLanguages)
-                    let cleaned = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                    let cleaned = (result.text ?? "")
+                        .trimmingCharacters(in: .whitespacesAndNewlines)
                     if DocumentCleaner.effectiveCharacterCount(cleaned)
                         >= Self.visionMinCharacters {
                         return (text: cleaned, needsVLM: false,
@@ -225,6 +228,11 @@ public final class OvisPDFParser: DocumentParser, VLMBackedParser {
                 renderSeconds += outcome.renderSeconds
                 visionSeconds += outcome.ocrSeconds
                 if outcome.isBlank {
+                    if outcome.renderFailed {
+                        failedPages += 1
+                        AgentLog.warning(
+                            "PDF 第 \(outcome.index + 1) 页渲染失败，已跳过")
+                    }
                     pageTexts[outcome.index] = ""
                 } else if let text = outcome.text {
                     pageTexts[outcome.index] = text
@@ -330,7 +338,13 @@ public final class OvisPDFParser: DocumentParser, VLMBackedParser {
                 renderSeconds += outcome.renderSeconds
                 ocrSeconds += outcome.ocrSeconds
                 if outcome.isBlank {
-                    // 空白页或产图失败，不算 OCR 失败。
+                    // 空白页不算失败；产图失败必须计入 failed_pages，
+                    // 否则整份文件会被标记 complete，失败页不再重试。
+                    if outcome.renderFailed {
+                        failedPages += 1
+                        AgentLog.warning(
+                            "PDF 第 \(outcome.index + 1) 页渲染失败，已跳过")
+                    }
                     pageTexts[outcome.index] = ""
                     continue
                 }
@@ -359,6 +373,9 @@ public final class OvisPDFParser: DocumentParser, VLMBackedParser {
             return [DocumentCleaner.pageMarker(index + 1), body]
         }
         let markdown = sections.joined(separator: "\n\n")
+        // 因视觉模型不可用而未能识别的扫描页同样是缺失内容：
+        // 计入 failed_pages，配置修复后的下次同步会重试该文件。
+        failedPages += missingOCRPages
 
         guard pageTexts.contains(where: { !($0 ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }) else {
             if missingOCRPages > 0 {
@@ -410,49 +427,68 @@ public final class OvisPDFParser: DocumentParser, VLMBackedParser {
 
     // MARK: - 纯文本页中的表格
 
+    /// 页内表格裁剪结果：裁剪图与文本区间。CGImage 在池外由本结构强引用，
+    /// 可以安全暴露给跨 await 的 VLM 调用。
+    private struct TableCrop {
+        let range: NSRange
+        let image: CGImage
+    }
+
     /// 在文本页中识别表格行块，只裁剪表格区域交给 OvisOCR3 转 Markdown，
     /// 再把返回内容替换回原位置；页面其它文本保持不变。
     /// 静态方法：文本层并行时每个 worker 都能安全调用，VLM 由调用方统一解析。
-    private static func replacingTables(in page: PDFPage, text: String, pageNumber: Int,
+    ///
+    /// `PDFPage` 只在同步的 autoreleasepool 内使用：选区、整页渲染与裁剪
+    /// 全部完成后再 await VLM。否则页面对象会跨异步调用驻留，多文件并发时
+    /// 解析缓存无法释放。
+    private static func replacingTables(document: PDFDocument, pageIndex: Int,
+                                        text: String, pageNumber: Int,
                                         options: ParserOptions,
                                         vlm: VLMService?)
         async -> (text: String, count: Int)? {
         let blocks = Self.tableBlocks(in: text)
         guard !blocks.isEmpty else { return nil }
-
-        let rotation = ((page.rotation % 360) + 360) % 360
-        guard rotation == 0 else {
-            AgentLog.warning("PDF 第 \(pageNumber) 页旋转 \(page.rotation)°，表格裁剪暂不支持，保留文本层")
-            return nil
-        }
         guard let vlm, vlm.isAvailable else {
             AgentLog.warning("PDF 第 \(pageNumber) 页检测到表格，但 OvisOCR3 不可用，保留文本层")
             return nil
         }
-        // 整页图在多次 VLM 调用期间驻留，但渲染产生的中间对象应立即释放；
-        // 返回的 CGImage 由 fullImage 强引用，不受 pool 影响。
-        guard let fullImage = autoreleasepool(invoking: {
-            PDFPageRenderer.render(page: page, dpi: 300, maxLongSide: 4_096)
-        }) else {
-            AgentLog.warning("PDF 第 \(pageNumber) 页表格区域渲染失败，保留文本层")
-            return nil
+
+        let crops: [TableCrop] = autoreleasepool {
+            guard let page = document.page(at: pageIndex) else { return [] }
+            let rotation = ((page.rotation % 360) + 360) % 360
+            guard rotation == 0 else {
+                AgentLog.warning(
+                    "PDF 第 \(pageNumber) 页旋转 \(page.rotation)°，表格裁剪暂不支持，保留文本层")
+                return []
+            }
+            guard let fullImage = PDFPageRenderer.render(
+                page: page, dpi: 300, maxLongSide: 4_096) else {
+                AgentLog.warning("PDF 第 \(pageNumber) 页表格区域渲染失败，保留文本层")
+                return []
+            }
+
+            var crops: [TableCrop] = []
+            for range in blocks {
+                guard let selection = page.selection(for: range) else { continue }
+                var bounds = selection.bounds(for: page)
+                guard !bounds.isNull, !bounds.isInfinite,
+                      bounds.width > 8, bounds.height > 8 else { continue }
+                bounds = bounds.insetBy(dx: -6, dy: -6)
+                guard let cropped = PDFPageRenderer.crop(
+                    image: fullImage, page: page, rect: bounds) else { continue }
+                crops.append(TableCrop(range: range, image: cropped))
+            }
+            return crops
         }
+        guard !crops.isEmpty else { return nil }
 
         var replacements: [(range: NSRange, markdown: String)] = []
-        for range in blocks {
+        for crop in crops {
             if Task.isCancelled { return nil }
-            guard let selection = page.selection(for: range) else { continue }
-            var bounds = selection.bounds(for: page)
-            guard !bounds.isNull, !bounds.isInfinite,
-                  bounds.width > 8, bounds.height > 8 else { continue }
-            bounds = bounds.insetBy(dx: -6, dy: -6)
-            guard let cropped = PDFPageRenderer.crop(image: fullImage, page: page,
-                                                     rect: bounds) else { continue }
-
             let source = options.ocrPreprocess
-                ? (OCRImagePreprocessor.normalize(cropped,
-                                                  binarize: options.ocrBinarize) ?? cropped)
-                : cropped
+                ? (OCRImagePreprocessor.normalize(crop.image,
+                                                  binarize: options.ocrBinarize) ?? crop.image)
+                : crop.image
             do {
                 let raw = try await vlm.recognize(image: source,
                                                   prompt: OvisPrompt.tableToMarkdown,
@@ -465,7 +501,7 @@ public final class OvisPDFParser: DocumentParser, VLMBackedParser {
                         "PDF 第 \(pageNumber) 页表格 OCR 结果为空，保留文本层")
                     continue
                 }
-                replacements.append((range, markdown))
+                replacements.append((crop.range, markdown))
             } catch AgentError.cancelled {
                 return nil
             } catch {

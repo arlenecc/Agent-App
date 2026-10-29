@@ -127,7 +127,12 @@ final class QueryTimeoutTests: XCTestCase {
 
     func testStatusReturnsSkipSnapshotOnTimeout() async throws {
         let root = directory.appendingPathComponent("status-timeout")
-        let (engine, _) = try makeEngine(root, text: "# 标题\n\n用于验证状态查询超时的正文内容。")
+        let (engine, _) = try makeEngine(root, text: """
+        # 标题
+
+        用于验证状态查询超时的正文内容。
+        Additional sentences make the body long enough for indexing, so the document is kept in the knowledge base.
+        """)
         defer { engine.close() }
         _ = await engine.ingest()
 
@@ -144,7 +149,12 @@ final class QueryTimeoutTests: XCTestCase {
 
     func testSearchThrowsTimeoutInsteadOfHanging() async throws {
         let root = directory.appendingPathComponent("search-timeout")
-        let (engine, _) = try makeEngine(root, text: "# 水果\n\nApple and banana are fruits. 苹果和香蕉。")
+        let (engine, _) = try makeEngine(root, text: """
+        # 水果
+
+        Apple and banana are fruits. 苹果和香蕉。
+        Additional apple sentences make the body long enough for indexing, so the document is kept in the knowledge base.
+        """)
         defer { engine.close() }
         _ = await engine.ingest()
 
@@ -163,8 +173,12 @@ final class QueryTimeoutTests: XCTestCase {
         let root = directory.appendingPathComponent("search-config")
         let kb = root.appendingPathComponent("kb")
         try FileManager.default.createDirectory(at: kb, withIntermediateDirectories: true)
-        try "# 水果\n\nApple and banana are fruits.".write(
-            to: kb.appendingPathComponent("a.md"), atomically: true, encoding: .utf8)
+        try """
+        # 水果
+
+        Apple and banana are fruits.
+        Additional apple sentences make the body long enough for indexing, so the document is kept in the knowledge base.
+        """.write(to: kb.appendingPathComponent("a.md"), atomically: true, encoding: .utf8)
         var config = AgentConfig()
         config.workspace = root.path
         config.knowledgeBase = kb.path
