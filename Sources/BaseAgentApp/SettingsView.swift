@@ -550,17 +550,14 @@ struct SettingsView: View {
                         }
                     }
                 }
-                // 闲时章节摘要：ANN 状态下方单独一行，避免挤占索引按钮布局。
-                HStack(spacing: 6) {
-                    Text("章节摘要").font(.caption)
-                    Text(model.bookSummaryStatusText)
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(2)
-                        .help("无前台活动 3 分钟后自动逐章生成摘要：辅助模型已启用且加载时"
-                            + "每 15 分钟一章；未启用/未加载时临时加载，每 5 分钟一章，"
-                            + "空闲会话结束即卸载。")
-                }
+                // 闲时章节摘要：ANN 状态下方单独一行；文案已含「章节摘要：」前缀。
+                Text(model.bookSummaryStatusText)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(2)
+                    .help("无前台活动 3 分钟后自动逐章生成摘要：辅助模型已启用且加载时"
+                        + "每 15 分钟一章；未启用/未加载时临时加载，每 5 分钟一章，"
+                        + "空闲会话结束即卸载。")
                 if model.vectorRebuildRequired {
                     HStack(alignment: .firstTextBaseline, spacing: 6) {
                         Image(systemName: "exclamationmark.triangle.fill")
