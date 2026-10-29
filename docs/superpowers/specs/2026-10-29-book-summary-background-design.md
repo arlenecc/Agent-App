@@ -231,7 +231,7 @@ LIMIT ?
 
 ## rag_outline 输出
 
-新增 `RAGEngine.lookupDocument(_:)` 与 `RAGEngine.enrichedOutline(query:)`：
+新增 `RAGEngine.lookupDocument(_:)` 与 `RAGEngine.getEnrichedOutline(docName:)`：
 
 1. 文档解析：
    - SQL 精确匹配 `doc_name` / `md_path`；
@@ -269,3 +269,19 @@ LIMIT ?
 4. `rag_outline` 在有摘要时返回每章摘要 + 全书摘要；无摘要时行为与旧版兼容。
 5. 同名/模糊文档返回歧义候选，不再静默选错。
 6. `swift build` 与全量 `swift test` 通过。
+
+## 实施记录（2026-10-29）
+
+- 协调器改为按空闲会话懒创建：`AppModel.startSummaryIdleSession()` 调
+  `RAGEngine.makeBookSummaryCoordinator(...)`，在后台任务中打开向量库；
+  会话结束丢弃协调器。避免启动时在同步路径上打开大库，也避免
+  `RAGEngine.reload()` 关闭 store 后协调器继续持有一个已关闭的连接。
+- `BookSummaryCoordinator.cancelCurrent()` 现在带会话级 `stopRequested`：
+  取消后新的 `runTick` 直接返回 `.noWork`，直到下个 `beginSession` 重置，
+  避免「取消后外层循环立刻又开一个 tick」。
+- 同步、配置切换、卸载辅助模型、退出都会先 `await stopSummaryIdleSession()`；
+  同步路径把 `suspendModelsForSync()` 移到后台任务、等摘要会话收尾后再执行，
+  防止卸载权重与摘要的在途生成并发。
+- `AppModel.init` 末尾主动 `scheduleIdleUnload()`：API 模式或辅助模型未启用时
+  `preloadModels` 会提前返回，仍需要空闲计时来启动摘要任务。
+- 实测：`swift build` 通过；全量 `swift test` 350 项、20 项环境依赖跳过、0 失败。
