@@ -222,7 +222,7 @@ public final class BookSummaryEngine: @unchecked Sendable {
                                    isCancelled: () -> Bool) async throws -> ChapterProcessResult {
         let resolved = resolve(document, markdown: markdown)
         let total = resolved.sections.count
-        if resolved.hadRepairs {
+        if resolved.digest != document.digest || resolved.chaptersJSON != document.chapters {
             try? store.updateDocumentOutline(docID: document.docID,
                                              digest: resolved.digest,
                                              chapters: resolved.chaptersJSON)
@@ -407,7 +407,7 @@ public final class BookSummaryEngine: @unchecked Sendable {
                                    now: Date,
                                    isCancelled: () -> Bool) async throws -> BookSummaryRecord {
         let resolved = resolve(document, markdown: markdown)
-        if resolved.hadRepairs {
+        if resolved.digest != document.digest || resolved.chaptersJSON != document.chapters {
             try? store.updateDocumentOutline(docID: document.docID,
                                              digest: resolved.digest,
                                              chapters: resolved.chaptersJSON)

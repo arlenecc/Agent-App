@@ -94,37 +94,134 @@ public final class RagOutlineTool: AgentTool {
     public func run(_ args: [String: JSONValue]) async throws -> ToolResult {
         let name = args.trimmedString("book_name")
         if name.isEmpty {
-            let documents = engine.listDocuments()
-            guard !documents.isEmpty else {
+            let list = engine.listDocuments(limit: 100)
+            guard list.total > 0 else {
                 return .ok("知识库中还没有已索引文档。")
             }
-            let lines = ["已索引文档（共 \(documents.count) 个）:"]
-                + documents.prefix(100).map { "  - \(($0 as NSString).lastPathComponent)" }
+            var lines = ["已索引文档（共 \(list.total) 个）:"]
+            lines.append(contentsOf: list.names.map {
+                "  - \((($0 as NSString).lastPathComponent))"
+            })
+            if list.total > list.names.count {
+                lines.append("  …（仅显示前 \(list.names.count) 个）")
+            }
             return .ok(lines.joined(separator: "\n"))
         }
 
-        let documents = engine.listDocuments()
-        let matched = documents.first {
-            ($0 as NSString).lastPathComponent.localizedCaseInsensitiveContains(name)
-        } ?? name
-        guard let record = engine.getDocumentOutline(docName: matched) else {
+        switch engine.lookupDocument(name) {
+        case .notFound:
             return .fail("未找到文档: \(name)")
+        case .ambiguous(let candidates):
+            var lines = ["匹配到多个文档（\(candidates.count) 个），请使用完整文件名或路径:"]
+            for candidate in candidates.prefix(20) {
+                lines.append("  - \(candidate.docName)（ID: \(candidate.docID)）")
+            }
+            return .ok(lines.joined(separator: "\n"))
+        case .found(let record):
+            guard let enriched = engine.getEnrichedOutline(docName: record.docName) else {
+                return .fail("文档 \(record.docName) 没有可用大纲")
+            }
+            return .ok(Self.format(enriched))
         }
-        let digest = record.digest.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !digest.isEmpty else {
-            return .fail("文档 \(record.docName) 没有可用大纲")
+    }
+
+    // MARK: - 输出
+
+    private static func format(_ enriched: EnrichedDocumentOutline) -> String {
+        let record = enriched.record
+        let summaries = enriched.chapterSummaries
+        let parsedChapters = parseChapters(record.chapters)
+        let total = max(enriched.jobProgress.chapterCount, summaries.count,
+                        parsedChapters.count)
+        let completed = summaries.filter { !$0.summary.isEmpty }.count
+        let hasBookSummary = !(enriched.bookSummary?.summary.isEmpty ?? true)
+        let state: String
+        if hasBookSummary {
+            state = "全书摘要已完成"
+        } else if completed < total || total == 0 {
+            state = "后台仍在补充"
+        } else {
+            state = "等待生成全书摘要"
         }
-        let chapters = record.chapters.trimmingCharacters(in: .whitespacesAndNewlines)
+
         var lines = ["文档: \(record.docName)", "文档 ID: \(record.docID)"]
-        if !chapters.isEmpty {
+        lines.append("章节摘要进度: \(completed)/\(total)（\(state)）")
+
+        if let book = enriched.bookSummary, !book.summary.isEmpty {
+            lines.append("")
+            lines.append("全书摘要:")
+            lines.append(book.summary)
+        } else if !summaries.isEmpty {
+            lines.append("")
+            lines.append("内容概览（基于已完成章节摘要，后台仍在补充）:")
+            for summary in summaries.prefix(20) where !summary.summary.isEmpty {
+                lines.append("- [\(summary.heading)] \(summary.summary)")
+            }
+            if summaries.count > 20 {
+                lines.append("…（仅显示前 20 章摘要）")
+            }
+        } else {
+            let digest = enriched.repairedTOC
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !digest.isEmpty {
+                lines.append("")
+                lines.append("内容摘要:")
+                lines.append(String(digest.prefix(20_000)))
+            }
+        }
+
+        let tree = chapterTree(enriched)
+        if !tree.isEmpty {
             lines.append("")
             lines.append("章节结构:")
-            lines.append(String(chapters.prefix(20_000)))
+            lines.append(tree)
         }
-        lines.append("")
-        lines.append("内容摘要:")
-        lines.append(String(digest.prefix(20_000)))
-        return .ok(lines.joined(separator: "\n"))
+        return lines.joined(separator: "\n")
+    }
+
+    private static func chapterTree(_ enriched: EnrichedDocumentOutline) -> String {
+        let nodes = parseChapters(enriched.record.chapters)
+        let summaries = Dictionary(
+            enriched.chapterSummaries.map { ($0.sectionIndex, $0) },
+            uniquingKeysWith: { first, _ in first })
+        if !nodes.isEmpty {
+            let lines = nodes.enumerated().map { index, node -> String in
+                let indent = String(repeating: "  ", count: max(0, min(node.level - 1, 5)))
+                if let summary = summaries[index], !summary.summary.isEmpty {
+                    return "\(indent)- [\(node.title)] \(summary.summary)"
+                }
+                return "\(indent)- \(node.title)"
+            }
+            return String(lines.joined(separator: "\n").prefix(20_000))
+        }
+        let summaryLines = enriched.chapterSummaries
+            .sorted { $0.sectionIndex < $1.sectionIndex }
+            .map { summary -> String in
+                let indent = String(repeating: "  ", count: max(0, min(summary.level - 1, 5)))
+                return summary.summary.isEmpty
+                    ? "\(indent)- \(summary.title)"
+                    : "\(indent)- [\(summary.title)] \(summary.summary)"
+            }
+        if !summaryLines.isEmpty {
+            return String(summaryLines.joined(separator: "\n").prefix(20_000))
+        }
+        let raw = enriched.record.chapters
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        return raw.isEmpty ? "" : String(raw.prefix(20_000))
+    }
+
+    private static func parseChapters(_ raw: String) -> [(level: Int, title: String)] {
+        guard let data = raw.data(using: .utf8),
+              let array = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            return []
+        }
+        return array.compactMap { item in
+            guard let title = item["title"] as? String,
+                  !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                return nil
+            }
+            return (level: (item["level"] as? Int) ?? 1, title: title)
+        }
     }
 }
 

@@ -364,6 +364,34 @@ private actor IngestAccumulator {
     }
 }
 
+/// 文档查找结果：歧义时返回全部候选，避免静默选错同名书。
+public enum DocumentLookupResult: Sendable, Equatable {
+    case found(DocumentRecord)
+    case ambiguous([DocumentRecord])
+    case notFound
+}
+
+/// `rag_outline` 使用的增强目录：修复后的目录 + 已生成的章节/全书摘要。
+public struct EnrichedDocumentOutline: Sendable, Equatable {
+    public var record: DocumentRecord
+    public var chapterSummaries: [ChapterSummaryRecord]
+    public var bookSummary: BookSummaryRecord?
+    public var jobProgress: DocumentSummaryProgress
+    /// 目录修复后的 TOC；无摘要时回退 `record.digest`。
+    public var repairedTOC: String
+
+    public init(record: DocumentRecord, chapterSummaries: [ChapterSummaryRecord],
+                bookSummary: BookSummaryRecord?,
+                jobProgress: DocumentSummaryProgress,
+                repairedTOC: String) {
+        self.record = record
+        self.chapterSummaries = chapterSummaries
+        self.bookSummary = bookSummary
+        self.jobProgress = jobProgress
+        self.repairedTOC = repairedTOC
+    }
+}
+
 /// 知识库引擎：解析 → 清洗 → 切片 → embedding → SQLite 写入；
 /// 检索走 FTS5 + 向量 RRF，再按配置做 rerank。
 public final class RAGEngine {
@@ -1360,7 +1388,8 @@ public final class RAGEngine {
             try store.upsertDocument(docName: file.relativePath,
                                      digest: digestInfo.digest,
                                      chapters: digestInfo.chapters,
-                                     mdPath: mdPath)
+                                     mdPath: mdPath,
+                                     contentHash: Self.contentHash(text))
             let cacheSeconds = Date().timeIntervalSince(cacheStarted)
             // 有页面解析/OCR 失败时仍保留已成功的内容，但标记为未完整完成：
             // 下次增量同步会重试，而不是因为 manifest 命中而永久跳过。
@@ -1480,7 +1509,8 @@ public final class RAGEngine {
         _ = try withStore { store in
             try store.upsertDocument(docName: docName, digest: digest,
                                      chapters: String(data: data, encoding: .utf8) ?? "[]",
-                                     mdPath: mdPath)
+                                     mdPath: mdPath,
+                                     contentHash: Self.contentHash(markdown))
         }
         return digest
     }
@@ -2048,6 +2078,64 @@ public final class RAGEngine {
 
     public func getDocumentOutline(docName: String) -> DocumentRecord? {
         try? withStore { $0.getDocumentDigest(docName: docName) }
+    }
+
+    /// SQL 限量列表：返回前 `limit` 个文档名与总条数。
+    public func listDocuments(limit: Int) -> (names: [String], total: Int) {
+        let result = try? withStore { store -> ([String], Int) in
+            (try store.documentNames(limit: limit), try store.documentCount())
+        }
+        guard let result else { return ([], 0) }
+        return (names: result.0, total: result.1)
+    }
+
+    /// 文档查找：精确完整路径/名称 > basename 精确 > 唯一模糊；多候选返回歧义。
+    public func lookupDocument(_ query: String) -> DocumentLookupResult {
+        let target = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !target.isEmpty else { return .notFound }
+        let result = try? withStore { store -> DocumentLookupResult in
+            let candidates = try store.lookupDocuments(query: target, limit: 50)
+            let lower = target.lowercased()
+            let standardized = (target as NSString).standardizingPath
+            let exact = candidates.filter { record in
+                record.docName.lowercased() == lower
+                    || record.mdPath.lowercased() == lower
+                    || (!standardized.isEmpty
+                        && (record.mdPath as NSString).standardizingPath == standardized)
+            }
+            if exact.count == 1 { return .found(exact[0]) }
+            if exact.count > 1 { return .ambiguous(exact) }
+
+            let basename = (target as NSString).lastPathComponent.lowercased()
+            let sameBasename = candidates.filter { record in
+                (record.docName as NSString).lastPathComponent.lowercased() == basename
+                    || (record.mdPath as NSString).lastPathComponent.lowercased() == basename
+            }
+            if sameBasename.count == 1 { return .found(sameBasename[0]) }
+            if sameBasename.count > 1 { return .ambiguous(sameBasename) }
+
+            if candidates.count == 1 { return .found(candidates[0]) }
+            if candidates.count > 1 { return .ambiguous(candidates) }
+            return .notFound
+        }
+        return result ?? .notFound
+    }
+
+    /// 增强目录：修复后的 TOC + 已完成的章节/全书摘要。
+    public func getEnrichedOutline(docName: String) -> EnrichedDocumentOutline? {
+        guard case .found(let record) = lookupDocument(docName) else { return nil }
+        return try? withStore { store in
+            let chapters = try store.chapterSummaries(docID: record.docID)
+            let book = try store.bookSummary(docID: record.docID)
+            let progress = try store.summaryProgress(docID: record.docID)
+            let outline = book?.outline.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return EnrichedDocumentOutline(
+                record: record,
+                chapterSummaries: chapters,
+                bookSummary: book,
+                jobProgress: progress,
+                repairedTOC: outline.isEmpty ? record.digest : outline)
+        }
     }
 
     public func listDocuments() -> [String] {
