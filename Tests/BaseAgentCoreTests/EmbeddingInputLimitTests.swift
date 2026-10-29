@@ -79,4 +79,35 @@ final class EmbeddingInputLimitTests: XCTestCase {
         XCTAssertEqual(provider.maxContentTokens, 1_014,
                        "再扣 nomic document 前缀预留 8")
     }
+
+    /// ONNX 的 intra-op 线程池是每 session 一个：并发 run 共用同一池，
+    /// 不会按「并发 × 线程」成倍占用 CPU。默认按逻辑核数开池、2 路并发；
+    /// 显式配置 1×8 / 2×4 时按配置生效。
+    func testONNXConcurrencySharesSessionThreadPool() throws {
+        let directory = try makeModelDirectory(window: 8_192)
+        let cores = max(1, ProcessInfo.processInfo.activeProcessorCount)
+
+        let automatic = ONNXEmbeddingProvider(directory: directory, modelName: "onnx-auto")
+        XCTAssertEqual(automatic.maxConcurrentRuns, 2)
+        XCTAssertEqual(automatic.intraOpThreads, min(32, cores))
+
+        let singleEighth = ONNXEmbeddingProvider(
+            directory: directory, modelName: "onnx-1x8",
+            concurrentRuns: 1, intraOpThreads: 8)
+        XCTAssertEqual(singleEighth.maxConcurrentRuns, 1)
+        XCTAssertEqual(singleEighth.intraOpThreads, 8)
+
+        let twoByFour = ONNXEmbeddingProvider(
+            directory: directory, modelName: "onnx-2x4",
+            concurrentRuns: 2, intraOpThreads: 4)
+        XCTAssertEqual(twoByFour.maxConcurrentRuns, 2)
+        XCTAssertEqual(twoByFour.intraOpThreads, 4)
+
+        // 非法配置收口到至少 1，不能出现 0 线程/0 并发。
+        let clamped = ONNXEmbeddingProvider(
+            directory: directory, modelName: "onnx-clamped",
+            concurrentRuns: 0, intraOpThreads: -1)
+        XCTAssertEqual(clamped.maxConcurrentRuns, 1)
+        XCTAssertEqual(clamped.intraOpThreads, min(32, cores))
+    }
 }

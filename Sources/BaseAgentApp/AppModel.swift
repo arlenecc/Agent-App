@@ -1093,7 +1093,7 @@ final class AppViewModel: ObservableObject {
         isBuildingANN = true
         statusText = "正在构建 ANN 索引…"
         appendLog("[rag] 开始构建 ANN 索引：分块 IVF，块内 k-means + int8 量化；"
-            + "构建期间知识检索会被只读超时跳过")
+            + "构建期间知识检索与状态查询不受影响")
         Task.detached(priority: .utility) {
             let result = agent.ragEngine.buildANNIndex { update in
                 Task { @MainActor [weak self] in
@@ -1143,7 +1143,7 @@ final class AppViewModel: ObservableObject {
         alert.informativeText = """
         当前索引：\(status.summary)。
         重建会先删除现有索引（含 \(status.indexedRows) 个已索引切片），再整库重新聚类写入；
-        大库上这一步可能耗时数十分钟，期间知识检索会按超时跳过。
+        大库上这一步可能耗时数十分钟，期间知识检索仍可正常使用。
         """
         alert.alertStyle = .warning
         // 默认按钮是「取消」，避免误触长时间占用。

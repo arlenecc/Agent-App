@@ -16,7 +16,15 @@ public final class ONNXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCount
     private let batchSize: Int
     let prefixStrategy: EmbeddingPrefixStrategy
     private let isJinaV3: Bool
-    private let state = EmbeddingLoadState()
+    private let state: EmbeddingLoadState
+
+    /// ONNXRuntime session.run 线程安全：同实例（共享权重）可并发调用。
+    /// 注意 ORT 的 intra-op 线程池是**每 session 一个**，并发 run 共用
+    /// 同一个池，并不会各自创建 `intraOpThreads` 个线程；因此
+    /// `maxConcurrentRuns × intraOpThreads` 不是实际线程数。
+    public let maxConcurrentRuns: Int
+    /// 该 session 的 intra-op 线程数（并发 run 共享）。
+    public let intraOpThreads: Int
 
     private let dimensionLock = NSLock()
     private var storedDimension = 768
@@ -28,14 +36,25 @@ public final class ONNXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCount
         return storedDimension
     }
 
-    /// ONNXRuntime session.run 线程安全：同实例（共享权重）允许 2 路并发，
-    /// 覆盖多文件并发 + 语义切片同时请求 embedding 的场景。
-    public var maxConcurrentRuns: Int { 2 }
-
-    public init(directory: URL, modelName: String, batchSize: Int = 32) {
+    /// - Parameters:
+    ///   - concurrentRuns: 允许的并发 run 数（默认 2，覆盖多文件并发 +
+    ///     语义切片同时请求 embedding）。并发 run 共用 session 线程池，
+    ///     不增加线程数，但能让线程池在多个 run 之间保持饱和。
+    ///   - intraOpThreads: 单 session 的 intra-op 线程数；0 表示按逻辑
+    ///     核数自动分配。实测 8 核机器上 2×8 比 2×4 快约 10%（见
+    ///     `ONNXThreadBenchTests`），说明并发 run 并没有成倍占用线程。
+    public init(directory: URL, modelName: String, batchSize: Int = 32,
+                concurrentRuns: Int = 2, intraOpThreads: Int = 0) {
+        let runs = max(1, concurrentRuns)
+        let threads = intraOpThreads > 0
+            ? max(1, min(32, intraOpThreads))
+            : max(1, min(32, ProcessInfo.processInfo.activeProcessorCount))
         self.directory = directory
         self.modelName = modelName
         self.identifier = "local:onnx:\(modelName)"
+        self.maxConcurrentRuns = runs
+        self.intraOpThreads = threads
+        self.state = EmbeddingLoadState(intraOpThreads: threads)
         // 模型窗口可能很大（jina-v3 8192），推理前统一压到 1024 token。
         self.maxLength = EmbeddingInputLimits.cappedWindow(
             LocalModelRegistry.resolveMaxSequenceLength(directory: directory, defaultValue: 8192))
@@ -299,6 +318,11 @@ private actor EmbeddingLoadState {
     private var session: OrtSession?
     private var tokenizer: LocalTokenizer?
     private var failure: Error?
+    private let intraOpThreads: Int
+
+    init(intraOpThreads: Int) {
+        self.intraOpThreads = max(1, intraOpThreads)
+    }
 
     func handles(modelURL: URL, directory: URL) async throws -> (OrtSession, LocalTokenizer) {
         if let session, let tokenizer {
@@ -309,9 +333,10 @@ private actor EmbeddingLoadState {
         }
 
         do {
-            // 8 线程吃满多核：embedding 推理是切片阶段的主要耗时，
-            // 单会话内并行比跨会话并发更高效。
-            let session = try OrtSession(modelPath: modelURL.path, intraOpThreads: 8)
+            // 线程数由 provider 统一收口：默认「核数 ÷ 并发数」，
+            // 避免 2 路并发 × 8 线程在 8 核机器上互相抢占。
+            let session = try OrtSession(modelPath: modelURL.path,
+                                         intraOpThreads: intraOpThreads)
             let tokenizer = try await LocalTokenizer.load(directory: directory)
             self.session = session
             self.tokenizer = tokenizer

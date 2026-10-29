@@ -229,4 +229,93 @@ final class VectorStoreANNTests: XCTestCase {
         XCTAssertFalse(hits.contains { $0.source == source(cluster: 1) },
                        "已删除来源不应出现在结果里")
     }
+
+    /// 删除/更新留下的旧行只累计计数；状态要展示陈旧行数与实际有效覆盖率。
+    func testDeleteAccumulatesStaleRowsAndEffectiveCoverage() throws {
+        let store = try makeStore()
+        try seed(store, perCluster: 40)
+        _ = try store.buildANNIndex(clusters: 4, clusterSize: 32, iterations: 8)
+
+        try store.deleteBySource(source(cluster: 1))
+        // 再追加一个新来源：索引仍是 240 行，库内总数也回到 240，
+        // 但其中 40 行是块内已删除的旧 rowid。
+        try seed(store, perCluster: 40, clusters: 6..<7)
+
+        let status = store.annIndexStatus()
+        XCTAssertEqual(status.indexedRows, 240)
+        XCTAssertEqual(status.tailRows, 40)
+        XCTAssertEqual(status.staleRows, 40)
+        XCTAssertEqual(status.coverage, 1.0, accuracy: 0.0001)
+        XCTAssertEqual(status.effectiveCoverage, 200.0 / 240.0, accuracy: 0.0001)
+        XCTAssertGreaterThan(status.staleRatio, 0)
+    }
+
+    /// 陈旧行超过 15% 时整体重建，而不是继续追加一个越来越空的索引。
+    func testHighStaleRatioTriggersFullRebuild() throws {
+        let store = try makeStore()
+        try seed(store, perCluster: 40)
+        _ = try store.buildANNIndex(clusters: 4, clusterSize: 32, iterations: 8)
+
+        // 40/240 ≈ 16.7% > 15%。
+        try store.deleteBySource(source(cluster: 1))
+        let before = store.annIndexStatus()
+        XCTAssertEqual(before.staleRows, 40)
+        XCTAssertTrue(before.needsRebuild, before.summary)
+
+        let rebuilt = try store.buildANNIndex(clusters: 4, clusterSize: 32, iterations: 8)
+        XCTAssertFalse(rebuilt.cancelled)
+        XCTAssertEqual(rebuilt.indexedRows, 200, "重建只索引现存切片")
+        XCTAssertEqual(rebuilt.tailRows, 0)
+        let status = store.annIndexStatus()
+        XCTAssertEqual(status.staleRows, 0)
+        XCTAssertEqual(status.indexedRows, 200)
+        XCTAssertEqual(status.effectiveCoverage, 1.0, accuracy: 0.0001)
+        XCTAssertTrue(status.isReady, status.summary)
+    }
+
+    /// 构建只在每块内持锁：块间释放，检索/状态查询不会被整体冻结。
+    func testBuildReleasesLockBetweenBlocks() throws {
+        let store = try makeStore()
+        try seed(store, perCluster: 40)
+        let query = vector(cluster: 2, offset: 1)
+
+        let semaphore = DispatchSemaphore(value: 0)
+        var hits: [SearchHit]?
+        var failure: Error?
+        var searched = false
+        _ = try store.buildANNIndex(clusters: 4, clusterSize: 32, iterations: 8,
+                                    progress: { update in
+            guard update.stage == "blocks", !searched else { return }
+            searched = true
+            DispatchQueue.global(qos: .userInitiated).async {
+                do { hits = try store.search(vector: query, topK: 3) }
+                catch { failure = error }
+                semaphore.signal()
+            }
+            // 构建若仍持有整把锁，这次检索会一直等到超时。
+            XCTAssertEqual(semaphore.wait(timeout: .now() + 5), .success,
+                           "ANN 构建期间检索不应被整体冻结")
+        })
+        XCTAssertNil(failure)
+        XCTAssertFalse(hits?.isEmpty ?? true)
+        XCTAssertTrue(searched)
+    }
+
+    /// 构建进度：start → 若干 blocks，比例单调不减且以 1 为上限。
+    func testBuildReportsProgress() throws {
+        let store = try makeStore()
+        try seed(store, perCluster: 40)
+        var stages: [String] = []
+        var fractions: [Double] = []
+        _ = try store.buildANNIndex(clusters: 4, clusterSize: 32, iterations: 8,
+                                    progress: { update in
+            stages.append(update.stage)
+            fractions.append(update.fraction)
+        })
+        XCTAssertEqual(stages.first, "start")
+        XCTAssertTrue(stages.contains("blocks"))
+        XCTAssertGreaterThan(fractions.last ?? 0, 0)
+        XCTAssertLessThanOrEqual(fractions.last ?? 0, 1)
+        XCTAssertEqual(fractions, fractions.sorted(), "进度比例不应回退")
+    }
 }

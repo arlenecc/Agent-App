@@ -159,7 +159,9 @@ public struct AgentConfig: Sendable {
     public var ragQueryTimeoutSeconds: Double = 5
     /// 辅助模型精简触发下限：检索结果总字数低于该值时原样返回，
     /// 不调用辅助模型（内容不多时总结只会丢细节、平白增加延迟）。
-    public var ragAuxSummarizeMinChars: Int = 4_000
+    /// 默认 8000：5 条 × 1500 字上限的常见结果不会触发，只有多文档/
+    /// 超长结果才交给辅助模型。
+    public var ragAuxSummarizeMinChars: Int = 8_000
     /// 辅助模型精简触发上限：超过该值的结果不做精简
     ///（内容过大时一次性摘要不可靠）。
     public var ragAuxSummarizeMaxChars: Int = 12_000
@@ -221,14 +223,27 @@ public struct AgentConfig: Sendable {
     public var ragEmbeddingProbeBatches: Int = 2
     /// 每档至少观察的秒数（0.5...30，默认 2）。
     public var ragEmbeddingProbeSeconds: Double = 2.0
+    /// 单批 token 预算下限（默认 4096）。
+    public var ragEmbeddingTokenBudgetMin: Int = 4_096
+    /// 单批 token 预算上限（默认 8192）。
+    public var ragEmbeddingTokenBudgetMax: Int = 8_192
+    /// 同步起始的 token 预算（默认 6144）。
+    public var ragEmbeddingTokenBudgetInitial: Int = 6_144
+    /// 自适应调整 token 预算的步进（默认 512）。
+    public var ragEmbeddingTokenBudgetStep: Int = 512
+    /// 增量同步是否校验文件内容指纹。默认关闭：信任 mtime + size，
+    /// 只在文件变化或 force 时重新采样，避免每次同步都读一遍文件头尾。
+    /// 开启后即使 mtime/size 相同也会比对采样指纹（能发现保留时间戳的改动）。
+    public var ragVerifyFingerprint: Bool = false
 
     // SQLite + sqlite-vec 存储
     public var ragStorageBackend: String = "sqlite"
     public var ragSQLiteVecEnabled: Bool = true
     /// 混合检索 RRF 常数（原项目 RRF k=60）。
     public var ragRRFK: Int = 60
-    /// 向量召回 over-fetch 倍数（先多取再过滤，避免 join 虚拟表）。
-    public var ragVectorOverfetch: Int = 4
+    /// 向量召回 over-fetch 倍数。混合检索先融合 rowid/分数再 hydrate，
+    /// 内层只需比最终条数多 1-2 倍；定向来源（sourceContains）按需自动放大。
+    public var ragVectorOverfetch: Int = 2
     /// FTS5 召回 over-fetch 倍数。
     public var ragFTSOverfetch: Int = 4
 
@@ -250,11 +265,14 @@ public struct AgentConfig: Sendable {
     public var ragANNClusters: Int = 256
     /// 每簇行数。簇越小越省读放大、召回越依赖 nprobe。
     public var ragANNClusterSize: Int = 512
-    /// 每块探测的簇数（1 = 最快，召回随探测数上升）。
-    public var ragANNProbe: Int = 1
-    /// 用精确向量重打分的候选数（0 = 关闭）。int8 量化排序有微小误差，
-    /// 重打分只对少量候选做点查，成本可忽略。
-    public var ragANNRescore: Int = 32
+    /// 每块探测的簇数（召回随探测数上升，读放大同步增加）。
+    /// 离线评测（VectorStoreANNQualityTests：recall@20/nDCG@20）中
+    /// nprobe 1→2→4 的召回为 26%→45%→74%，取 4；真实库可用
+    /// `RAGEngine.evaluateANNQuality` 再校准。
+    public var ragANNProbe: Int = 4
+    /// 用精确向量重打分的候选数（0 = 关闭）。只需覆盖最终 topK 并留余量，
+    /// 评测中 64 与 128 的召回/排序一致，取 64 控制点查成本。
+    public var ragANNRescore: Int = 64
     /// 自动构建的切片数下限：小库上精确扫描足够快，不值得建索引。
     public var ragANNMinChunks: Int = 20_000
     /// 同步结束后自动构建/续建 ANN 索引（索引已就绪且尾块不多时跳过）。
@@ -445,6 +463,7 @@ public struct AgentConfig: Sendable {
         if let v = int("rag_ingest_concurrency") {
             ragIngestConcurrency = min(max(1, v), 10)
         }
+        if let v = bool("rag_verify_fingerprint") { ragVerifyFingerprint = v }
         if let v = int("rag_vision_concurrency") { ragVisionConcurrency = max(0, v) }
         if let v = int("rag_ovis_instances") { ragOvisInstances = min(max(1, v), 2) }
         if let v = int("rag_embedding_min_batch") { ragEmbeddingMinBatch = v }
@@ -457,6 +476,10 @@ public struct AgentConfig: Sendable {
         }
         if let v = int("rag_embedding_probe_batches") { ragEmbeddingProbeBatches = v }
         if let v = double("rag_embedding_probe_seconds") { ragEmbeddingProbeSeconds = v }
+        if let v = int("rag_embedding_token_budget_min") { ragEmbeddingTokenBudgetMin = v }
+        if let v = int("rag_embedding_token_budget_max") { ragEmbeddingTokenBudgetMax = v }
+        if let v = int("rag_embedding_token_budget_initial") { ragEmbeddingTokenBudgetInitial = v }
+        if let v = int("rag_embedding_token_budget_step") { ragEmbeddingTokenBudgetStep = v }
         if let v = string("rag_embedding_model") { ragEmbeddingModel = v }
         if let v = string("rag_rerank_model") { ragRerankModel = v }
         if let v = bool("rag_rerank_enabled") { ragRerankEnabled = v }
@@ -716,6 +739,13 @@ public struct AgentConfig: Sendable {
                                               min(0.5, ragEmbeddingThroughputTolerance))
         ragEmbeddingProbeBatches = max(1, min(16, ragEmbeddingProbeBatches))
         ragEmbeddingProbeSeconds = max(0.5, min(30, ragEmbeddingProbeSeconds))
+        ragEmbeddingTokenBudgetMin = max(512, min(65_536, ragEmbeddingTokenBudgetMin))
+        ragEmbeddingTokenBudgetMax = max(ragEmbeddingTokenBudgetMin,
+                                          min(65_536, ragEmbeddingTokenBudgetMax))
+        ragEmbeddingTokenBudgetInitial = max(ragEmbeddingTokenBudgetMin,
+                                             min(ragEmbeddingTokenBudgetMax,
+                                                 ragEmbeddingTokenBudgetInitial))
+        ragEmbeddingTokenBudgetStep = max(128, min(8_192, ragEmbeddingTokenBudgetStep))
         // Matryoshka 截断维只允许 128 / 256 / 512，其它值回落到默认 256。
         // 元素类型不做收口：fp16 保留在配置里，打开向量库时给出明确报错。
         if ![128, 256, 512].contains(ragMatryoshkaDim) {
@@ -783,6 +813,7 @@ public struct AgentConfig: Sendable {
             "rag_chunk_size": ragChunkSize, "rag_chunk_overlap": ragChunkOverlap,
             "rag_semantic_chunking": ragSemanticChunking,
             "rag_ingest_concurrency": ragIngestConcurrency,
+            "rag_verify_fingerprint": ragVerifyFingerprint,
             "rag_vision_concurrency": ragVisionConcurrency,
             "rag_ovis_instances": ragOvisInstances,
             "rag_embedding_min_batch": ragEmbeddingMinBatch,
@@ -793,6 +824,10 @@ public struct AgentConfig: Sendable {
             "rag_embedding_throughput_tolerance": ragEmbeddingThroughputTolerance,
             "rag_embedding_probe_batches": ragEmbeddingProbeBatches,
             "rag_embedding_probe_seconds": ragEmbeddingProbeSeconds,
+            "rag_embedding_token_budget_min": ragEmbeddingTokenBudgetMin,
+            "rag_embedding_token_budget_max": ragEmbeddingTokenBudgetMax,
+            "rag_embedding_token_budget_initial": ragEmbeddingTokenBudgetInitial,
+            "rag_embedding_token_budget_step": ragEmbeddingTokenBudgetStep,
             "rag_embedding_model": ragEmbeddingModel,
             "rag_rerank_model": ragRerankModel,
             "rag_rerank_enabled": ragRerankEnabled,

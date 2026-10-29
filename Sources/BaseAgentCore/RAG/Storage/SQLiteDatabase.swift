@@ -74,6 +74,24 @@ public final class SQLiteDatabase {
     /// 进度回调间隔（VM 指令数）：越小越灵敏、开销越大。2000 条指令约
     /// 几十微秒的量级，配合 5s 级期限足够灵敏。
     private static let progressInstructionCount = 2_000
+    /// 单连接预编译语句缓存上限。检索/写入反复使用同一批 SQL，缓存后
+    /// 省掉每次 prepare/finalize；64 条足够覆盖 RAG 的全部热路径。
+    private static let statementCacheLimit = 64
+
+    private struct CachedStatement {
+        let stmt: OpaquePointer
+        var inUse: Bool
+        var lastUsed: UInt64
+    }
+
+    private var statementCache: [String: CachedStatement] = [:]
+    private var statementClock: UInt64 = 0
+
+    /// 当前缓存的语句数（测试/诊断用）。
+    var statementCacheSize: Int {
+        lock.lock(); defer { lock.unlock() }
+        return statementCache.count
+    }
 
     public init(path: String, readOnly: Bool = false) throws {
         self.path = path
@@ -104,6 +122,10 @@ public final class SQLiteDatabase {
 
     public func close() {
         lock.lock(); defer { lock.unlock() }
+        for cached in statementCache.values {
+            sqlite3_finalize(cached.stmt)
+        }
+        statementCache.removeAll()
         if let handle {
             sqlite3_close_v2(handle)
             self.handle = nil
@@ -168,6 +190,65 @@ public final class SQLiteDatabase {
         return AgentError.storage("\(stage): \(message)\n\(sql.prefix(300))")
     }
 
+    // MARK: Statement cache
+
+    /// 取一条可执行语句。命中缓存时 reset/clear bindings 后复用；同一 SQL
+    /// 正在被外层 `stream` 的递归调用使用时，另建临时语句，避免 reset 正在
+    /// step 的语句。返回值第二项表示是否属于缓存（决定 release 时是否 finalize）。
+    private func acquireStatement(_ sql: String) throws -> (stmt: OpaquePointer, cached: Bool) {
+        guard let handle else { throw AgentError.storage("数据库已关闭") }
+        statementClock &+= 1
+        if var entry = statementCache[sql], !entry.inUse {
+            sqlite3_reset(entry.stmt)
+            sqlite3_clear_bindings(entry.stmt)
+            entry.inUse = true
+            entry.lastUsed = statementClock
+            statementCache[sql] = entry
+            return (entry.stmt, true)
+        }
+
+        var stmt: OpaquePointer?
+        let rc = sqlite3_prepare_v2(handle, sql, -1, &stmt, nil)
+        guard rc == SQLITE_OK, let prepared = stmt else {
+            throw statementError(handle, stage: "SQL 准备失败", sql: sql)
+        }
+
+        // 只有同一 SQL 尚未缓存时才可能放进去；缓存满时淘汰最久未用且
+        // 不在执行中的语句。全部在执行中（递归查询）则本次不缓存。
+        var cacheable = statementCache[sql] == nil
+        if cacheable, statementCache.count >= Self.statementCacheLimit {
+            let victim = statementCache
+                .filter { !$0.value.inUse }
+                .min { $0.value.lastUsed < $1.value.lastUsed }?.key
+            if let victim, let entry = statementCache.removeValue(forKey: victim) {
+                sqlite3_finalize(entry.stmt)
+            } else {
+                cacheable = false
+            }
+        }
+        if cacheable {
+            statementCache[sql] = CachedStatement(stmt: prepared, inUse: true,
+                                                 lastUsed: statementClock)
+        }
+        return (prepared, cacheable)
+    }
+
+    private func releaseStatement(_ sql: String, _ stmt: OpaquePointer, cached: Bool) {
+        if cached, var entry = statementCache[sql], entry.stmt == stmt {
+            // 必须 reset 后再放回缓存：提前 break 的 `stream` 可能停在
+            // SQLITE_ROW，未 reset 的语句会让同一连接上的 COMMIT 报
+            // "SQL statements in progress"。
+            sqlite3_reset(stmt)
+            sqlite3_clear_bindings(stmt)
+            entry.inUse = false
+            statementClock &+= 1
+            entry.lastUsed = statementClock
+            statementCache[sql] = entry
+        } else {
+            sqlite3_finalize(stmt)
+        }
+    }
+
     // MARK: Core execution
 
     @discardableResult
@@ -175,12 +256,8 @@ public final class SQLiteDatabase {
         lock.lock(); defer { lock.unlock() }
         guard let handle else { throw AgentError.storage("数据库已关闭") }
         try checkDeadline()
-        var stmt: OpaquePointer?
-        let rc = sqlite3_prepare_v2(handle, sql, -1, &stmt, nil)
-        guard rc == SQLITE_OK else {
-            throw statementError(handle, stage: "SQL 准备失败", sql: sql)
-        }
-        defer { sqlite3_finalize(stmt) }
+        let (stmt, cached) = try acquireStatement(sql)
+        defer { releaseStatement(sql, stmt, cached: cached) }
         try bind(stmt, bindings)
         let step = sqlite3_step(stmt)
         guard step == SQLITE_DONE || step == SQLITE_ROW else {
@@ -193,12 +270,8 @@ public final class SQLiteDatabase {
         lock.lock(); defer { lock.unlock() }
         guard let handle else { throw AgentError.storage("数据库已关闭") }
         try checkDeadline()
-        var stmt: OpaquePointer?
-        let rc = sqlite3_prepare_v2(handle, sql, -1, &stmt, nil)
-        guard rc == SQLITE_OK else {
-            throw statementError(handle, stage: "SQL 准备失败", sql: sql)
-        }
-        defer { sqlite3_finalize(stmt) }
+        let (stmt, cached) = try acquireStatement(sql)
+        defer { releaseStatement(sql, stmt, cached: cached) }
         try bind(stmt, bindings)
         var rows: [[String: SQLValue]] = []
         while true {
@@ -257,12 +330,8 @@ public final class SQLiteDatabase {
         lock.lock(); defer { lock.unlock() }
         guard let handle else { throw AgentError.storage("数据库已关闭") }
         try checkDeadline()
-        var stmt: OpaquePointer?
-        let rc = sqlite3_prepare_v2(handle, sql, -1, &stmt, nil)
-        guard rc == SQLITE_OK else {
-            throw statementError(handle, stage: "SQL 准备失败", sql: sql)
-        }
-        defer { sqlite3_finalize(stmt) }
+        let (stmt, cached) = try acquireStatement(sql)
+        defer { releaseStatement(sql, stmt, cached: cached) }
         try bind(stmt, bindings)
         while true {
             let step = sqlite3_step(stmt)

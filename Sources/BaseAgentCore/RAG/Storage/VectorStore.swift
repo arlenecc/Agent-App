@@ -445,6 +445,9 @@ public final class VectorStore: @unchecked Sendable {
             try db.execute("DELETE FROM \(Self.vectorTable) WHERE rowid IN (\(placeholders))", args)
             index += batch.count
         }
+        // ANN 只追加：块内旧 rowid 不随删除回收，这里累计陈旧行。
+        // 与删除同事务提交；超过阈值的整体重建由 buildANNIndex 处理。
+        try recordANNStaleRowsLocked(rowIDs)
         if let cachedChunkCount {
             self.cachedChunkCount = max(0, cachedChunkCount - rowIDs.count)
             try persistChunkCounterLocked()
@@ -785,26 +788,106 @@ public final class VectorStore: @unchecked Sendable {
     /// 精确检索（vec0 KNN 或全表扫描）。调用方需已持有 `lock` 且确认库非空。
     func bruteSearchLocked(vector: [Float], topK: Int, sourceFilter: String?,
                            sourceContains: String?) throws -> [SearchHit] {
-        let query = VectorCodec.normalize(vector)
-        let targeted = sourceFilter != nil || sourceContains != nil
+        let candidates = try bruteCandidatesLocked(vector: vector, topK: topK,
+                                                   sourceFilter: sourceFilter,
+                                                   sourceContains: sourceContains)
+        return try hydrate(candidates: candidates, sourceFilter: sourceFilter,
+                           sourceContains: sourceContains, limit: topK)
+    }
 
+    /// 向量通道候选（只返回 rowid + 相似度，不读正文）。
+    /// 调用方需已持有 `lock` 且确认库非空。
+    func vectorCandidatesLocked(vector: [Float], topK: Int,
+                                sourceFilter: String?,
+                                ann: ANNQueryOptions?,
+                                targeted: Bool = false) throws -> [(Int64, Double)] {
+        guard topK > 0 else { return [] }
+        if let sourceFilter {
+            return try scopedSourceCandidatesLocked(vector: vector, topK: topK,
+                                                    source: sourceFilter)
+        }
+        if let ann,
+           let candidates = try annCandidatesLocked(vector: vector, topK: topK,
+                                                    options: ann,
+                                                    targeted: targeted) {
+            return candidates
+        }
+        return try bruteCandidatesLocked(vector: vector, topK: topK,
+                                         sourceFilter: nil)
+    }
+
+    /// 精确来源候选：在该来源内部召回，绕开全局 KNN 的候选上限。
+    func scopedSourceCandidatesLocked(vector: [Float], topK: Int,
+                                      source: String) throws -> [(Int64, Double)] {
+        let rows = chunkCount(source: source)
+        guard rows > 0 else { return [] }
+        guard rows <= Self.scopedExactRowLimit else {
+            // 超大来源：退回全局多取并过滤，由调用方超时预算兜底。
+            return try bruteCandidatesLocked(vector: vector, topK: max(topK, 20),
+                                             sourceFilter: source)
+        }
+        let query = VectorCodec.normalize(vector)
+        return Array(try knnExact(query: query, sourceFilter: source).prefix(topK))
+    }
+
+    /// 精确候选（vec0 KNN 或全表扫描），不读正文。
+    /// `sourceContains` 只用于决定 vec0 的 k 要放大多少：子串匹配在 SQL 里
+    /// 无法走索引，必须先多取候选再按来源列过滤，否则目标来源会被全局
+    /// Top-k 挤空（与 sourceFilter 的处理一致）。
+    func bruteCandidatesLocked(vector: [Float], topK: Int,
+                               sourceFilter: String?,
+                               sourceContains: String? = nil) throws -> [(Int64, Double)] {
+        let query = VectorCodec.normalize(vector)
+        let needle = sourceContains?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         if vectorEnabled {
-            // 首轮召回也必须先夹到 sqlite-vec 的 k 上限内。
-            var k = min(max(topK, targeted ? topK * 20 : topK), maxVectorK)
+            let widened = sourceFilter != nil || !needle.isEmpty
+            var k = min(max(topK, widened ? topK * 20 : topK), maxVectorK)
             while true {
-                let candidates = try knnVec0(query: query, k: k)
-                let hits = try hydrate(candidates: candidates, sourceFilter: sourceFilter,
-                                       sourceContains: sourceContains, limit: topK)
-                if hits.count >= topK || !targeted || k >= maxVectorK {
-                    return hits
+                var candidates = try knnVec0(query: query, k: k)
+                if let sourceFilter {
+                    candidates = try filterCandidatesLocked(candidates, source: sourceFilter)
+                }
+                if !needle.isEmpty {
+                    candidates = try filterCandidatesLocked(candidates, contains: needle)
+                }
+                if candidates.count >= topK || !widened || k >= maxVectorK {
+                    return Array(candidates.prefix(topK))
                 }
                 k = min(k * 2, maxVectorK)
             }
-        } else {
-            let candidates = try knnExact(query: query, sourceFilter: sourceFilter)
-            return try hydrate(candidates: candidates, sourceFilter: sourceFilter,
-                               sourceContains: sourceContains, limit: topK)
         }
+        let candidates = try knnExact(query: query, sourceFilter: sourceFilter)
+        guard !needle.isEmpty else { return Array(candidates.prefix(topK)) }
+        let filtered = try filterCandidatesLocked(candidates, contains: needle)
+        return Array(filtered.prefix(topK))
+    }
+
+    /// 候选行按来源过滤（只读 source 列，比 hydrate 全文便宜得多）。
+    private func filterCandidatesLocked(_ candidates: [(Int64, Double)],
+                                        source: String? = nil,
+                                        contains: String? = nil) throws -> [(Int64, Double)] {
+        guard !candidates.isEmpty, source != nil || contains != nil else { return candidates }
+        var allowed = Set<Int64>()
+        allowed.reserveCapacity(candidates.count)
+        let ids = candidates.map(\.0)
+        var index = 0
+        while index < ids.count {
+            let batch = Array(ids[index..<min(index + deleteBatchSize, ids.count)])
+            let placeholders = Array(repeating: "?", count: batch.count).joined(separator: ",")
+            let rows = try db.query(
+                "SELECT rowid, source FROM \(Self.chunksTable) WHERE rowid IN (\(placeholders))",
+                batch.map { SQLValue.int($0) })
+            for row in rows {
+                guard let rowID = row["rowid"]?.intValue,
+                      let candidateSource = row["source"]?.stringValue else { continue }
+                if let source, candidateSource != source { continue }
+                if let contains,
+                   !candidateSource.localizedCaseInsensitiveContains(contains) { continue }
+                allowed.insert(rowID)
+            }
+            index += batch.count
+        }
+        return candidates.filter { allowed.contains($0.0) }
     }
 
     /// vec0 点查精确向量（供 ANN 重打分使用）；非 vec0 库走普通表的按 rowid 查询。
@@ -899,90 +982,85 @@ public final class VectorStore: @unchecked Sendable {
         return scored.sorted { $0.1 > $1.1 }
     }
 
+    /// 按 rowid 批量读取正文。用列序号 + `stream` 直接取值，避免为每个候选
+    /// 构造 `[String: SQLValue]` 字典（ANN/FTS 路径一次可能取数百行）。
+    private struct HydratedChunk {
+        let text: String
+        let source: String
+        let chunkIndex: Int
+        let heading: String
+    }
+
+    private func loadChunksLocked(rowIDs: [Int64]) throws -> [Int64: HydratedChunk] {
+        guard !rowIDs.isEmpty else { return [:] }
+        var output: [Int64: HydratedChunk] = [:]
+        output.reserveCapacity(rowIDs.count)
+        var index = 0
+        while index < rowIDs.count {
+            let batch = Array(rowIDs[index..<min(index + deleteBatchSize, rowIDs.count)])
+            let placeholders = Array(repeating: "?", count: batch.count).joined(separator: ",")
+            let sql = """
+            SELECT rowid, text, source, chunk_index, heading
+            FROM \(Self.chunksTable) WHERE rowid IN (\(placeholders))
+            """
+            try db.stream(sql, batch.map { SQLValue.int($0) }) { row in
+                let rowID = row.int(0)
+                output[rowID] = HydratedChunk(
+                    text: row.text(1) ?? "",
+                    source: row.text(2) ?? "",
+                    chunkIndex: Int(row.int(3)),
+                    heading: row.text(4) ?? "")
+                return true
+            }
+            index += batch.count
+        }
+        return output
+    }
+
     /// 二段式收尾：按 rowid 批量取正文并过滤（精确路径与 ANN 路径共用）。
     func hydrate(candidates: [(Int64, Double)], sourceFilter: String?,
                  sourceContains: String? = nil, limit: Int) throws -> [SearchHit] {
         guard !candidates.isEmpty else { return [] }
+        let starts = stride(from: 0, to: candidates.count, by: deleteBatchSize).map { $0 }
         var result: [SearchHit] = []
         result.reserveCapacity(min(limit, candidates.count))
-        var index = 0
-        while index < candidates.count && result.count < limit {
-            let batch = Array(candidates[index..<min(index + deleteBatchSize, candidates.count)])
-            let placeholders = Array(repeating: "?", count: batch.count).joined(separator: ",")
-            let rows = try db.query("""
-            SELECT rowid, text, source, chunk_index, heading
-            FROM \(Self.chunksTable) WHERE rowid IN (\(placeholders))
-            """, batch.map { SQLValue.int($0.0) })
-            var byID: [Int64: [String: SQLValue]] = [:]
-            for row in rows {
-                if let rowID = row["rowid"]?.intValue { byID[rowID] = row }
-            }
+        for start in starts {
+            guard result.count < limit else { break }
+            let batch = Array(candidates[start..<min(start + deleteBatchSize, candidates.count)])
+            let byID = try loadChunksLocked(rowIDs: batch.map(\.0))
             for (rowID, score) in batch {
                 guard let row = byID[rowID] else { continue }
-                let source = row["source"]?.stringValue ?? ""
-                if let sourceFilter, source != sourceFilter { continue }
-                if let sourceContains, !source.localizedCaseInsensitiveContains(sourceContains) { continue }
+                if let sourceFilter, row.source != sourceFilter { continue }
+                if let sourceContains,
+                   !row.source.localizedCaseInsensitiveContains(sourceContains) { continue }
                 result.append(SearchHit(
                     rowID: rowID,
-                    text: row["text"]?.stringValue ?? "",
-                    source: source,
-                    chunkIndex: Int(row["chunk_index"]?.intValue ?? 0),
-                    heading: row["heading"]?.stringValue ?? "",
+                    text: row.text,
+                    source: row.source,
+                    chunkIndex: row.chunkIndex,
+                    heading: row.heading,
                     score: score,
                     vectorScore: score
                 ))
                 if result.count >= limit { break }
             }
-            index += batch.count
         }
         return result
     }
 
     /// FTS5 关键词检索，BM25 分数归一化为 [0,1)。
+    ///
+    /// 查询 token 先按「停用词过滤 + 最多 32 个显著 token」构造 AND 表达式；
+    /// AND 一条都命中不了时再退化为 OR，避免多个关键词被 OR 稀释成噪声。
     public func searchFTS(query: String, topK: Int, sourceFilter: String? = nil,
                           sourceContains: String? = nil) throws -> [SearchHit] {
         guard topK > 0 else { return [] }
-        let match = TextAnalyzer.ftsQuery(query)
-        guard !match.isEmpty else { return [] }
         // 同 search：FTS 命中与主表 hydrate 必须处于同一写入快照。
         lock.lock(); defer { lock.unlock() }
-
-        // 定向检索时扩大 FTS 召回，再在第二阶段过滤（FTS 表不参与 JOIN）。
         let fetchLimit = sourceContains == nil ? topK : topK * 20
-        let sql: String
-        let bindings: [SQLValue]
-        if let sourceFilter {
-            sql = """
-            SELECT rowid, bm25(\(Self.ftsTable)) AS rank
-            FROM \(Self.ftsTable)
-            WHERE tokens MATCH ? AND source_hash = ?
-            ORDER BY rank LIMIT ?
-            """
-            bindings = [.text(match), .text(Self.hashSource(sourceFilter)), .int(Int64(fetchLimit))]
-        } else {
-            sql = """
-            SELECT rowid, bm25(\(Self.ftsTable)) AS rank
-            FROM \(Self.ftsTable)
-            WHERE tokens MATCH ?
-            ORDER BY rank LIMIT ?
-            """
-            bindings = [.text(match), .int(Int64(fetchLimit))]
-        }
-
-        let rows: [[String: SQLValue]]
-        do {
-            rows = try db.query(sql, bindings)
-        } catch {
-            AgentLog.warning("FTS5 检索失败，退化为纯向量检索: \(error.localizedDescription)")
-            return []
-        }
-
-        let ranked = rows.compactMap { row -> (Int64, Double)? in
-            guard let rowID = row["rowid"]?.intValue else { return nil }
-            // bm25() 越小越相关，通常是负数。
-            let raw = -(row["rank"]?.doubleValue ?? 0)
-            return (rowID, raw)
-        }
+        let ranked = try ftsCandidatesLocked(query: query, limit: fetchLimit,
+                                             sourceFilter: sourceFilter)
+        guard !ranked.isEmpty else { return [] }
         let hydrated = try hydrateRaw(ranked: ranked, sourceFilter: sourceFilter,
                                       sourceContains: sourceContains, limit: topK)
         return hydrated.map { hit in
@@ -994,31 +1072,66 @@ public final class VectorStore: @unchecked Sendable {
         }
     }
 
+    /// FTS5 候选（rowid + 原始 BM25 分，不读正文）。调用方需已持有 `lock`。
+    func ftsCandidatesLocked(query: String, limit: Int,
+                             sourceFilter: String?) throws -> [(Int64, Double)] {
+        guard limit > 0 else { return [] }
+        let andQuery = TextAnalyzer.ftsQuery(query, mode: .and)
+        let orQuery = TextAnalyzer.ftsQuery(query, mode: .or)
+        guard !orQuery.isEmpty else { return [] }
+
+        func run(_ match: String) throws -> [[String: SQLValue]] {
+            if let sourceFilter {
+                return try db.query("""
+                SELECT rowid, bm25(\(Self.ftsTable)) AS rank
+                FROM \(Self.ftsTable)
+                WHERE tokens MATCH ? AND source_hash = ?
+                ORDER BY rank LIMIT ?
+                """, [.text(match), .text(Self.hashSource(sourceFilter)), .int(Int64(limit))])
+            }
+            return try db.query("""
+            SELECT rowid, bm25(\(Self.ftsTable)) AS rank
+            FROM \(Self.ftsTable)
+            WHERE tokens MATCH ?
+            ORDER BY rank LIMIT ?
+            """, [.text(match), .int(Int64(limit))])
+        }
+
+        var rows: [[String: SQLValue]] = []
+        do {
+            rows = try run(andQuery)
+            if rows.isEmpty, andQuery != orQuery {
+                rows = try run(orQuery)
+            }
+        } catch {
+            AgentLog.warning("FTS5 检索失败，退化为纯向量检索: \(error.localizedDescription)")
+            return []
+        }
+
+        return rows.compactMap { row -> (Int64, Double)? in
+            guard let rowID = row["rowid"]?.intValue else { return nil }
+            // bm25() 越小越相关，通常是负数。
+            let raw = -(row["rank"]?.doubleValue ?? 0)
+            return (rowID, raw)
+        }
+    }
+
     private func hydrateRaw(ranked: [(Int64, Double)], sourceFilter: String?,
                             sourceContains: String? = nil, limit: Int) throws -> [SearchHit] {
         guard !ranked.isEmpty else { return [] }
-        let ids = ranked.map(\.0)
-        let placeholders = Array(repeating: "?", count: ids.count).joined(separator: ",")
-        let rows = try db.query("""
-        SELECT rowid, text, source, chunk_index, heading
-        FROM \(Self.chunksTable) WHERE rowid IN (\(placeholders))
-        """, ids.map { SQLValue.int($0) })
-        var byID: [Int64: [String: SQLValue]] = [:]
-        for row in rows {
-            if let rowID = row["rowid"]?.intValue { byID[rowID] = row }
-        }
+        let byID = try loadChunksLocked(rowIDs: ranked.map(\.0))
         var result: [SearchHit] = []
         for (rowID, score) in ranked {
             guard let row = byID[rowID] else { continue }
-            let source = row["source"]?.stringValue ?? ""
-            if let sourceFilter, source != sourceFilter { continue }
-            if let sourceContains, !source.localizedCaseInsensitiveContains(sourceContains) { continue }
+            if let sourceFilter, row.source != sourceFilter { continue }
+            if let sourceContains,
+               !row.source.localizedCaseInsensitiveContains(sourceContains) { continue }
             result.append(SearchHit(
                 rowID: rowID,
-                text: row["text"]?.stringValue ?? "",
-                source: source,
-                chunkIndex: Int(row["chunk_index"]?.intValue ?? 0),
-                heading: row["heading"]?.stringValue ?? "",
+                text: row.text,
+                source: row.source,
+                chunkIndex: row.chunkIndex,
+                heading: row.heading,
                 score: score,
                 ftsScore: score
             ))
@@ -1028,54 +1141,73 @@ public final class VectorStore: @unchecked Sendable {
     }
 
     /// 混合检索：FTS5 + 向量 → RRF 融合。
-    /// - 两路各自 over-fetch（`topK * overfetch`）；
-    /// - 定向检索时向量通道自动放大召回；
-    /// - 融合只按 rowid，不 JOIN 虚拟表；
-    /// - `ann` 非空且索引可用时，向量通道走 ANN（失败自动回退精确路径）。
+    ///
+    /// 两路只取 rowid + 分数，先做 RRF 定出前 `topK`，最后一次性 hydrate 正文，
+    /// 避免为几百个候选读取全文。`overfetch` 只按 1-2 倍内层放大。
     public func hybridSearch(vector: [Float], query: String, topK: Int,
                              sourceFilter: String? = nil,
                              sourceContains: String? = nil,
-                             rrfK: Int = 60, overfetch: Int = 4,
+                             rrfK: Int = 60, overfetch: Int = 2,
                              ann: ANNQueryOptions? = nil) throws -> [SearchHit] {
-        let candidateCount = max(topK * max(1, overfetch) * 4, 20)
-        let vectorHits = try search(vector: vector, topK: candidateCount,
-                                    sourceFilter: sourceFilter, sourceContains: sourceContains,
-                                    ann: ann)
-        let ftsHits = try searchFTS(query: query, topK: candidateCount,
-                                    sourceFilter: sourceFilter, sourceContains: sourceContains)
+        guard topK > 0 else { return [] }
+        guard vector.count == dimension else {
+            throw AgentError.storage("查询向量维度 \(vector.count) != \(dimension)")
+        }
+        lock.lock(); defer { lock.unlock() }
+        guard hasChunks else { return [] }
 
-        if vectorHits.isEmpty && ftsHits.isEmpty { return [] }
-        if vectorHits.isEmpty { return Array(ftsHits.prefix(topK)) }
-        if ftsHits.isEmpty { return Array(vectorHits.prefix(topK)) }
+        // 待重建时向量通道暂停，但全文通道仍然可用（与 status 的提示一致）。
+        let vectorUsable = rebuildReason == nil
+        if !vectorUsable {
+            AgentLog.info("向量库待重建（\(rebuildReason ?? "")），本次只用全文检索")
+        }
 
-        var fused: [Int64: SearchHit] = [:]
+        // 内层候选量：每路仅比最终条数多 1-2 倍，不再乘 4。
+        let inner = max(topK * max(1, overfetch), 20)
+        let targeted = sourceContains != nil
+        let candidateCount = targeted ? max(inner * 4, 20) : inner
+        var vectorCandidates: [(Int64, Double)] = vectorUsable
+            ? try vectorCandidatesLocked(vector: vector, topK: candidateCount,
+                                         sourceFilter: sourceFilter,
+                                         ann: ann, targeted: targeted)
+            : []
+        var ftsCandidates = try ftsCandidatesLocked(
+            query: query, limit: candidateCount, sourceFilter: sourceFilter)
+        if let needle = sourceContains?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !needle.isEmpty {
+            vectorCandidates = try filterCandidatesLocked(vectorCandidates, contains: needle)
+            ftsCandidates = try filterCandidatesLocked(ftsCandidates, contains: needle)
+        }
+        guard !vectorCandidates.isEmpty || !ftsCandidates.isEmpty else { return [] }
+
         var rrfScores: [Int64: Double] = [:]
+        var vectorScores: [Int64: Double] = [:]
+        var ftsScores: [Int64: Double] = [:]
         let k = Double(max(1, rrfK))
-
-        for (rank, hit) in vectorHits.enumerated() {
-            let contribution = 1.0 / (k + Double(rank + 1))
-            rrfScores[hit.rowID, default: 0] += contribution
-            fused[hit.rowID] = hit
+        for (rank, candidate) in vectorCandidates.enumerated() {
+            rrfScores[candidate.0, default: 0] += 1.0 / (k + Double(rank + 1))
+            vectorScores[candidate.0] = candidate.1
         }
-        for (rank, hit) in ftsHits.enumerated() {
-            let contribution = 1.0 / (k + Double(rank + 1))
-            rrfScores[hit.rowID, default: 0] += contribution
-            if var existing = fused[hit.rowID] {
-                existing.ftsScore = hit.ftsScore
-                fused[hit.rowID] = existing
-            } else {
-                fused[hit.rowID] = hit
-            }
+        for (rank, candidate) in ftsCandidates.enumerated() {
+            rrfScores[candidate.0, default: 0] += 1.0 / (k + Double(rank + 1))
+            ftsScores[candidate.0] = candidate.1
         }
 
-        var output = fused.values.map { hit -> SearchHit in
+        let fused = rrfScores.sorted { $0.value > $1.value }
+        guard !fused.isEmpty else { return [] }
+        // hydrate 会跳过两次查询之间已被删除的 rowid，多取少量兜底。
+        let pool = fused.prefix(min(fused.count, topK * 2))
+        let hydrated = try hydrate(candidates: pool.map { ($0.key, $0.value) },
+                                   sourceFilter: sourceFilter,
+                                   sourceContains: sourceContains,
+                                   limit: topK)
+        return hydrated.map { hit in
             var copy = hit
-            copy.rrfScore = rrfScores[hit.rowID]
-            copy.score = rrfScores[hit.rowID] ?? 0
+            copy.rrfScore = hit.score
+            copy.vectorScore = vectorScores[hit.rowID]
+            copy.ftsScore = ftsScores[hit.rowID]
             return copy
         }
-        output.sort { ($0.rrfScore ?? 0) > ($1.rrfScore ?? 0) }
-        return Array(output.prefix(topK))
     }
 
     // MARK: - Documents

@@ -5,13 +5,15 @@ import Accelerate
 
 /// ANN 检索参数。
 public struct ANNQueryOptions: Sendable {
-    /// 每块探测的簇数。越大召回越高、读放大越多（1 = 最快）。
+    /// 每块探测的簇数。越大召回越高、读放大越多。
+    /// 离线评测（recall@20）中 1→2→4 为 26%→45%→74%，默认 4；
+    /// 真实库可用 `VectorStore.evaluateANNQuality` 再校准。
     public var nprobe: Int
     /// 用点查精确向量重打分的候选数（0 = 关闭）。开启后最终排序用真实
-    /// 余弦分，消除 int8 量化带来的排序误差。
+    /// 余弦分，消除 int8 量化带来的排序误差；64 已覆盖 topK 并留有余量。
     public var rescore: Int
 
-    public init(nprobe: Int = 1, rescore: Int = 0) {
+    public init(nprobe: Int = 4, rescore: Int = 64) {
         self.nprobe = max(1, nprobe)
         self.rescore = max(0, rescore)
     }
@@ -58,6 +60,29 @@ public struct ANNBuildResult: Sendable {
     public init() {}
 }
 
+/// ANN 离线质量评测结果：同一批查询下 ANN 与精确检索的对比。
+public struct ANNQualityReport: Sendable {
+    public var queries: Int = 0
+    public var topK: Int = 0
+    public var nprobe: Int = 0
+    public var rescore: Int = 0
+    /// recall@K：ANN 前 K 与精确前 K 的交集占精确前 K 的比例。
+    public var recall: Double = 0
+    /// nDCG@K：以精确余弦分为增益，衡量排序质量而不只是命中集合。
+    public var ndcg: Double = 0
+    /// 精确检索也返回空结果的查询数（这些查询无法计入召回）。
+    public var emptyQueries: Int = 0
+    public var averageMilliseconds: Double = 0
+
+    public init() {}
+
+    public var summary: String {
+        String(format: "nprobe=%ld rescore=%ld recall@%ld %.1f%% nDCG@%ld %.3f（%ld 查询，%.1fms/查询）",
+               nprobe, rescore, topK, recall * 100, topK, ndcg,
+               queries, averageMilliseconds)
+    }
+}
+
 /// ANN 索引状态。
 public struct ANNIndexStatus: Sendable {
     public var clusters: Int = 0
@@ -69,6 +94,8 @@ public struct ANNIndexStatus: Sendable {
     public var tailRows: Int = 0
     /// 尾块里超出精确补齐上限的部分：这些切片检索不到，需要重建索引。
     public var unindexedRows: Int = 0
+    /// 索引里已被删除/更新、但块内仍保留的旧行数（检索时 hydrate 会过滤）。
+    public var staleRows: Int = 0
     public var dimension: Int = 0
     public var builtAt: Double = 0
     /// 整库都在块内（无尾块）才算完全就绪。
@@ -76,8 +103,17 @@ public struct ANNIndexStatus: Sendable {
     /// 当前能否用索引检索（尾块仍在上限内）。
     public var isUsable: Bool = false
     public var needsRebuild: Bool = false
+    /// 索引块覆盖的切片比例（含陈旧行）。
     public var coverage: Double = 0
+    /// 扣掉陈旧行后的实际有效覆盖比例。
+    public var effectiveCoverage: Double = 0
     public var summary: String = ""
+
+    /// 陈旧行占已索引行的比例。
+    public var staleRatio: Double {
+        guard indexedRows > 0 else { return 0 }
+        return min(1, Double(staleRows) / Double(indexedRows))
+    }
 
     public init() {}
 }
@@ -92,6 +128,8 @@ struct ANNStoredMeta {
     var dim = 0
     var blocks = 0
     var rows = 0
+    /// 已索引范围内被删除/替换、块内仍保留的旧行数。超过阈值时整体重建。
+    var staleRows = 0
     var lastRowID: Int64 = 0
     var builtAt: Double = 0
     /// 构建时向量表的元素类型；与当前配置不符时索引不可用。
@@ -350,6 +388,8 @@ extension VectorStore {
     static let annFormatVersion = 2
     /// 尾块精确补齐的读取预算：超出则不再用索引检索（回退精确路径并要求重建）。
     static let annTailScanByteBudget = 128 * 1024 * 1024
+    /// 陈旧行占比阈值：超过后不再续建，直接整体重建（回收删除/更新留下的旧行）。
+    static let annStaleRebuildRatio: Double = 0.15
     static let annCellsTable = "ann_cells"
     static let annBlocksTable = "ann_blocks"
     private var annMetaPrefix: String { "ann_" }
@@ -376,18 +416,25 @@ extension VectorStore {
         let dimOK = meta.dim > 0 && meta.dim == dimension
         let typeOK = meta.elementType == elementType
         let versionOK = meta.version == Self.annFormatVersion
+        let stale = min(meta.rows, max(0, meta.staleRows))
         status.clusters = meta.clusters
         status.blockRows = meta.blockRows
         status.blocks = meta.blocks
         status.indexedRows = meta.rows
         status.tailRows = tail
         status.unindexedRows = unindexed
+        status.staleRows = stale
         status.dimension = meta.dim
         status.builtAt = meta.builtAt
         status.isReady = meta.blocks > 0 && dimOK && typeOK && versionOK && tail == 0
         status.isUsable = meta.blocks > 0 && dimOK && typeOK && versionOK && unindexed == 0
         status.coverage = total > 0 ? min(1, Double(meta.rows) / Double(total)) : 0
-        status.needsRebuild = meta.blocks > 0 && tail > annRebuildTailThreshold(dim: meta.dim)
+        status.effectiveCoverage = total > 0
+            ? min(1, Double(max(0, meta.rows - stale)) / Double(total))
+            : 0
+        status.needsRebuild = meta.blocks > 0
+            && (tail > annRebuildTailThreshold(dim: meta.dim)
+                || status.staleRatio >= Self.annStaleRebuildRatio)
         if !versionOK {
             status.summary = "ANN 索引格式版本 \(meta.version) 与当前 \(Self.annFormatVersion) 不符，需重建"
             return status
@@ -444,7 +491,14 @@ extension VectorStore {
         ]
         if status.tailRows > 0 { parts.append("尾块 \(status.tailRows) 切片（精确补齐）") }
         if status.unindexedRows > 0 { parts.append("尾块超出补齐上限，需重建索引") }
+        if status.staleRows > 0 {
+            parts.append(String(format: "陈旧 %ld 切片（占已索引 %.1f%%）",
+                                status.staleRows, status.staleRatio * 100))
+        }
         parts.append(String(format: "覆盖 %.1f%%", status.coverage * 100))
+        if status.staleRows > 0 {
+            parts.append(String(format: "实际覆盖 %.1f%%", status.effectiveCoverage * 100))
+        }
         if status.needsRebuild { parts.append("建议重建") }
         return parts.joined(separator: "，")
     }
@@ -455,14 +509,17 @@ extension VectorStore {
     ///
     /// 已建好的块直接复用（meta 记录块数、行数与 rowid 水位），因此取消/中断
     /// 后再次调用会从断点继续；簇数、块大小或维度变化时整体重建。
-    /// 每块一个事务：中途杀进程只丢当前块。
+    /// 陈旧行（删除/更新留下的旧 rowid）占比超过 15% 时也整体重建，
+    /// 而不是继续追加一个越来越空的索引。
+    ///
+    /// 锁粒度：准备与每块（读取 → 训练 → 写事务）各自持锁，块间释放。
+    /// 因此构建期间检索/状态查询不会被整体冻结；progress 回调也在锁外执行。
     @discardableResult
     public func buildANNIndex(clusters: Int = 256,
                               clusterSize: Int = 512,
                               iterations: Int = 8,
                               progress: ((ANNBuildProgress) -> Void)? = nil,
                               isCancelled: (() -> Bool)? = nil) throws -> ANNBuildResult {
-        lock.lock(); defer { lock.unlock() }
         let started = Date()
         let dim = dimension
         guard dim > 0 else { throw AgentError.storage("向量维度无效，无法构建 ANN 索引") }
@@ -470,16 +527,38 @@ extension VectorStore {
         let rowsPerCluster = min(max(1, clusterSize), 8192)
         let blockRows = clusterCount * rowsPerCluster
 
-        try ensureANNSchemaLocked()
-        var meta = try annStoredMetaLocked()
-        if meta.version != Self.annFormatVersion || meta.dim != dim
-            || meta.elementType != elementType
-            || meta.clusters != clusterCount || meta.blockRows != blockRows {
-            if meta.version != 0 {
-                AgentLog.info("ANN: 索引参数变化（\(meta.elementType.rawValue) / \(meta.clusters) 簇 / \(meta.blockRows) 行/块 / dim \(meta.dim)），整体重建")
+        func locked<T>(_ body: () throws -> T) rethrows -> T {
+            lock.lock(); defer { lock.unlock() }
+            return try body()
+        }
+
+        var meta = ANNStoredMeta()
+        var total = 0
+        var stopRowID: Int64 = 0
+        try locked {
+            try ensureANNSchemaLocked()
+            meta = try annStoredMetaLocked()
+            if meta.version != Self.annFormatVersion || meta.dim != dim
+                || meta.elementType != elementType
+                || meta.clusters != clusterCount || meta.blockRows != blockRows {
+                if meta.version != 0 {
+                    AgentLog.info("ANN: 索引参数变化（\(meta.elementType.rawValue) / \(meta.clusters) 簇 / \(meta.blockRows) 行/块 / dim \(meta.dim)），整体重建")
+                }
+                try resetANNIndexLocked()
+                meta = ANNStoredMeta()
+            } else if meta.blocks > 0, meta.rows > 0,
+                      min(meta.rows, max(0, meta.staleRows))
+                        >= Int(Double(meta.rows) * Self.annStaleRebuildRatio) {
+                // 删除/更新只累计计数；超过阈值直接重置，避免继续追加陈旧块。
+                AgentLog.info("ANN: 陈旧切片 \(meta.staleRows)/\(meta.rows) 超过 "
+                    + "\(Int(Self.annStaleRebuildRatio * 100))%，整体重建以回收旧行")
+                try resetANNIndexLocked()
+                meta = ANNStoredMeta()
             }
-            try resetANNIndexLocked()
-            meta = ANNStoredMeta()
+            total = count
+            stopRowID = (try? db.scalar(
+                "SELECT COALESCE(MAX(rowid), 0) FROM \(Self.chunksTable)").intValue)
+                .flatMap { Int64($0) } ?? 0
         }
 
         var result = ANNBuildResult()
@@ -488,7 +567,6 @@ extension VectorStore {
         var blockID = meta.blocks
         var indexedRows = meta.rows
         var watermark = meta.lastRowID
-        let total = count
         let remaining = max(0, total - indexedRows)
         let estimatedBlocks = max(1, (remaining + blockRows - 1) / blockRows)
         if indexedRows > 0 {
@@ -500,29 +578,44 @@ extension VectorStore {
             message: "开始构建 ANN 索引（\(clusterCount) 簇/块 × \(rowsPerCluster) 行/簇）"))
 
         while true {
-            var buffer = ANNBlockBuffer()
-            try gatherANNBlockLocked(after: watermark, dim: dim, maxRows: blockRows,
-                                     elementType: elementType, into: &buffer)
-            if buffer.count == 0 { break }
-            if let isCancelled, isCancelled() {
+            // 每块单独持锁：块间允许并发的检索/状态查询拿到锁。
+            let step = try locked { () -> (finished: Bool, cancelled: Bool,
+                                           update: ANNBuildProgress?) in
+                if let isCancelled, isCancelled() {
+                    return (true, true, nil)
+                }
+                if watermark >= stopRowID {
+                    return (true, false, nil)
+                }
+                var buffer = ANNBlockBuffer()
+                try gatherANNBlockLocked(after: watermark, dim: dim, maxRows: blockRows,
+                                         elementType: elementType, into: &buffer)
+                guard buffer.count > 0 else { return (true, false, nil) }
+                try writeANNBlockLocked(blockID: blockID, dim: dim, clusters: clusterCount,
+                                        blockRows: blockRows, iterations: iterations,
+                                        buffer: buffer)
+                blockID += 1
+                indexedRows += buffer.count
+                watermark = buffer.lastRowID
+                return (false, false, ANNBuildProgress(
+                    stage: "blocks", blocks: blockID,
+                    totalBlocks: max(estimatedBlocks, blockID),
+                    rows: indexedRows, totalRows: max(total, indexedRows),
+                    message: "已写入 \(blockID) 块（\(indexedRows) 切片）"))
+            }
+            if let update = step.update { progress?(update) }
+            if step.cancelled {
                 result.cancelled = true
                 break
             }
-            try writeANNBlockLocked(blockID: blockID, dim: dim, clusters: clusterCount,
-                                    blockRows: blockRows, iterations: iterations, buffer: buffer)
-            blockID += 1
-            indexedRows += buffer.count
-            watermark = buffer.lastRowID
-            progress?(ANNBuildProgress(
-                stage: "blocks", blocks: blockID,
-                totalBlocks: max(estimatedBlocks, blockID),
-                rows: indexedRows, totalRows: max(total, indexedRows),
-                message: "已写入 \(blockID) 块（\(indexedRows) 切片）"))
+            if step.finished { break }
         }
 
-        result.blocks = blockID
-        result.indexedRows = indexedRows
-        result.tailRows = max(0, count - indexedRows)
+        locked {
+            result.blocks = blockID
+            result.indexedRows = indexedRows
+            result.tailRows = max(0, count - indexedRows)
+        }
         result.elapsed = Date().timeIntervalSince(started)
         var summary = "ANN 索引：\(blockID) 块 / \(indexedRows) 切片，耗时 "
             + String(format: "%.1fs", result.elapsed)
@@ -556,7 +649,7 @@ extension VectorStore {
     // MARK: 检索
 
     /// ANN 检索：返回 nil 表示索引不可用，调用方应回退精确检索。
-    public func annSearch(vector: [Float], topK: Int, nprobe: Int = 1, rescore: Int = 0,
+    public func annSearch(vector: [Float], topK: Int, nprobe: Int = 4, rescore: Int = 64,
                           sourceFilter: String? = nil,
                           sourceContains: String? = nil) throws -> [SearchHit]? {
         guard topK > 0, vector.count == dimension else { return nil }
@@ -567,10 +660,98 @@ extension VectorStore {
                                    sourceFilter: sourceFilter, sourceContains: sourceContains)
     }
 
+    /// 用同一批查询向量对比 ANN 与精确检索的 recall@K / nDCG@K。
+    ///
+    /// 不 hydrate 正文，只比较 rowid 排序，适合在真实库上离线验证
+    /// `nprobe` / `rescore`：先看召回是否够用，再决定要不要调大参数。
+    /// 返回 nil 表示索引不可用（未构建/维度或量化方式不符）。
+    public func evaluateANNQuality(queries: [[Float]], topK: Int = 20,
+                                   nprobe: Int = 2,
+                                   rescore: Int = 64) throws -> ANNQualityReport? {
+        guard topK > 0, !queries.isEmpty else { return nil }
+        guard queries.allSatisfy({ $0.count == dimension }) else {
+            throw AgentError.storage("查询向量维度与索引不一致")
+        }
+        lock.lock(); defer { lock.unlock() }
+        guard hasChunks else { return nil }
+        guard let meta = try? annStoredMetaLocked(), meta.blocks > 0,
+              meta.version == Self.annFormatVersion,
+              meta.elementType == elementType,
+              meta.dim == dimension else { return nil }
+
+        let options = ANNQueryOptions(nprobe: nprobe, rescore: rescore)
+        var report = ANNQualityReport()
+        report.topK = topK
+        report.nprobe = options.nprobe
+        report.rescore = options.rescore
+        let started = Date()
+        var recallSum = 0.0
+        var ndcgSum = 0.0
+        var validQueries = 0
+
+        for query in queries {
+            let exact = try bruteCandidatesLocked(vector: query, topK: topK,
+                                                  sourceFilter: nil)
+            guard !exact.isEmpty else {
+                report.emptyQueries += 1
+                continue
+            }
+            let ann = try annCandidatesLocked(vector: query, topK: topK,
+                                              options: options) ?? []
+            validQueries += 1
+
+            let exactTop = Array(exact.prefix(topK))
+            let exactIDs = Set(exactTop.map(\.0))
+            let annTop = Array(ann.prefix(topK))
+            let hits = annTop.filter { exactIDs.contains($0.0) }.count
+            recallSum += Double(hits) / Double(min(topK, exactTop.count))
+
+            // 增益用精确检索的相似度：命中相同 rowid 但排序不同也会扣分。
+            var dcg = 0.0
+            for (rank, item) in annTop.enumerated() {
+                guard let matched = exactTop.first(where: { $0.0 == item.0 }) else { continue }
+                dcg += max(0, matched.1) / log2(Double(rank) + 2)
+            }
+            var idcg = 0.0
+            for (rank, item) in exactTop.enumerated() {
+                idcg += max(0, item.1) / log2(Double(rank) + 2)
+            }
+            ndcgSum += idcg > 0 ? dcg / idcg : 1
+        }
+
+        report.queries = validQueries
+        report.recall = validQueries > 0 ? recallSum / Double(validQueries) : 0
+        report.ndcg = validQueries > 0 ? ndcgSum / Double(validQueries) : 0
+        report.averageMilliseconds = validQueries > 0
+            ? Date().timeIntervalSince(started) * 1_000 / Double(validQueries) : 0
+        return report
+    }
+
     /// 调用方需已持有 `lock`。
     func annSearchLocked(vector: [Float], topK: Int, options: ANNQueryOptions,
                          sourceFilter: String?,
                          sourceContains: String?) throws -> [SearchHit]? {
+        let targeted = sourceFilter != nil || sourceContains != nil
+        // 多取候选再 hydrate：块内可能残留已删除的旧 rowid（陈旧行），
+        // 若只取 topK 个候选，hydrate 过滤后结果会不足 topK。
+        let probeCount = targeted ? max(topK * 8, 64) : max(topK * 4, 32)
+        guard let candidates = try annCandidatesLocked(vector: vector, topK: probeCount,
+                                                       options: options,
+                                                       targeted: targeted) else {
+            return nil
+        }
+        let hits = try hydrate(candidates: candidates, sourceFilter: sourceFilter,
+                               sourceContains: sourceContains, limit: topK)
+        // 有候选但一条都 hydrate 不出来：候选 rowid 全失效，或定向过滤把候选全
+        // 排除了。ANN 的「近似」只应体现在排序上，不该把它答不出的问题答成空，
+        // 回退精确检索核实一次。
+        return hits.isEmpty ? nil : hits
+    }
+
+    /// ANN 候选（rowid + 分数，不读正文）。返回 nil 表示索引不可用，需回退精确检索。
+    /// 调用方需已持有 `lock`。
+    func annCandidatesLocked(vector: [Float], topK: Int, options: ANNQueryOptions,
+                             targeted: Bool = false) throws -> [(Int64, Double)]? {
         guard let meta = try? annStoredMetaLocked(), meta.blocks > 0,
               meta.version == Self.annFormatVersion,
               meta.elementType == elementType,
@@ -587,7 +768,6 @@ extension VectorStore {
             let queryBits = elementType.isBinary
                 ? [UInt8](VectorEncoder.encodeBits(query))
                 : []
-            let targeted = sourceFilter != nil || sourceContains != nil
             // 候选池必须留余量：索引里的 rowid 可能已被删除（同步是「先删后插」），
             // hydrate 会丢弃这些失效行；池子太小会让有效结果被挤空。
             let capacity = targeted
@@ -603,11 +783,11 @@ extension VectorStore {
                 for block in 0..<meta.blocks {
                     let probes = centroids.nearest(query: queryBase, block: block,
                                                    nprobe: options.nprobe, scratch: &scratch)
-                    for cluster in probes {
-                        try scoreANNCellsLocked(block: block, cluster: cluster, dim: meta.dim,
-                                                elementType: elementType, query: queryBase,
-                                                queryBits: queryBits, pool: &pool)
-                    }
+                    // 每个块只发一条 SQL 读取所有命中簇：nprobe 通常 2-4，
+                    // 逐簇查询会把同一块的 IO 拆成多次 prepare/step。
+                    try scoreANNCellsLocked(block: block, clusters: probes, dim: meta.dim,
+                                            elementType: elementType, query: queryBase,
+                                            queryBits: queryBits, pool: &pool)
                 }
             }
             if tailRows > 0 {
@@ -623,28 +803,29 @@ extension VectorStore {
             // 一个候选都没有：多半是索引里的 rowid 全被删了（清空/去重/整库重同步后
             // 水位之前的内容都不存在了）。此时不能返回空结果——交给精确检索作答。
             guard !candidates.isEmpty else { return nil }
-            let hits = try hydrate(candidates: candidates, sourceFilter: sourceFilter,
-                                   sourceContains: sourceContains, limit: topK)
-            // 有候选但一条都 hydrate 不出来：候选 rowid 全失效，或定向过滤把候选全
-            // 排除了。ANN 的「近似」只应体现在排序上，不该把它答不出的问题答成空，
-            // 回退精确检索核实一次。
-            return hits.isEmpty ? nil : hits
+            return Array(candidates.prefix(topK))
         } catch {
             AgentLog.warning("ANN: 检索失败，回退精确检索: \(error.localizedDescription)")
             return nil
         }
     }
 
-    /// 读取一个簇的打包行并打分。
-    private func scoreANNCellsLocked(block: Int, cluster: Int, dim: Int,
+    /// 读取一个块内所有命中簇的打包行并打分。按 `cluster_id, seq` 顺序返回，
+    /// 命中簇在磁盘上本来就连续存放，一次 IN 查询即可顺序读完。
+    private func scoreANNCellsLocked(block: Int, clusters: [Int], dim: Int,
                                      elementType: VectorElementType,
                                      query: UnsafePointer<Float>,
                                      queryBits: [UInt8],
                                      pool: inout ANNTopKCollector) throws {
+        guard !clusters.isEmpty else { return }
+        let placeholders = Array(repeating: "?", count: clusters.count).joined(separator: ",")
+        var bindings: [SQLValue] = [.int(Int64(block))]
+        bindings.append(contentsOf: clusters.map { .int(Int64($0)) })
         let rows = try db.query("""
         SELECT payload FROM \(Self.annCellsTable)
-        WHERE block_id = ? AND cluster_id = ? ORDER BY seq
-        """, [.int(Int64(block)), .int(Int64(cluster))])
+        WHERE block_id = ? AND cluster_id IN (\(placeholders))
+        ORDER BY cluster_id, seq
+        """, bindings)
         guard !rows.isEmpty else { return }
         if elementType.isBinary {
             let bitBytes = elementType.blobSize(dimension: dim)
@@ -724,21 +905,25 @@ extension VectorStore {
         }
     }
 
-    /// 用点查到的精确向量给候选重打分（消除量化误差）。
+    /// 用点查到的精确向量给前 `limit` 个候选重打分（消除量化误差）。
+    ///
+    /// 只返回重打分成功的候选：量化分与余弦分不在同一尺度，混排会失真
+    /// （bin 的量化满分是 1.0，但反量化后完美匹配的余弦只有 1/√dim）。
+    /// 取不到精确向量的候选（已被删除）hydrate 时本来也会被过滤。
     private func rescoreANNCandidatesLocked(_ candidates: [(Int64, Double)], query: [Float],
                                             limit: Int) throws -> [(Int64, Double)] {
         let head = candidates.prefix(limit).map(\.0)
+        guard !head.isEmpty else { return candidates }
         let exact = try exactVectorsLocked(rowIDs: Array(head))
         guard !exact.isEmpty else { return candidates }
         var rescored: [(Int64, Double)] = []
-        rescored.reserveCapacity(candidates.count)
-        for item in candidates {
-            if let vector = exact[item.0], vector.count == query.count {
-                rescored.append((item.0, VectorCodec.cosine(query, vector)))
-            } else {
-                rescored.append(item)
+        rescored.reserveCapacity(head.count)
+        for rowID in head {
+            if let vector = exact[rowID], vector.count == query.count {
+                rescored.append((rowID, VectorCodec.cosine(query, vector)))
             }
         }
+        guard !rescored.isEmpty else { return candidates }
         rescored.sort { $0.1 > $1.1 }
         return rescored
     }
@@ -851,7 +1036,8 @@ extension VectorStore {
     }
 
     /// 写索引 meta。`meta.rows` 是**本块新增行数**：`ann_rows` 在已有值上累加
-    ///（块数、水位、簇数等其余键直接覆盖）。
+    ///（块数、水位、簇数等其余键直接覆盖）。`ann_stale_rows` 沿用已有计数，
+    /// 新块不会把之前累计的陈旧行清零。
     private func writeANNMetaLocked(_ meta: ANNStoredMeta) throws {
         let stored = try annStoredMetaLocked()
         let rows = stored.rows + meta.rows
@@ -863,6 +1049,7 @@ extension VectorStore {
             ("ann_element_type", meta.elementType.rawValue),
             ("ann_blocks", String(meta.blocks)),
             ("ann_rows", String(rows)),
+            ("ann_stale_rows", String(stored.staleRows)),
             ("ann_last_rowid", String(meta.lastRowID)),
             ("ann_built_at", String(meta.builtAt)),
         ]
@@ -872,6 +1059,22 @@ extension VectorStore {
             ON CONFLICT(key) DO UPDATE SET value = excluded.value
             """, [.text(key), .text(value)])
         }
+    }
+
+    /// 删除/更新切片后累计陈旧行数：只有落在索引水位之前的 rowid 才在块内。
+    /// 调用方需已在同一个写事务里（删除与计数一起提交）。
+    func recordANNStaleRowsLocked(_ rowIDs: [Int64]) throws {
+        guard !rowIDs.isEmpty,
+              let meta = try? annStoredMetaLocked(), meta.blocks > 0,
+              meta.lastRowID > 0 else { return }
+        let stale = rowIDs.reduce(0) { $0 + ($1 <= meta.lastRowID ? 1 : 0) }
+        guard stale > 0 else { return }
+        let updated = min(meta.rows, max(0, meta.staleRows) + stale)
+        guard updated != meta.staleRows else { return }
+        try db.execute("""
+        INSERT INTO meta(key, value) VALUES('ann_stale_rows', ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """, [.text(String(updated))])
     }
 
     /// 初始簇心：块内均匀采样若干行（k-means 起点）。
@@ -939,6 +1142,7 @@ extension VectorStore {
         meta.dim = Int(values["ann_dim"] ?? "") ?? 0
         meta.blocks = Int(values["ann_blocks"] ?? "") ?? 0
         meta.rows = Int(values["ann_rows"] ?? "") ?? 0
+        meta.staleRows = Int(values["ann_stale_rows"] ?? "") ?? 0
         meta.lastRowID = Int64(values["ann_last_rowid"] ?? "") ?? 0
         meta.builtAt = Double(values["ann_built_at"] ?? "") ?? 0
         meta.elementType = values["ann_element_type"]

@@ -131,6 +131,177 @@ final class ManifestStore: @unchecked Sendable {
     }
 }
 
+/// 本轮同步内的「正文内容哈希」去重登记表。
+///
+/// 解析/清洗后、切片/embedding 前先算正文哈希：
+/// - 命中 manifest 中仍完整的历史文档 → 直接写 tombstone，跳过切片与向量化；
+/// - 命中本轮正在处理且正文相同的文档 → 等它结束：成功则写 tombstone 跳过，
+///   失败/取消则由等待者接手，避免把去重结果押在一个最终失败的文件上。
+final class ContentDedupRegistry: @unchecked Sendable {
+    enum Claim: Sendable {
+        /// 由本次调用负责切片/embedding。
+        case owner
+        /// 正文已由 `canonical` 负责，当前来源只需写 tombstone。
+        case duplicate(canonical: String)
+    }
+
+    private struct Waiter {
+        let source: String
+        let continuation: CheckedContinuation<Claim, Never>
+    }
+
+    private let lock = NSLock()
+    /// digest → manifest 中可能可用的保留来源（第一次遇到时再验证库内切片）。
+    private let manifestCandidates: [String: [String]]
+    private var resolvedDigests = Set<String>()
+    /// digest → 已确认可用的保留来源（历史文档或本轮完成文档）。
+    private var canonicals: [String: String] = [:]
+    /// digest → 当前负责切片/embedding 的来源。
+    private var owners: [String: String] = [:]
+    private var waiters: [String: [Waiter]] = [:]
+    private let isUsable: @Sendable (String) -> Bool
+
+    /// - Parameters:
+    ///   - manifest: 同步开始时的 manifest 快照（已排除本轮删除的来源）。
+    ///   - sources: 本轮仍存在的来源集合。
+    ///   - isUsable: 历史条目是否仍有切片在库中；用于避免 tombstone 指向空来源。
+    init(manifest: [String: RAGManifestEntry],
+         sources: Set<String>,
+         isUsable: @escaping @Sendable (String) -> Bool) {
+        self.isUsable = isUsable
+        var candidates: [String: [String]] = [:]
+        for (source, entry) in manifest where sources.contains(source) {
+            guard entry.complete == true,
+                  (entry.chunkCount ?? 0) > 0,
+                  entry.duplicateOf == nil,
+                  !entry.digest.isEmpty else { continue }
+            candidates[entry.digest, default: []].append(source)
+        }
+        manifestCandidates = candidates.mapValues {
+            $0.sorted { $0.localizedStandardCompare($1) == .orderedAscending }
+        }
+    }
+
+    /// 认领正文哈希。返回 `.duplicate` 时调用方不得再切片/embedding。
+    func claim(digest: String, source: String) async -> Claim {
+        // 历史 manifest 候选只在该 digest 第一次出现时验证一次（COUNT 查询），
+        // 避免同步开头对每条 manifest 都扫一遍库。
+        var candidatesToVerify: [String]?
+        lock.lock()
+        if !resolvedDigests.contains(digest) {
+            resolvedDigests.insert(digest)
+            candidatesToVerify = manifestCandidates[digest]
+        }
+        lock.unlock()
+
+        if let candidatesToVerify {
+            // 关闭查询可能在处理中删掉旧向量，因此以「当前库内确实有切片」为准。
+            let usable = candidatesToVerify.first {
+                $0 != source && isUsable($0)
+            }
+            if let usable {
+                lock.lock()
+                if canonicals[digest] == nil { canonicals[digest] = usable }
+                lock.unlock()
+            }
+        }
+
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                lock.lock()
+                if let canonical = canonicals[digest], canonical != source {
+                    lock.unlock()
+                    continuation.resume(returning: .duplicate(canonical: canonical))
+                    return
+                }
+                if let owner = owners[digest] {
+                    if owner == source {
+                        lock.unlock()
+                        continuation.resume(returning: .owner)
+                        return
+                    }
+                    waiters[digest, default: []].append(
+                        Waiter(source: source, continuation: continuation))
+                    lock.unlock()
+                    return
+                }
+                owners[digest] = source
+                lock.unlock()
+                continuation.resume(returning: .owner)
+            }
+        } onCancel: {
+            // 等待中的任务取消后必须唤醒自己，否则 owner 永远等不到结果。
+            self.removeWaiter(digest: digest, source: source)
+        }
+    }
+
+    /// owner 成功完成入库后调用，唤醒所有等待者写 tombstone。
+    func complete(digest: String, source: String) {
+        lock.lock()
+        canonicals[digest] = source
+        if owners[digest] == source { owners.removeValue(forKey: digest) }
+        let waiting = waiters.removeValue(forKey: digest) ?? []
+        lock.unlock()
+        for waiter in waiting {
+            waiter.continuation.resume(returning: .duplicate(canonical: source))
+        }
+    }
+
+    /// owner 失败或取消后调用：让下一个等待者接手，其余继续排队。
+    func fail(digest: String, source: String) {
+        lock.lock()
+        guard owners[digest] == source else {
+            lock.unlock()
+            return
+        }
+        guard var list = waiters[digest], !list.isEmpty else {
+            owners.removeValue(forKey: digest)
+            lock.unlock()
+            return
+        }
+        let next = list.removeFirst()
+        if list.isEmpty {
+            waiters.removeValue(forKey: digest)
+        } else {
+            waiters[digest] = list
+        }
+        owners[digest] = next.source
+        lock.unlock()
+        next.continuation.resume(returning: .owner)
+    }
+
+    /// 同步结束时兜底：唤醒所有等待者，避免异常路径留下永久挂起的任务。
+    func cancelAll() {
+        lock.lock()
+        let waiting = waiters
+        waiters.removeAll()
+        owners.removeAll()
+        lock.unlock()
+        for list in waiting.values {
+            for waiter in list {
+                waiter.continuation.resume(returning: .owner)
+            }
+        }
+    }
+
+    private func removeWaiter(digest: String, source: String) {
+        lock.lock()
+        guard var list = waiters[digest],
+              let index = list.firstIndex(where: { $0.source == source }) else {
+            lock.unlock()
+            return
+        }
+        let waiter = list.remove(at: index)
+        if list.isEmpty {
+            waiters.removeValue(forKey: digest)
+        } else {
+            waiters[digest] = list
+        }
+        lock.unlock()
+        waiter.continuation.resume(returning: .owner)
+    }
+}
+
 // MARK: - RAG Engine
 
 // MARK: - 并发 Ingest 任务
@@ -158,6 +329,8 @@ private struct IngestOutcome: Sendable {
     var skipped = false
     var processed = false
     var cancelled = false
+    /// 命中正文哈希、只写 tombstone 的副本（没有切片/向量化）。
+    var deduplicated = false
     var chunks = 0
     var error: String?
 }
@@ -238,6 +411,13 @@ public final class RAGEngine {
     private var openInFlight = false
     private var openFailure: Error?
     private let openQueue = DispatchQueue(label: "base-agent.rag.open", qos: .utility)
+    /// ANN 后台自动构建状态。构建不占 `searchLock`，检索与状态查询随时可用。
+    private let annBuildLock = NSLock()
+    private var annBuildTask: Task<Void, Never>?
+    private var annBuildScheduled = false
+    private var annBuildActive = false
+    private var annBuildProgress: ANNBuildProgress?
+    private var annBuildGeneration: UInt64 = 0
 
     public static let supportedExtensions: Set<String> = [
         "pdf", "txt", "md", "markdown", "html", "htm", "xhtml",
@@ -588,6 +768,9 @@ public final class RAGEngine {
     // MARK: Ingest
 
     /// 增量同步知识库。返回统计；同一实例并发调用会被拒绝。
+    ///
+    /// ANN 索引的自动构建在同步收尾、释放独占标志后转到后台任务执行，
+    /// 因此同步一返回，检索与状态查询即可继续（构建不持有 `searchLock`）。
     public func ingest(force: Bool = false,
                        progress: ((Int, Int, String) -> Void)? = nil,
                        log: ((String) -> Void)? = nil) async -> IngestStats {
@@ -596,17 +779,20 @@ public final class RAGEngine {
             stats.errors.append("另一次同步正在进行，已忽略本次请求")
             return stats
         }
+        let logFn: (String) -> Void = { message in
+            if let log { log(message) } else { AgentLog.info(message) }
+        }
+        var stats = IngestStats()
+        var autoBuildRequested = false
         defer {
             invalidateStatusCache()
             releaseIngestFlag()
             closeIfPending()
+            if autoBuildRequested {
+                scheduleANNAutoBuild(log: logFn)
+            }
         }
         cancelLock.lock(); cancelRequested = false; cancelLock.unlock()
-
-        var stats = IngestStats()
-        let logFn: (String) -> Void = { message in
-            if let log { log(message) } else { AgentLog.info(message) }
-        }
 
         guard FileManager.default.fileExists(atPath: knowledgeBase) else {
             stats.errors.append("知识库目录不存在: \(knowledgeBase)")
@@ -655,6 +841,16 @@ public final class RAGEngine {
             return stats
         }
         logFn("RAG: 索引库就绪（现有 \(existingChunkCount) 切片）")
+        if effectiveForce {
+            // force 会先删后插全部来源；旧索引的 rowid 全部失效，续建没有意义。
+            // 同步开始前直接重置，结束后由后台任务按需全量重建。
+            do {
+                try store.dropANNIndex()
+                logFn("RAG: 强制同步前已重置 ANN 索引，结束后将按需重建")
+            } catch {
+                logFn("RAG: 重置 ANN 索引失败（不影响本次同步）：\(error.localizedDescription)")
+            }
+        }
 
         var manifest = manifestStore.load()
         logFn("RAG: manifest 载入 \(manifest.count) 条")
@@ -682,7 +878,11 @@ public final class RAGEngine {
         }
 
         // 原始文件采样指纹去重：同一本书放在不同目录时只解析一个代表文件。
-        let (uniqueFiles, duplicateGroups) = Self.groupDuplicateFiles(files, manifest: manifest)
+        // 默认信任 manifest 里的 mtime + size + 指纹，未变化文件不再读盘采样；
+        // force 或 verify_fingerprint 开启时才重新校验内容。
+        let (uniqueFiles, duplicateGroups) = Self.groupDuplicateFiles(
+            files, manifest: manifest, force: effectiveForce,
+            verifyFingerprint: config.ragVerifyFingerprint)
         let total = uniqueFiles.count
         let duplicateCount = duplicateGroups.reduce(0) { $0 + $1.duplicates.count }
         if duplicateCount > 0 {
@@ -726,7 +926,11 @@ public final class RAGEngine {
                            memoryLimitMB: Double(config.ragEmbeddingMemoryLimitMB),
                            throughputTolerance: config.ragEmbeddingThroughputTolerance,
                            probeBatches: config.ragEmbeddingProbeBatches,
-                           probeSeconds: config.ragEmbeddingProbeSeconds),
+                           probeSeconds: config.ragEmbeddingProbeSeconds,
+                           tokenBudgetMin: config.ragEmbeddingTokenBudgetMin,
+                           tokenBudgetMax: config.ragEmbeddingTokenBudgetMax,
+                           initialTokenBudget: config.ragEmbeddingTokenBudgetInitial,
+                           tokenBudgetStep: config.ragEmbeddingTokenBudgetStep),
             log: logFn)
         let jobs = uniqueFiles.enumerated().map { index, file in
             IngestJob(index: index, total: total, file: file,
@@ -743,6 +947,12 @@ public final class RAGEngine {
         var snapshot = manifest
         for key in removedKeys { snapshot.removeValue(forKey: key) }
         let manifestSnapshot = snapshot
+        // 正文哈希去重登记表：解析/清洗后就能判断的内容副本不再切片/embedding。
+        // 历史 manifest 条目在首次命中时验证库内切片，避免 tombstone 指向空来源。
+        let contentRegistry = ContentDedupRegistry(
+            manifest: snapshot,
+            sources: currentSources,
+            isUsable: { source in storeRef.chunkCount(source: source) > 0 })
         let markdownDirRef = markdownDir
         let knowledgeBaseRef = knowledgeBase
         let signature = signatureHash
@@ -763,6 +973,7 @@ public final class RAGEngine {
                             force: force,
                             config: configRef,
                             registry: registry,
+                            contentRegistry: contentRegistry,
                             store: storeRef,
                             embedding: scheduler,
                             manifestStore: manifestStoreRef,
@@ -781,6 +992,8 @@ public final class RAGEngine {
             }
             await group.waitForAll()
         }
+        // 兜底唤醒：worker 在异常路径退出时也不能让等待同一正文的任务永久挂起。
+        contentRegistry.cancelAll()
 
         if isCancelled { stats.cancelled = true }
         for outcome in await accumulator.snapshot() {
@@ -789,6 +1002,7 @@ public final class RAGEngine {
                 stats.processed += 1
                 stats.chunks += outcome.chunks
             }
+            if outcome.deduplicated { stats.deduplicated += 1 }
             if outcome.cancelled { stats.cancelled = true }
             if let error = outcome.error { stats.errors.append(error) }
         }
@@ -798,9 +1012,9 @@ public final class RAGEngine {
         if stats.cancelled {
             logFn("RAG: 同步已取消，跳过副本向量清理由下次完整同步执行")
         } else {
-            // 同步完成后按 content hash 再做一次全局去重，清掉不同目录/不同格式
-            // 但正文相同的副本，避免检索命中重复切片。
-            stats.deduplicated = Self.deduplicateByContentHash(
+            // 同步完成后按 content hash 再做一次全局去重，兜住本轮未能提前
+            // 判定（例如并发时序/旧版本 manifest）的正文副本。
+            stats.deduplicated += Self.deduplicateByContentHash(
                 manifestStore: manifestStore,
                 duplicateGroups: duplicateGroups,
                 existingSources: Set(manifest.keys),
@@ -824,10 +1038,18 @@ public final class RAGEngine {
             logFn("RAG: 已完成文件已保留，下次同步将从剩余未完成文件继续")
         } else {
             progress?(total, total, "")
+            let metrics = scheduler.metricsSnapshot()
+            if metrics.texts > 0 {
+                logFn(String(format: "RAG: embedding 实测 %ld token，%.0f token/秒，"
+                             + "峰值内存 %.0f MB，当前预算 %ld token / 最多 %ld 条",
+                             metrics.tokens, metrics.tokensPerSecond,
+                             metrics.peakMemoryMB, metrics.tokenBudget,
+                             metrics.maxBatchTexts))
+            }
             logFn("RAG: 同步完成 — \(stats.summary)")
-            // 同步成功后按需构建/续建 ANN 索引：大库上精确检索会超时跳过，
-            // 建好索引后 rag_search 才能稳定在超时预算内返回。
-            autoBuildANNIndexIfNeeded(log: logFn)
+            // 同步成功后按需构建/续建 ANN 索引。放到 defer 里、独占标志释放后
+            // 由后台任务执行：同步返回即可继续检索，构建不再冻结读路径。
+            autoBuildRequested = true
         }
         return stats
     }
@@ -915,6 +1137,7 @@ public final class RAGEngine {
         force: Bool,
         config: AgentConfig,
         registry: DocumentParserRegistry,
+        contentRegistry: ContentDedupRegistry,
         store: VectorStore,
         embedding: AdaptiveEmbeddingScheduler,
         manifestStore: ManifestStore,
@@ -929,6 +1152,17 @@ public final class RAGEngine {
         let file = job.file
         let source = file.path
         var outcome = IngestOutcome(source: source)
+        // 认领正文哈希后，无论成功、失败还是取消都要通知等待者，避免挂死。
+        var contentDigest: String?
+        defer {
+            if let digest = contentDigest {
+                if outcome.processed {
+                    contentRegistry.complete(digest: digest, source: source)
+                } else {
+                    contentRegistry.fail(digest: digest, source: source)
+                }
+            }
+        }
 
         if isCancelled() || Task.isCancelled {
             outcome.cancelled = true
@@ -947,7 +1181,8 @@ public final class RAGEngine {
            abs(entry.mtime - signature.mtime) < 0.001,
            entry.size == signature.size,
            !entry.fingerprint.isEmpty,
-           Self.sourceFingerprint(source, size: signature.size) == entry.fingerprint,
+           (!config.ragVerifyFingerprint
+                || Self.sourceFingerprint(source, size: signature.size) == entry.fingerprint),
            let canonicalEntry = manifestSnapshot[canonical],
            canonicalEntry.complete == true,
            (canonicalEntry.chunkCount ?? 0) > 0,
@@ -972,7 +1207,10 @@ public final class RAGEngine {
                 redoReason = "文件大小已变更"
             } else if entry.digest.isEmpty {
                 redoReason = "摘要缺失"
-            } else if Self.sourceFingerprint(source, size: signature.size) != entry.fingerprint {
+            } else if config.ragVerifyFingerprint,
+                      Self.sourceFingerprint(source, size: signature.size) != entry.fingerprint {
+                // 默认信任 mtime + size；只有显式开启 verify_fingerprint 才为
+                // 「保留时间戳的同尺寸改动」再读一遍采样指纹。
                 redoReason = "文件内容已变更"
             } else if entry.mdPath.isEmpty
                         || !FileManager.default.fileExists(atPath: entry.mdPath) {
@@ -1020,6 +1258,42 @@ public final class RAGEngine {
             }
             let parseBreakdown = Self.parseTimingText(parsed.metadata)
             let parseSeconds = Date().timeIntervalSince(parseStarted)
+
+            // 正文去重前移到这里：同一内容无论来自不同目录还是不同格式
+            // （md/html/pdf…），都只保留一份切片与向量。命中时直接写 tombstone，
+            // 省掉一次切片和整篇 embedding；命中本轮在处理的文件则等它结束，
+            // 避免把 tombstone 指向最终失败/取消的来源。
+            let textDigest = Self.contentHash(text)
+            let claim = await contentRegistry.claim(digest: textDigest, source: source)
+            switch claim {
+            case .duplicate(let canonical):
+                let previous = manifestSnapshot[source]
+                let marker = RAGManifestEntry(
+                    mtime: signature?.mtime ?? 0,
+                    size: signature?.size ?? 0,
+                    fingerprint: Self.sourceFingerprint(source, size: signature?.size),
+                    digest: textDigest,
+                    docName: file.relativePath,
+                    mdPath: "",
+                    ingestSignature: signatureHash,
+                    chunkCount: 0,
+                    complete: false,
+                    duplicateOf: canonical)
+                manifestStore.merge(updated: [source: marker], removed: [])
+                // 该来源之前可能以独立文档入过库：清掉旧向量与 Markdown/摘要，
+                // 避免检索同时命中两份正文。
+                removeIndexedSource(source: source, entry: previous, store: store,
+                                    markdownDir: markdownDir, knowledgeBase: knowledgeBase)
+                outcome.skipped = true
+                outcome.deduplicated = true
+                let keepName = manifestSnapshot[canonical]?.docName
+                    ?? relativeSourcePath(canonical, knowledgeBase: knowledgeBase)
+                log("RAG: \(job.label) 跳过（正文与 \(keepName) 相同，已写 tombstone）")
+                return outcome
+            case .owner:
+                contentDigest = textDigest
+            }
+            if isCancelled() || Task.isCancelled { throw AgentError.cancelled }
 
             let chunkStarted = Date()
             var chunkDocument = parsed
@@ -1361,8 +1635,23 @@ public final class RAGEngine {
         try? withStoreBounded(timeout: resolvedTimeout(timeout)) { $0.annIndexStatus() }
     }
 
+    /// 离线评测 ANN 召回质量：同一批查询分别走 ANN 与精确检索，
+    /// 计算 recall@K / nDCG@K。不 hydrate 正文、不修改索引，
+    /// 用于在真实知识库上验证 `ragANNProbe` / `ragANNRescore` 是否够用。
+    public func evaluateANNQuality(queries: [[Float]], topK: Int = 20,
+                                   nprobe: Int = 2,
+                                   rescore: Int = 64) -> ANNQualityReport? {
+        try? withStore { store in
+            try store.evaluateANNQuality(queries: queries, topK: topK,
+                                         nprobe: nprobe, rescore: rescore)
+        }
+    }
+
     /// 构建（或从断点续建）ANN 索引。与同步/清空串行，可被 `cancel()` 中断
     /// （已写完的块保留，下次接着建）。返回 nil 表示被拒绝或失败。
+    ///
+    /// 构建期间不持有 `searchLock`：只短暂持有 store 的写锁与 ingest 标志，
+    /// 检索/状态查询可以并行执行。
     @discardableResult
     public func buildANNIndex(progress: ((ANNBuildProgress) -> Void)? = nil,
                               log: ((String) -> Void)? = nil) -> ANNBuildResult? {
@@ -1377,14 +1666,17 @@ public final class RAGEngine {
             invalidateStatusCache()
             releaseIngestFlag()
             closeIfPending()
+            annBuildLock.lock()
+            annBuildActive = false
+            annBuildProgress = nil
+            annBuildLock.unlock()
         }
         cancelLock.lock(); cancelRequested = false; cancelLock.unlock()
         return performANNBuild(progress: progress, log: logFn)
     }
 
-    /// 实际的构建流程。调用方必须已持有 ingest 标志：公开入口自己取，
-    /// 同步收尾（`autoBuildANNIndexIfNeeded`）复用同步已持有的标志，避免
-    /// 在同步内部把自己挡在门外。
+    /// 实际的构建流程。调用方必须已持有 ingest 标志。
+    /// 不通过 `withStore` 取 `searchLock`，只依赖 store 自身的分块锁。
     @discardableResult
     private func performANNBuild(progress: ((ANNBuildProgress) -> Void)?,
                                  log logFn: @escaping (String) -> Void) -> ANNBuildResult? {
@@ -1392,20 +1684,22 @@ public final class RAGEngine {
         let clusters = max(2, config.ragANNClusters)
         let clusterSize = max(1, config.ragANNClusterSize)
         do {
-            let result = try withStore { store -> ANNBuildResult in
-                try store.buildANNIndex(
-                    clusters: clusters,
-                    clusterSize: clusterSize,
-                    progress: { update in
-                        progress?(update)
-                        // 每块日志限流：块粒度是 6 位数的切片量，逐块打印会刷屏。
-                        guard Date().timeIntervalSince(lastLog) >= 10,
-                              update.stage == "blocks" else { return }
-                        lastLog = Date()
-                        logFn("RAG: \(update.message)")
-                    },
-                    isCancelled: { [weak self] in self?.isCancelled ?? true })
-            }
+            let store = try ensureStore()
+            let result = try store.buildANNIndex(
+                clusters: clusters,
+                clusterSize: clusterSize,
+                progress: { [weak self] update in
+                    self?.recordANNBuildProgress(update)
+                    progress?(update)
+                    // 每块日志限流：块粒度是 6 位数的切片量，逐块打印会刷屏。
+                    guard Date().timeIntervalSince(lastLog) >= 10,
+                          update.stage == "blocks" else { return }
+                    lastLog = Date()
+                    logFn("RAG: \(update.message)")
+                },
+                isCancelled: { [weak self] in
+                    Task.isCancelled || (self?.isCancelled ?? true)
+                })
             logFn("RAG: \(result.summary)")
             invalidateStatusCache()
             return result
@@ -1431,30 +1725,123 @@ public final class RAGEngine {
         AgentLog.info("RAG: ANN 索引已删除，检索回退精确扫描")
     }
 
-    /// 同步结束后按需自动构建/续建 ANN 索引。
-    ///
-    /// 只在「值得建」时动手：小库上精确扫描足够快；索引就绪且尾块不大时
-    /// 交给尾块精确补齐（顺序读，成本远低于重建一块）。真正需要重建的
-    /// 情形（尾块超预算）由状态里的 `needsRebuild` 提示用户手动重建。
-    private func autoBuildANNIndexIfNeeded(log logFn: @escaping (String) -> Void) {
+    // MARK: ANN 后台自动构建
+
+    /// ANN 自动构建的实时状态（进度 / 是否在跑）。
+    public struct ANNAutoBuildState: Sendable {
+        public var isRunning: Bool = false
+        public var progress: ANNBuildProgress?
+        public init() {}
+    }
+
+    public var annAutoBuildState: ANNAutoBuildState {
+        annBuildLock.lock(); defer { annBuildLock.unlock() }
+        var state = ANNAutoBuildState()
+        state.isRunning = annBuildScheduled || annBuildActive
+        state.progress = annBuildProgress
+        return state
+    }
+
+    /// 取消正在进行的（后台/手动）ANN 构建。已写完的块保留，下次可续建。
+    public func cancelANNAutoBuild() {
+        cancel()
+        annBuildLock.lock()
+        let task = annBuildTask
+        annBuildLock.unlock()
+        task?.cancel()
+    }
+
+    /// 等待当前后台 ANN 构建结束（测试 / 设置面板收尾用）。
+    public func awaitANNAutoBuild() async {
+        annBuildLock.lock()
+        let task = annBuildTask
+        annBuildLock.unlock()
+        await task?.value
+    }
+
+    private func recordANNBuildProgress(_ update: ANNBuildProgress) {
+        annBuildLock.lock()
+        annBuildActive = true
+        annBuildProgress = update
+        annBuildLock.unlock()
+    }
+
+    /// 同步收尾后调度后台构建。真正的「是否值得建」判断放在后台任务里，
+    /// 避免把状态查询重新塞回同步返回路径。
+    private func scheduleANNAutoBuild(log logFn: @escaping (String) -> Void) {
         guard config.ragANNEnabled, config.ragANNAutoBuild else { return }
+        annBuildLock.lock()
+        guard annBuildTask == nil else {
+            annBuildLock.unlock()
+            return
+        }
+        annBuildScheduled = true
+        annBuildGeneration &+= 1
+        let generation = annBuildGeneration
+        annBuildLock.unlock()
+
+        let task = Task.detached(priority: .utility) { [weak self] in
+            guard let self else { return }
+            self.runBackgroundANNAutoBuild(log: logFn)
+            self.annBuildLock.lock()
+            if self.annBuildGeneration == generation {
+                self.annBuildScheduled = false
+                self.annBuildTask = nil
+                self.annBuildActive = false
+                self.annBuildProgress = nil
+            }
+            self.annBuildLock.unlock()
+        }
+        annBuildLock.lock()
+        // 任务可能已经完成并清掉了 scheduled：此时不再回填已结束的句柄。
+        if annBuildScheduled, annBuildGeneration == generation {
+            annBuildTask = task
+        }
+        annBuildLock.unlock()
+    }
+
+    /// 后台自动构建：先判断是否值得建，再短暂占用 ingest 标志执行。
+    private func runBackgroundANNAutoBuild(log logFn: @escaping (String) -> Void) {
+        guard config.ragANNEnabled, config.ragANNAutoBuild else { return }
+        let overview: (chunks: Int, status: ANNIndexStatus)?
+        do {
+            let store = try ensureStore()
+            overview = (store.count, store.annIndexStatus())
+        } catch {
+            logFn("RAG: 自动构建 ANN 索引跳过：\(error.localizedDescription)")
+            return
+        }
+        guard let overview, overview.chunks >= config.ragANNMinChunks else { return }
+
+        let chunks = overview.chunks
+        let status = overview.status
         let clusters = max(2, config.ragANNClusters)
         let clusterSize = max(1, config.ragANNClusterSize)
         let blockRows = clusters * clusterSize
-        let overview: (chunks: Int, status: ANNIndexStatus)? = try? withStore { store in
-            (store.count, store.annIndexStatus())
-        }
-        guard let overview, overview.chunks >= config.ragANNMinChunks else { return }
-        let status = overview.status
         let threshold = max(config.ragANNMinChunks / 2, blockRows / 4)
+        let staleNeedsRebuild = status.indexedRows > 0
+            && Double(status.staleRows)
+                >= Double(status.indexedRows) * VectorStore.annStaleRebuildRatio
         if status.blocks == 0 {
-            logFn("RAG: 自动构建 ANN 索引（\(overview.chunks) 切片，\(clusters) 簇 × \(clusterSize) 行/块）")
+            logFn("RAG: 自动构建 ANN 索引（\(chunks) 切片，\(clusters) 簇 × \(clusterSize) 行/块）")
+        } else if staleNeedsRebuild {
+            logFn("RAG: 自动全量重建 ANN 索引（陈旧 \(status.staleRows)/\(status.indexedRows) 切片）")
         } else if status.unindexedRows > 0 || status.tailRows >= threshold {
             logFn("RAG: 自动续建 ANN 索引（尾块 \(status.tailRows) 切片）")
         } else {
             return
         }
-        // 复用同步已持有的 ingest 标志（不能走公开入口，否则会被自己挡住）。
+
+        guard tryBeginIngest() else {
+            logFn("RAG: 另一次同步/维护正在进行，跳过本次自动构建 ANN 索引")
+            return
+        }
+        defer {
+            invalidateStatusCache()
+            releaseIngestFlag()
+            closeIfPending()
+        }
+        cancelLock.lock(); cancelRequested = false; cancelLock.unlock()
         _ = performANNBuild(progress: nil, log: logFn)
     }
 
@@ -1621,7 +2008,7 @@ public final class RAGEngine {
             }
         }
         let output = lines.joined(separator: "\n")
-        return await condenseIfNeeded(output)
+        return await condenseIfNeeded(output, hits: hits)
     }
 
     // MARK: 辅助模型精简
@@ -1630,14 +2017,26 @@ public final class RAGEngine {
     /// 返回 nil 表示不精简（未配置辅助模型、精简失败或结果为空）。
     public var auxCondenser: ((String) async -> String?)?
 
-    /// 结果总字数落在 [min, max] 区间时交给辅助模型精简：
-    /// - 低于下限：内容不多，总结只会丢细节、平白增加延迟，原样返回；
-    /// - 高于上限：内容过大，一次性摘要不可靠，原样返回。
+    /// 精简触发条件：
+    /// - 总字数落在 [min, max] 区间；
+    /// - 且（多文档 或 接近上限的超长结果）。
+    ///
+    /// 单文档的中等长度结果直接原样返回：调用辅助模型只会增加延迟，
+    /// 摘要反而丢掉主模型需要的原文细节。
+    static func shouldCondense(outputChars: Int, documentCount: Int,
+                               config: AgentConfig) -> Bool {
+        guard outputChars >= config.ragAuxSummarizeMinChars,
+              outputChars <= config.ragAuxSummarizeMaxChars else { return false }
+        return documentCount >= 2
+            || outputChars >= config.ragAuxSummarizeMinChars * 3 / 2
+    }
+
     /// 精简失败或输出为空时回退原文，绝不让检索结果变空。
-    private func condenseIfNeeded(_ output: String) async -> String {
-        let count = output.count
-        guard count >= config.ragAuxSummarizeMinChars,
-              count <= config.ragAuxSummarizeMaxChars,
+    private func condenseIfNeeded(_ output: String, hits: [SearchHit]) async -> String {
+        let documentCount = Set(hits.map(\.source)).count
+        guard Self.shouldCondense(outputChars: output.count,
+                                  documentCount: documentCount,
+                                  config: config),
               let condenser = auxCondenser else { return output }
         if let condensed = await condenser(output), !condensed.isEmpty {
             return condensed
@@ -1674,10 +2073,14 @@ public final class RAGEngine {
         if let unsupported = config.ragVectorElementType.unsupportedReason {
             return unsupportedVectorTypeSnapshot(unsupported)
         }
-        if let cached = cachedStatus(maxAge: maxAge) { return cached }
+        if let cached = cachedStatus(maxAge: maxAge) {
+            return mergingANNBuildState(cached)
+        }
         // `maxAge <= 0` 表示调用方要绕过缓存（诊断/刚同步完），此时也不复用
         // 「上次超时」的跳过快照，直接重试。
-        if maxAge > 0, let skipped = cachedSkipSnapshot() { return skipped }
+        if maxAge > 0, let skipped = cachedSkipSnapshot() {
+            return mergingANNBuildState(skipped)
+        }
         let limit = resolvedTimeout(timeout)
         statusLock.lock()
         let generation = statusGeneration
@@ -1710,6 +2113,9 @@ public final class RAGEngine {
                 "ann_index": .string(ann.summary),
                 "ann_usable": .bool(ann.isUsable),
                 "ann_needs_rebuild": .bool(ann.needsRebuild || ann.unindexedRows > 0),
+                // 陈旧行与实际有效覆盖率（删除/更新留下的旧 rowid）。
+                "ann_stale_rows": .int(ann.staleRows),
+                "ann_effective_coverage": .double(ann.effectiveCoverage),
                 // 向量落盘类型 / Matryoshka 截断维 / 待重建闸门。
                 "vector_element_type": .string(store.elementType.rawValue),
                 "matryoshka_dim": .int(effectiveMatryoshkaDimension),
@@ -1730,7 +2136,21 @@ public final class RAGEngine {
             statusSnapshotTime = Date().timeIntervalSince1970
         }
         statusLock.unlock()
-        return result
+        return mergingANNBuildState(result)
+    }
+
+    /// 把实时 ANN 构建状态合并进状态快照。构建进度变化频繁，不进缓存，
+    /// 每次读取时叠加，保证 `rag_status` 能看到进度。
+    private func mergingANNBuildState(_ snapshot: [String: JSONValue]) -> [String: JSONValue] {
+        annBuildLock.lock()
+        let running = annBuildScheduled || annBuildActive
+        let progress = annBuildProgress
+        annBuildLock.unlock()
+        var output = snapshot
+        output["ann_building"] = .bool(running)
+        output["ann_build_progress"] = .double(progress?.fraction ?? 0)
+        output["ann_build_message"] = .string(progress?.message ?? "")
+        return output
     }
 
     /// 只读最近一次 `status()` 快照，不打开数据库、不扫描任何表。
@@ -1932,7 +2352,9 @@ public final class RAGEngine {
     /// 每组只保留一个代表文件参与解析；优先已有 manifest 的完整条目。
     private static func groupDuplicateFiles(
         _ files: [ScannedFile],
-        manifest: [String: RAGManifestEntry]
+        manifest: [String: RAGManifestEntry],
+        force: Bool,
+        verifyFingerprint: Bool
     ) -> (unique: [ScannedFile], groups: [DuplicateFileGroup]) {
         struct FingerprintKey: Hashable {
             let size: Int64
@@ -1959,9 +2381,19 @@ public final class RAGEngine {
                 continue
             }
             for file in sameSize {
-                // 始终重新采样：manifest 里的指纹可能属于旧内容，直接复用会把
-                // 两个不同文件误判为副本。
-                let fingerprint = sourceFingerprint(file.path, size: size)
+                // 默认复用 manifest 指纹（mtime + size 已匹配，说明文件未变化）；
+                // force / verify_fingerprint 或文件变化时才重新采样，避免每次
+                // 增量同步都对同尺寸文件做头部/尾部读取。
+                let fingerprint: String
+                if !force, !verifyFingerprint,
+                   let entry = manifest[file.path],
+                   !entry.fingerprint.isEmpty,
+                   abs(entry.mtime - (fileSignature(file.path)?.mtime ?? -1)) < 0.001,
+                   entry.size == size {
+                    fingerprint = entry.fingerprint
+                } else {
+                    fingerprint = sourceFingerprint(file.path, size: size)
+                }
                 guard !fingerprint.isEmpty else {
                     unique.append(file)
                     continue

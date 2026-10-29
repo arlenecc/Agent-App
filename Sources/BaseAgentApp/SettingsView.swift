@@ -107,6 +107,12 @@ struct SettingsView: View {
     @State private var embeddingThroughputTolerance = 0.03
     @State private var embeddingProbeBatches = 2
     @State private var embeddingProbeSeconds = 2.0
+    @State private var embeddingTokenBudgetMin = 4_096
+    @State private var embeddingTokenBudgetMax = 8_192
+    @State private var embeddingTokenBudgetInitial = 6_144
+    @State private var embeddingTokenBudgetStep = 512
+    /// 默认信任 mtime + 大小；开启后为「保留时间戳的同尺寸改动」再校验内容指纹。
+    @State private var verifyFingerprint = false
     @State private var showAdvanced = false
 
     @State private var statusMessage = ""
@@ -683,6 +689,30 @@ struct SettingsView: View {
                                 .help("吞吐变化小于该比例视为测量噪声，不调整子批；默认 3%，实测噪声较大时可调到 8-10%")
                         }
                         .font(.caption)
+                        HStack(spacing: 8) {
+                            Text("embedding token 预算")
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                            Stepper("下限：\(embeddingTokenBudgetMin)",
+                                    value: $embeddingTokenBudgetMin,
+                                    in: 512...65_536, step: 512)
+                                .help("单批 token 预算的下限，默认 4096；"
+                                    + "长切片由预算决定批大小，短切片仍受条数上限约束")
+                            Stepper("上限：\(embeddingTokenBudgetMax)",
+                                    value: $embeddingTokenBudgetMax,
+                                    in: 512...65_536, step: 512)
+                                .help("单批 token 预算的上限，默认 8192；"
+                                    + "超过上限时按内存阈值下调，避免 padding/峰值内存过高")
+                            Stepper("启动：\(embeddingTokenBudgetInitial)",
+                                    value: $embeddingTokenBudgetInitial,
+                                    in: 512...65_536, step: 512)
+                                .help("每次同步开始时的 token 预算，默认 6144；会被夹在下限与上限之间")
+                            Stepper("步进：\(embeddingTokenBudgetStep)",
+                                    value: $embeddingTokenBudgetStep,
+                                    in: 128...8_192, step: 128)
+                                .help("每轮上探/下探的 token 预算幅度，默认 512")
+                        }
+                        .font(.caption)
                     }
                     .padding(.top, 8)
                 }
@@ -801,6 +831,10 @@ struct SettingsView: View {
                 in: 0...32_768, step: 512)
             .help("MLX 全局内存硬上限（含权重/KV/buffer）；"
                 + "0 = 自动取 min(物理内存 65%, 9.6GB)。误配可能导致 OOM")
+        Toggle("校验内容指纹", isOn: $verifyFingerprint)
+            .help("默认信任文件 mtime + 大小，未变化文件不再读盘采样内容指纹。"
+                + "开启后每次增量同步都为同尺寸文件重新计算指纹，"
+                + "可发现「保留时间戳的同尺寸改动」，代价是额外磁盘读取")
     }
 
     @ViewBuilder
@@ -846,7 +880,7 @@ struct SettingsView: View {
             model.requestANNIndexBuild()
         }
         .help("构建/续建向量库的分块 IVF 索引（可中断，已写完的块保留）；"
-            + "构建期间知识检索会按只读超时跳过，建议在空闲时执行")
+            + "构建期间知识检索与状态查询仍可正常使用")
         .disabled(model.isBuildingANN || model.isSyncing || model.isDeduplicating
             || model.isModelLoading || model.isWarmingUp || model.isRunning)
         Button("停止构建") { model.stopANNIndexBuild() }
@@ -1142,6 +1176,11 @@ struct SettingsView: View {
         embeddingThroughputTolerance = config.ragEmbeddingThroughputTolerance
         embeddingProbeBatches = config.ragEmbeddingProbeBatches
         embeddingProbeSeconds = config.ragEmbeddingProbeSeconds
+        embeddingTokenBudgetMin = config.ragEmbeddingTokenBudgetMin
+        embeddingTokenBudgetMax = config.ragEmbeddingTokenBudgetMax
+        embeddingTokenBudgetInitial = config.ragEmbeddingTokenBudgetInitial
+        embeddingTokenBudgetStep = config.ragEmbeddingTokenBudgetStep
+        verifyFingerprint = config.ragVerifyFingerprint
         refreshEmbeddingLimit()
     }
 
@@ -1452,6 +1491,14 @@ struct SettingsView: View {
                                                       0.5)
         config.ragEmbeddingProbeBatches = min(max(1, embeddingProbeBatches), 16)
         config.ragEmbeddingProbeSeconds = min(max(0.5, embeddingProbeSeconds), 30)
+        config.ragEmbeddingTokenBudgetMin = min(max(512, embeddingTokenBudgetMin), 65_536)
+        config.ragEmbeddingTokenBudgetMax = min(max(config.ragEmbeddingTokenBudgetMin,
+                                                    embeddingTokenBudgetMax), 65_536)
+        config.ragEmbeddingTokenBudgetInitial = min(max(config.ragEmbeddingTokenBudgetMin,
+                                                        embeddingTokenBudgetInitial),
+                                                    config.ragEmbeddingTokenBudgetMax)
+        config.ragEmbeddingTokenBudgetStep = min(max(128, embeddingTokenBudgetStep), 8_192)
+        config.ragVerifyFingerprint = verifyFingerprint
 
         if mainMode == "local", !config.localLLMModel.isEmpty,
            config.localLLMModel != model.config.localLLMModel {

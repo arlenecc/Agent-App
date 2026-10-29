@@ -58,6 +58,92 @@ final class EmbeddingSchedulerTests: XCTestCase {
         }
     }
 
+    /// 精确 token 计数 + 记录每批文本，用于验证「按 token 预算 + 长度排序组批」。
+    private final class TokenBudgetRecordingEmbedding: EmbeddingProvider,
+                                                      EmbeddingTokenCounting,
+                                                      @unchecked Sendable {
+        let identifier = "token-budget-recording"
+        let dimension = 1
+        let maxContentTokens = 4_096
+        private let lock = NSLock()
+        private(set) var batches: [[String]] = []
+
+        func embedDocuments(_ texts: [String]) async throws -> [[Float]] {
+            lock.lock()
+            batches.append(texts)
+            lock.unlock()
+            // 向量值 = 文本长度，便于验证结果按原始下标还原。
+            return texts.map { [Float($0.count)] }
+        }
+
+        func embedQuery(_ text: String) async throws -> [Float] {
+            [Float(text.count)]
+        }
+
+        func makeTokenCounter() async -> (@Sendable (String) -> Int)? {
+            { $0.count }
+        }
+    }
+
+    /// 按 token 预算（而不是块数）分组：长文本优先独占/先装满，
+    /// 每个批次的 token 总量不超过预算，且结果顺序与输入一致。
+    func testTokenBudgetGroupsByLengthAndRestoresInputOrder() async throws {
+        let base = TokenBudgetRecordingEmbedding()
+        let scheduler = AdaptiveEmbeddingScheduler(
+            base: base,
+            options: .init(minBatchSize: 1, maxBatchSize: 16,
+                           initialBatchSize: 16, step: 1,
+                           memoryLimitMB: 32_768, throughputTolerance: 0.5,
+                           probeBatches: 16, probeSeconds: 30,
+                           tokenBudgetMin: 1_024, tokenBudgetMax: 1_024,
+                           initialTokenBudget: 1_024, tokenBudgetStep: 128),
+            log: { _ in }
+        )
+        let lengths = [700, 100, 600, 50, 550, 300]
+        let texts = lengths.map { String(repeating: "a", count: $0) }
+        let vectors = try await scheduler.embedDocuments(texts)
+
+        // 输出顺序必须与输入一致（内部按长度重排后要还原）。
+        XCTAssertEqual(vectors.compactMap { $0.first.map(Int.init) }, lengths)
+        let batches = base.batches
+        // 700+300=1000，600+100+50=750，550 独占一批；每个子批都不超过 1024。
+        XCTAssertEqual(batches.map { $0.map(\.count) }, [[700, 300], [600, 100, 50], [550]],
+                       "长块优先，跳过装不下的项用更短的切片填满预算")
+        for batch in batches {
+            let tokens = batch.reduce(0) { $0 + $1.count }
+            XCTAssertLessThanOrEqual(tokens, 1_024)
+        }
+
+        let metrics = scheduler.metricsSnapshot()
+        XCTAssertEqual(metrics.batches, 3)
+        XCTAssertEqual(metrics.texts, texts.count)
+        XCTAssertEqual(metrics.tokens, lengths.reduce(0, +))
+        XCTAssertEqual(metrics.observedMaxBatchTexts, 3)
+        XCTAssertEqual(metrics.tokenBudget, 1_024)
+        XCTAssertGreaterThan(metrics.tokensPerSecond, 0)
+        XCTAssertGreaterThan(metrics.peakMemoryMB, 0)
+    }
+
+    /// 单条超过 token 预算时仍要能处理（独占一批），不能死循环或丢弃。
+    func testTokenBudgetAllowsSingleOversizedText() async throws {
+        let base = TokenBudgetRecordingEmbedding()
+        let scheduler = AdaptiveEmbeddingScheduler(
+            base: base,
+            options: .init(minBatchSize: 1, maxBatchSize: 16,
+                           initialBatchSize: 16, step: 1,
+                           memoryLimitMB: 32_768, throughputTolerance: 0.5,
+                           probeBatches: 16, probeSeconds: 30,
+                           tokenBudgetMin: 1_024, tokenBudgetMax: 1_024,
+                           initialTokenBudget: 1_024, tokenBudgetStep: 128),
+            log: { _ in }
+        )
+        let texts = [String(repeating: "a", count: 2_000), "x", "y"]
+        let vectors = try await scheduler.embedDocuments(texts)
+        XCTAssertEqual(vectors.compactMap { $0.first.map(Int.init) }, [2_000, 1, 1])
+        XCTAssertEqual(base.batches.map { $0.map(\.count) }, [[2_000], [1, 1]])
+        XCTAssertEqual(scheduler.metricsSnapshot().tokens, 2_002)
+    }
+
     /// ingest 拿到的是调度器而不是底层 provider，必须把窗口预算与精确计数器转发出去，
     /// 否则 bge 的 512 token 窗口在切片阶段完全失去保护。
     func testSchedulerForwardsTokenCountingCapability() async {

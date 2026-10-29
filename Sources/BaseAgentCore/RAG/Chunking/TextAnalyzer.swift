@@ -73,14 +73,76 @@ public enum TextAnalyzer {
         ftsTokens(text).joined(separator: " ")
     }
 
-    /// 构造 FTS5 MATCH 表达式：带引号的 OR 查询，避免特殊字符注入语法错误。
-    public static func ftsQuery(_ query: String) -> String {
-        let tokens = Array(Set(ftsTokens(query))).sorted()
+    /// 查询词里最多参与 MATCH 的显著 token 数。自然语言问句常带几十个词，
+    /// 全量交给 AND 会几乎不可能命中；按信息量截断后再逐级回退 OR。
+    public static let maxSignificantTokens = 32
+
+    public enum FTSQueryMode: Sendable {
+        case or
+        case and
+    }
+
+    /// 停用词：高频虚词几乎不提供区分度，参与 AND 只会把结果筛空。
+    private static let stopwords: Set<String> = [
+        // 英文
+        "a", "an", "and", "are", "as", "at", "be", "been", "but", "by",
+        "do", "does", "did", "for", "from", "had", "has", "have", "he", "her",
+        "his", "how", "i", "if", "in", "into", "is", "it", "its", "me", "my",
+        "no", "not", "of", "on", "or", "our", "she", "so", "than", "that",
+        "the", "their", "them", "then", "there", "these", "they", "this",
+        "those", "to", "was", "we", "were", "what", "when", "where", "which",
+        "who", "why", "will", "with", "would", "you", "your",
+        // 中文功能词 / 常见填充词
+        "的", "了", "着", "过", "是", "在", "和", "与", "及", "或", "也",
+        "就", "都", "而", "被", "把", "对", "从", "向", "给", "为", "以",
+        "于", "其", "之", "这", "那", "这个", "那个", "这些", "那些",
+        "一个", "一些", "什么", "怎么", "怎样", "如何", "为什么", "哪",
+        "哪些", "我", "我们", "你", "你们", "他", "他们", "她", "她们",
+        "它", "它们", "可以", "能够", "应该", "已经", "正在", "还是",
+        "但是", "因为", "所以", "如果", "然后", "以及", "对于", "关于",
+        "通过", "进行", "使用", "目前", "其中", "并", "并且", "且", "等",
+        "等等", "吗", "呢", "吧", "啊", "呀", "哦",
+    ]
+
+    /// 查询用显著 token：去停用词、去重，按词长（信息量）取前 `limit` 个。
+    ///
+    /// - 长 CJK 词只保留 bigram：分词边界不稳定，整词 AND 常常因文档里
+    ///   只有更长/更短的词而全灭；bigram 已在 `ftsTokens` 里展开。
+    public static func ftsSignificantTokens(_ text: String,
+                                            limit: Int = maxSignificantTokens) -> [String] {
+        guard limit > 0 else { return [] }
+        var seen = Set<String>()
+        var tokens: [String] = []
+        for token in ftsTokens(text) {
+            guard !stopwords.contains(token) else { continue }
+            if containsCJK(token), token.count > 2 { continue }
+            guard seen.insert(token).inserted else { continue }
+            tokens.append(token)
+        }
+        guard tokens.count > limit else { return tokens }
+        // 长词信息量更高；同长度保持原顺序（稳定排序）。
+        return tokens.enumerated()
+            .sorted { lhs, rhs in
+                lhs.element.count == rhs.element.count
+                    ? lhs.offset < rhs.offset
+                    : lhs.element.count > rhs.element.count
+            }
+            .prefix(limit)
+            .map(\.element)
+    }
+
+    /// 构造 FTS5 MATCH 表达式：所有 token 加引号，避免特殊字符注入语法错误。
+    /// `mode` 决定 token 之间是 AND 还是 OR；调用方通常先试 AND，无结果再退 OR。
+    public static func ftsQuery(_ query: String,
+                                mode: FTSQueryMode = .or,
+                                limit: Int = maxSignificantTokens) -> String {
+        let tokens = ftsSignificantTokens(query, limit: limit)
         guard !tokens.isEmpty else { return "" }
+        let joiner = mode == .and ? " AND " : " OR "
         return tokens.map { term -> String in
             let escaped = term.replacingOccurrences(of: "\"", with: "\"\"")
             return "\"\(escaped)\""
-        }.joined(separator: " OR ")
+        }.joined(separator: joiner)
     }
 
     // MARK: Helpers

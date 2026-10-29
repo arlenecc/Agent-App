@@ -179,6 +179,15 @@ public final class AdaptiveEmbeddingScheduler: EmbeddingProvider, EmbeddingToken
         /// 每个尺寸至少观察的批次数或秒数，避免测量噪声导致抖动。
         public var probeBatches: Int
         public var probeSeconds: Double
+        /// 单批 token 预算的下限（默认 4096）。批大小同时受条数上限约束，
+        /// 实际以先到者为准；长切片由 token 预算决定，短切片由条数决定。
+        public var tokenBudgetMin: Int
+        /// 单批 token 预算的上限（默认 8192）。
+        public var tokenBudgetMax: Int
+        /// 每次同步的起始 token 预算（默认 6144）。
+        public var initialTokenBudget: Int
+        /// 每轮上探/下探的 token 预算步进（默认 512）。
+        public var tokenBudgetStep: Int
 
         public init(minBatchSize: Int = 2,
                     maxBatchSize: Int = 32,
@@ -187,7 +196,11 @@ public final class AdaptiveEmbeddingScheduler: EmbeddingProvider, EmbeddingToken
                     memoryLimitMB: Double = 6 * 1_024,
                     throughputTolerance: Double = 0.03,
                     probeBatches: Int = 2,
-                    probeSeconds: Double = 2.0) {
+                    probeSeconds: Double = 2.0,
+                    tokenBudgetMin: Int = 4_096,
+                    tokenBudgetMax: Int = 8_192,
+                    initialTokenBudget: Int = 6_144,
+                    tokenBudgetStep: Int = 512) {
             let normalizedMin = max(1, minBatchSize)
             let normalizedMax = max(normalizedMin, maxBatchSize)
             self.minBatchSize = normalizedMin
@@ -198,6 +211,34 @@ public final class AdaptiveEmbeddingScheduler: EmbeddingProvider, EmbeddingToken
             self.throughputTolerance = max(0.005, min(0.5, throughputTolerance))
             self.probeBatches = max(1, probeBatches)
             self.probeSeconds = max(0.1, probeSeconds)
+            let normalizedBudgetMin = max(512, tokenBudgetMin)
+            let normalizedBudgetMax = max(normalizedBudgetMin, tokenBudgetMax)
+            self.tokenBudgetMin = normalizedBudgetMin
+            self.tokenBudgetMax = normalizedBudgetMax
+            self.initialTokenBudget = min(max(normalizedBudgetMin, initialTokenBudget),
+                                          normalizedBudgetMax)
+            self.tokenBudgetStep = max(128, tokenBudgetStep)
+        }
+    }
+
+    /// embedding 运行指标：tokens/s 与进程 footprint 峰值。
+    public struct Metrics: Sendable {
+        public var batches: Int = 0
+        public var texts: Int = 0
+        public var tokens: Int = 0
+        public var seconds: Double = 0
+        public var peakMemoryMB: Double = 0
+        /// 当前生效的 token 预算（采样时值）。
+        public var tokenBudget: Int = 0
+        /// 单批最多文本条数（采样时值）。
+        public var maxBatchTexts: Int = 0
+        /// 实际观察到的最大单批条数。
+        public var observedMaxBatchTexts: Int = 0
+
+        public init() {}
+
+        public var tokensPerSecond: Double {
+            seconds > 0 ? Double(tokens) / seconds : 0
         }
     }
 
@@ -210,23 +251,59 @@ public final class AdaptiveEmbeddingScheduler: EmbeddingProvider, EmbeddingToken
     private let stateLock = NSLock()
 
     // stateLock 保护以下状态
+    /// 单批文本条数上限（与 token 预算共同生效）。
     private var batchSize: Int
-    private var windowChunks = 0
+    /// 单批 token 预算。
+    private var tokenBudget: Int
+    private var windowTokens = 0
     private var windowSeconds = 0.0
     private var windowBatches = 0
     private var windowStarted = Date()
+    /// 吞吐统一用 token/秒，短切片与长切片可比。
     private var lastThroughput = 0.0
     private var direction = 1   // +1 上探，-1 下探
     private var lastAdjustmentLog = Date.distantPast
 
+    // 累计指标（跨文件、跨调用）
+    private var totalBatches = 0
+    private var totalTexts = 0
+    private var totalTokens = 0
+    private var totalSeconds = 0.0
+    private var peakMemoryMB = 0.0
+    private var observedMaxBatchTexts = 0
+    private var lastBatchTexts = 0
+
     public var identifier: String { base.identifier }
     public var dimension: Int { base.dimension }
 
-    /// 供完成日志展示当前子批大小。
+    /// 供完成日志展示最近一次实际子批的文本条数。
     public var currentBatchSize: Int {
         stateLock.lock()
         defer { stateLock.unlock() }
-        return batchSize
+        return lastBatchTexts > 0 ? lastBatchTexts : batchSize
+    }
+
+    /// 当前生效的 token 预算。
+    public var currentTokenBudget: Int {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        return tokenBudget
+    }
+
+    /// 累计 tokens/s、峰值内存与批大小快照。
+    public func metricsSnapshot() -> Metrics {
+        stateLock.lock()
+        defer { stateLock.unlock() }
+        var metrics = Metrics()
+        metrics.batches = totalBatches
+        metrics.texts = totalTexts
+        metrics.tokens = totalTokens
+        metrics.seconds = totalSeconds
+        metrics.peakMemoryMB = peakMemoryMB
+        metrics.tokenBudget = tokenBudget
+        metrics.maxBatchTexts = batchSize
+        metrics.observedMaxBatchTexts = observedMaxBatchTexts
+        return metrics
     }
 
     public init(base: EmbeddingProvider,
@@ -238,6 +315,7 @@ public final class AdaptiveEmbeddingScheduler: EmbeddingProvider, EmbeddingToken
         self.semaphore = AsyncSemaphore(value: max(1, base.maxConcurrentRuns))
         self.batchSize = max(options.minBatchSize,
                              min(options.initialBatchSize, options.maxBatchSize))
+        self.tokenBudget = options.initialTokenBudget
     }
 
     // MARK: - EmbeddingProvider
@@ -246,21 +324,65 @@ public final class AdaptiveEmbeddingScheduler: EmbeddingProvider, EmbeddingToken
         try await embedDocuments(texts, progress: nil)
     }
 
-    /// 用于流水线内的长文档：每完成一个子批回调一次进度。
+    /// 用于流水线内的长文档：按 token 预算组批，每完成一个子批回调一次进度。
+    ///
+    /// 先按长度降序排列，贪心装入「条数上限 + token 预算」双约束的子批；
+    /// 当前批装不下的切片跳过并留给下一批，继续用更短的切片填满预算，
+    /// 减少 padding 浪费。向量按原始下标写回，顺序与输入一致。长切片由
+    /// token 预算决定批大小，短切片由条数上限决定。
     public func embedDocuments(
         _ texts: [String],
         progress: ((Int, Int) -> Void)?
     ) async throws -> [[Float]] {
         guard !texts.isEmpty else { return [] }
         return try await semaphore.withPermit {
-            var result: [[Float]] = []
-            result.reserveCapacity(texts.count)
-            var offset = 0
-            while offset < texts.count {
+            let counter: @Sendable (String) -> Int
+            if let provider = base as? EmbeddingTokenCounting,
+               let exact = await provider.makeTokenCounter() {
+                counter = exact
+            } else {
+                counter = { EmbeddingTokenEstimator.count($0) }
+            }
+            let tokenCounts = texts.map { max(1, counter($0)) }
+            // 大块优先：单条超预算时独占一批，小块随后紧凑填满。
+            let order = texts.indices.sorted { lhs, rhs in
+                tokenCounts[lhs] == tokenCounts[rhs]
+                    ? lhs < rhs
+                    : tokenCounts[lhs] > tokenCounts[rhs]
+            }
+            var result = [[Float]](repeating: [], count: texts.count)
+            var pending = order
+            var processed = 0
+            while !pending.isEmpty {
                 if Task.isCancelled { throw AgentError.cancelled }
-                let size = currentBatchSize
-                let end = min(offset + size, texts.count)
-                let batch = Array(texts[offset..<end])
+                stateLock.lock()
+                let sizeCap = max(1, batchSize)
+                let budget = max(1, tokenBudget)
+                stateLock.unlock()
+
+                var indices: [Int] = []
+                indices.reserveCapacity(min(sizeCap, pending.count))
+                var remaining: [Int] = []
+                remaining.reserveCapacity(pending.count)
+                var tokens = 0
+                for index in pending {
+                    let cost = tokenCounts[index]
+                    guard indices.count < sizeCap else {
+                        remaining.append(index)
+                        continue
+                    }
+                    // 装不下就先跳过，继续用后面更短的切片填满预算；
+                    // 单条超过预算时仍允许独占一批，否则会永远装不进去。
+                    if indices.isEmpty || tokens + cost <= budget {
+                        indices.append(index)
+                        tokens += cost
+                    } else {
+                        remaining.append(index)
+                    }
+                }
+                pending = remaining
+                processed += indices.count
+                let batch = indices.map { texts[$0] }
                 let batchStarted = Date()
                 let vectors = try await base.embedDocuments(batch)
                 let seconds = Date().timeIntervalSince(batchStarted)
@@ -268,10 +390,11 @@ public final class AdaptiveEmbeddingScheduler: EmbeddingProvider, EmbeddingToken
                     throw AgentError.storage(
                         "embedding 子批返回数量异常: \(vectors.count) != \(batch.count)")
                 }
-                result.append(contentsOf: vectors)
-                offset = end
-                record(chunks: batch.count, seconds: seconds)
-                progress?(offset, texts.count)
+                for (offset, index) in indices.enumerated() {
+                    result[index] = vectors[offset]
+                }
+                record(texts: batch.count, tokens: tokens, seconds: seconds)
+                progress?(processed, texts.count)
             }
             return result
         }
@@ -301,14 +424,20 @@ public final class AdaptiveEmbeddingScheduler: EmbeddingProvider, EmbeddingToken
 
     // MARK: - 自适应子批
 
-    private func record(chunks: Int, seconds: TimeInterval) {
-        guard seconds > 0.0001 else { return }
-
+    private func record(texts: Int, tokens: Int, seconds: TimeInterval) {
         stateLock.lock()
-        windowChunks += chunks
-        windowSeconds += seconds
+        let elapsed = max(seconds, 0.0001)
+        windowTokens += tokens
+        windowSeconds += elapsed
         windowBatches += 1
+        totalBatches += 1
+        totalTexts += texts
+        totalTokens += tokens
+        totalSeconds += elapsed
+        lastBatchTexts = texts
+        observedMaxBatchTexts = max(observedMaxBatchTexts, texts)
         let memoryMB = ProcessMemory.footprintMB()
+        peakMemoryMB = max(peakMemoryMB, memoryMB)
         let enoughBatches = windowBatches >= max(1, options.probeBatches)
         let enoughTime = Date().timeIntervalSince(windowStarted) >= options.probeSeconds
         guard enoughBatches || enoughTime else {
@@ -316,59 +445,87 @@ public final class AdaptiveEmbeddingScheduler: EmbeddingProvider, EmbeddingToken
             return
         }
 
-        let throughput = Double(windowChunks) / max(windowSeconds, 0.0001)
+        let throughput = Double(windowTokens) / max(windowSeconds, 0.0001)
         let oldSize = batchSize
-        var newSize = batchSize
+        let oldBudget = tokenBudget
+        var newSize = oldSize
+        var newBudget = oldBudget
         var reason: String?
 
+        // 两个旋钮一起调：长切片由 token 预算绑定，短切片由条数绑定；
+        // 同时上探/下探可覆盖两种语料，实际批大小取先到者。
+        func grow() {
+            if newSize < options.maxBatchSize {
+                newSize = min(options.maxBatchSize, newSize + options.step)
+            }
+            if newBudget < options.tokenBudgetMax {
+                newBudget = min(options.tokenBudgetMax,
+                                newBudget + options.tokenBudgetStep)
+            }
+        }
+        func shrink() {
+            if newSize > options.minBatchSize {
+                newSize = max(options.minBatchSize, newSize - options.step)
+            }
+            if newBudget > options.tokenBudgetMin {
+                newBudget = max(options.tokenBudgetMin,
+                                newBudget - options.tokenBudgetStep)
+            }
+        }
+
         if memoryMB > options.memoryLimitMB {
-            if batchSize > options.minBatchSize {
-                direction = -1
-                newSize = max(options.minBatchSize, batchSize - options.step)
+            direction = -1
+            shrink()
+            if newSize != oldSize || newBudget != oldBudget {
                 reason = "内存 \(Int(memoryMB))MB 超限"
             }
         } else if lastThroughput <= 0 {
-            if batchSize < options.maxBatchSize {
-                direction = 1
-                newSize = min(options.maxBatchSize, batchSize + options.step)
-                reason = "首次上探"
-            }
+            grow()
+            if newSize != oldSize || newBudget != oldBudget { reason = "首次上探" }
         } else {
             let ratio = throughput / lastThroughput
             let tolerance = options.throughputTolerance
             if ratio >= 1 + tolerance {
-                if direction > 0, batchSize < options.maxBatchSize {
-                    newSize = min(options.maxBatchSize, batchSize + options.step)
-                    reason = "吞吐提升，继续上探"
-                } else if direction < 0, batchSize > options.minBatchSize {
-                    newSize = max(options.minBatchSize, batchSize - options.step)
-                    reason = "下调后吞吐提升，继续下探"
+                if direction > 0 {
+                    grow()
+                    if newSize != oldSize || newBudget != oldBudget {
+                        reason = "吞吐提升，继续上探"
+                    }
+                } else {
+                    shrink()
+                    if newSize != oldSize || newBudget != oldBudget {
+                        reason = "下调后吞吐提升，继续下探"
+                    }
                 }
             } else if ratio <= 1 - tolerance {
                 direction = -direction
-                if direction > 0, batchSize < options.maxBatchSize {
-                    newSize = min(options.maxBatchSize, batchSize + options.step)
-                    reason = "下探无提升，回升"
-                } else if direction < 0, batchSize > options.minBatchSize {
-                    newSize = max(options.minBatchSize, batchSize - options.step)
-                    reason = "吞吐下降，下调"
+                if direction > 0 {
+                    grow()
+                    if newSize != oldSize || newBudget != oldBudget { reason = "下探无提升，回升" }
+                } else {
+                    shrink()
+                    if newSize != oldSize || newBudget != oldBudget { reason = "吞吐下降，下调" }
                 }
             }
         }
 
         lastThroughput = throughput
-        windowChunks = 0
+        windowTokens = 0
         windowSeconds = 0
         windowBatches = 0
         windowStarted = Date()
         batchSize = newSize
+        tokenBudget = newBudget
+        let changed = newSize != oldSize || newBudget != oldBudget
+        // 调参日志节流，避免快速上探时刷屏。
+        let shouldLog = changed && Date().timeIntervalSince(lastAdjustmentLog) >= 10
+        if shouldLog { lastAdjustmentLog = Date() }
         stateLock.unlock()
 
-        guard newSize != oldSize, let reason else { return }
-        // 调参日志节流，避免快速上探时刷屏。
-        guard Date().timeIntervalSince(lastAdjustmentLog) >= 10 else { return }
-        lastAdjustmentLog = Date()
-        log("RAG: embedding 子批自适应 \(oldSize) → \(newSize)"
-            + "（\(reason)，\(Int(throughput)) 片/秒，内存 \(Int(memoryMB))/\(Int(options.memoryLimitMB)) MB）")
+        guard changed, shouldLog, let reason else { return }
+        log("RAG: embedding 自适应 条数 \(oldSize) → \(newSize)"
+            + " / token 预算 \(oldBudget) → \(newBudget)"
+            + "（\(reason)，\(Int(throughput)) token/秒，"
+            + "内存 \(Int(memoryMB))/\(Int(options.memoryLimitMB)) MB）")
     }
 }

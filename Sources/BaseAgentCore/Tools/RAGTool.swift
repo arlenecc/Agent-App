@@ -158,6 +158,11 @@ public final class RagStatusTool: AgentTool {
         let sources = status["sources"]?.arrayValue?.compactMap(\.stringValue) ?? []
         let sourceCount = status["source_count"]?.intValue ?? sources.count
         let annIndex = status["ann_index"]?.stringValue ?? ""
+        let annBuilding = status["ann_building"]?.boolValue ?? false
+        let annBuildProgress = status["ann_build_progress"]?.doubleValue ?? 0
+        let annBuildMessage = status["ann_build_message"]?.stringValue ?? ""
+        let annStaleRows = status["ann_stale_rows"]?.intValue ?? 0
+        let annEffectiveCoverage = status["ann_effective_coverage"]?.doubleValue ?? 0
         let elementType = status["vector_element_type"]?.stringValue ?? ""
         let matryoshkaDim = status["matryoshka_dim"]?.intValue ?? 0
         let rebuildRequired = status["vector_rebuild_required"]?.boolValue ?? false
@@ -177,6 +182,18 @@ public final class RagStatusTool: AgentTool {
             lines.append("    提示: 向量检索暂停（全文检索仍可用），请在设置中执行「重建向量库」")
         }
         if !annIndex.isEmpty { lines.append("  ANN 索引: \(annIndex)") }
+        if annStaleRows > 0 {
+            lines.append(String(format: "  ANN 陈旧切片: %ld（有效覆盖 %.1f%%）",
+                                annStaleRows, annEffectiveCoverage * 100))
+        }
+        if annBuilding {
+            let percent = Int((min(1, max(0, annBuildProgress)) * 100).rounded())
+            lines.append("  ANN 后台构建: 进行中 \(percent)%"
+                + (annBuildMessage.isEmpty ? "" : " — \(annBuildMessage)"))
+            lines.append("    提示: 构建期间检索/状态查询不受影响，已写完的块会在取消后保留")
+        } else if !annBuildMessage.isEmpty {
+            lines.append("  ANN 构建: \(annBuildMessage)")
+        }
         lines.append("  已索引文件数: \(sourceCount)")
         if !sources.isEmpty {
             lines.append("  已索引文件:")
@@ -238,6 +255,9 @@ public final class RagIngestTool: AgentTool {
         lines.append("  删除文件数: \(stats.removed)")
         lines.append("  去重副本数: \(stats.deduplicated)")
         lines.append("  生成切片数: \(stats.chunks)")
+        if engine.annAutoBuildState.isRunning {
+            lines.append("  ANN 索引: 正在后台构建（可用 rag_status 查看进度）")
+        }
         if !stats.errors.isEmpty {
             lines.append("  失败: \(stats.errors.count) 个")
             for error in stats.errors.prefix(5) {

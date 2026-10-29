@@ -265,6 +265,56 @@ final class RAGEngineTests: XCTestCase {
         engine.close()
     }
 
+    /// 默认信任 mtime + 大小：同尺寸、同 mtime 的内容变化不会被发现；
+    /// 打开 `rag_verify_fingerprint` 后才重新采样指纹并重建。
+    func testIncrementalSyncTrustsMtimeAndSizeUnlessVerifyFingerprint() async throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("base-agent-rag-verify-\(UUID().uuidString)")
+        let kb = root.appendingPathComponent("kb")
+        try FileManager.default.createDirectory(at: kb, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let path = kb.appendingPathComponent("note.md")
+        let contentA = "# 标题\n\n版本一正文。"
+        let contentB = "# 标题\n\n版本二正文。"
+        XCTAssertEqual(contentA.utf8.count, contentB.utf8.count,
+                       "构造同尺寸改动，才需要指纹兜底")
+        try contentA.write(to: path, atomically: true, encoding: .utf8)
+        let fixed = Date(timeIntervalSince1970: 1_700_000_000)
+        try FileManager.default.setAttributes([.modificationDate: fixed],
+                                              ofItemAtPath: path.path)
+
+        var config = AgentConfig()
+        config.workspace = root.path
+        config.knowledgeBase = kb.path
+        config.ragRerankEnabled = false
+        config.ragChunkSize = 40
+        config.ragChunkOverlap = 2
+        config.ragVerifyFingerprint = false
+
+        let engine = RAGEngine(config: config, knowledgeBase: kb.path,
+                               embedding: RagFakeEmbedding(), reranker: nil)
+        let first = await engine.ingest()
+        XCTAssertEqual(first.processed, 1)
+
+        try contentB.write(to: path, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.modificationDate: fixed],
+                                              ofItemAtPath: path.path)
+        let second = await engine.ingest()
+        XCTAssertEqual(second.processed, 0, "默认信任 mtime + size，不再读盘采样")
+        XCTAssertEqual(second.skipped, 1)
+        engine.close()
+
+        var verifyConfig = config
+        verifyConfig.ragVerifyFingerprint = true
+        let verifying = RAGEngine(config: verifyConfig, knowledgeBase: kb.path,
+                                  embedding: RagFakeEmbedding(), reranker: nil)
+        let third = await verifying.ingest()
+        XCTAssertEqual(third.processed, 1, "verify_fingerprint 应发现同尺寸同 mtime 的改动")
+        XCTAssertEqual(third.skipped, 0)
+        verifying.close()
+    }
+
     func testContentHashDedupeRemovesDuplicateVectorsAndSkipsNextRun() async throws {
         let root = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("base-agent-rag-dup-content-\(UUID().uuidString)")
@@ -293,8 +343,10 @@ final class RAGEngineTests: XCTestCase {
         let engine = RAGEngine(config: config, knowledgeBase: kb.path,
                                embedding: RagFakeEmbedding(), reranker: nil)
         let first = await engine.ingest()
-        XCTAssertEqual(first.processed, 2)
-        XCTAssertEqual(first.deduplicated, 1, "content_hash 相同的副本应移除向量")
+        // 解析/清洗后即命中内容哈希：副本只写 tombstone，不再切片/embedding。
+        XCTAssertEqual(first.processed, 1)
+        XCTAssertEqual(first.skipped, 1)
+        XCTAssertEqual(first.deduplicated, 1, "content_hash 相同的副本应提前跳过")
         XCTAssertEqual(engine.status()["sources"]?.arrayValue?.count, 1)
         XCTAssertEqual(engine.listDocuments().count, 1)
 
@@ -910,6 +962,70 @@ final class RAGEngineTests: XCTestCase {
         XCTAssertEqual(hit.count, 1, "manifest 缺失时必须回退到索引来源名单")
         XCTAssertEqual(hit.first.map { ($0.source as NSString).lastPathComponent },
                        "target-a.md")
+        engine.close()
+    }
+
+    /// #9：辅助模型只在「多文档」或「接近上限的超长结果」时精简，
+    /// 单文档中等长度结果原样返回，避免每次 rag_search 都多一次模型调用。
+    func testAuxCondenseOnlyTriggersForMultiDocumentOrVeryLongResults() {
+        var config = AgentConfig()
+        config.ragAuxSummarizeMinChars = 8_000
+        config.ragAuxSummarizeMaxChars = 12_000
+
+        XCTAssertFalse(RAGEngine.shouldCondense(outputChars: 7_999, documentCount: 3,
+                                                config: config))
+        XCTAssertFalse(RAGEngine.shouldCondense(outputChars: 8_000, documentCount: 1,
+                                                config: config),
+                       "单文档中等长度结果不调用辅助模型")
+        XCTAssertTrue(RAGEngine.shouldCondense(outputChars: 8_000, documentCount: 2,
+                                               config: config))
+        XCTAssertFalse(RAGEngine.shouldCondense(outputChars: 11_999, documentCount: 1,
+                                                config: config))
+        XCTAssertTrue(RAGEngine.shouldCondense(outputChars: 12_000, documentCount: 1,
+                                               config: config),
+                      "接近上限的超长结果即使单文档也摘要")
+        XCTAssertFalse(RAGEngine.shouldCondense(outputChars: 12_001, documentCount: 2,
+                                                config: config),
+                       "超过上限不做一次性摘要")
+    }
+
+    /// 命中多文档且长度达阈值时，`searchFormatted` 必须把输出交给注入的整理器。
+    func testSearchFormattedUsesAuxCondenserWhenEligible() async throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("base-agent-rag-condense-\(UUID().uuidString)")
+        let kb = root.appendingPathComponent("kb")
+        try FileManager.default.createDirectory(at: kb, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let body = String(repeating: "apple banana ", count: 40)
+        for name in ["a.md", "b.md"] {
+            try body.write(to: kb.appendingPathComponent(name),
+                           atomically: true, encoding: .utf8)
+        }
+
+        var config = AgentConfig()
+        config.workspace = root.path
+        config.knowledgeBase = kb.path
+        config.ragRerankEnabled = false
+        config.ragSemanticChunking = false
+        config.ragChunkSize = 800
+        config.ragChunkOverlap = 0
+        config.ragSearchMaxCharsPerResult = 1_000
+        config.ragSearchMaxTotalChars = 2_000
+        config.ragAuxSummarizeMinChars = 100
+        config.ragAuxSummarizeMaxChars = 2_000
+
+        let engine = RAGEngine(config: config, knowledgeBase: kb.path,
+                               embedding: RagFakeEmbedding(), reranker: nil)
+        _ = await engine.ingest()
+        var calls = 0
+        engine.auxCondenser = { input in
+            calls += 1
+            return "摘要:\n\(input.prefix(20))\n原文片段:\n---"
+        }
+        let output = try await engine.searchFormatted(query: "apple", topK: 2)
+        XCTAssertEqual(calls, 1)
+        XCTAssertTrue(output.hasPrefix("摘要:"))
         engine.close()
     }
 }

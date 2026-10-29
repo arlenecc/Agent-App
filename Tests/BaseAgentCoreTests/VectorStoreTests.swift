@@ -32,6 +32,9 @@ final class VectorStoreTests: XCTestCase {
         let hits = try store.search(vector: [1, 0, 0], topK: 2)
         XCTAssertEqual(hits.count, 2)
         XCTAssertEqual(hits.first?.text, "apple banana fruit")
+        // hydrate 改用 stream + 列序号读取，heading/chunkIndex 不能错位。
+        XCTAssertEqual(hits.first?.heading, "第一章")
+        XCTAssertEqual(hits.first?.chunkIndex, 0)
 
         // over-fetch + 第二阶段过滤。
         let filtered = try store.search(vector: [1, 0, 0], topK: 2, sourceContains: "bookB")
@@ -144,6 +147,70 @@ final class VectorStoreTests: XCTestCase {
         let hits = try store.searchFTS(query: "人工智能", topK: 3)
         XCTAssertEqual(hits.count, 1)
         XCTAssertTrue(hits[0].text.contains("人工智能"))
+    }
+
+    /// FTS 先按显著 token 的 AND 召回；AND 无结果才退化为 OR。
+    /// 否则「apple banana」会被 OR 稀释，只含 apple 的切片也会排在前面。
+    func testFTSPrefersANDThenFallsBackToOR() throws {
+        let store = try VectorStore(dbPath: directory.appendingPathComponent("fts-and.sqlite").path,
+                                    dimension: 2)
+        let chunks = [
+            Chunk(text: "apple banana fruit", source: "a.md", chunkIndex: 0),
+            Chunk(text: "apple only", source: "b.md", chunkIndex: 0),
+            Chunk(text: "banana only", source: "c.md", chunkIndex: 0),
+        ]
+        _ = try store.add(chunks: chunks, vectors: [[1, 0], [0.8, 0.2], [0.2, 0.8]])
+
+        let andHits = try store.searchFTS(query: "apple banana", topK: 5)
+        XCTAssertEqual(andHits.count, 1, "AND 只应命中同时包含两个词的切片")
+        XCTAssertEqual(andHits.first?.source, "a.md")
+
+        let orHits = try store.searchFTS(query: "apple quokka", topK: 5)
+        XCTAssertEqual(Set(orHits.map(\.source)), ["a.md", "b.md"],
+                       "AND 无结果时回退 OR，应命中只含 apple 的切片")
+        store.close()
+    }
+
+    /// 停用词过滤 + 显著 token 上限：问句里的虚词不参与 AND，超长查询截断。
+    func testFTSQueryFiltersStopwordsAndCapsTokens() {
+        XCTAssertEqual(TextAnalyzer.ftsQuery("What is the apple", mode: .and), "\"apple\"")
+        let chinese = TextAnalyzer.ftsQuery("如何 配置 这个 系统", mode: .and)
+        XCTAssertTrue(chinese.contains("\"配置\""))
+        XCTAssertTrue(chinese.contains("\"系统\""))
+        XCTAssertFalse(chinese.contains("如何"))
+        XCTAssertFalse(chinese.contains("这个"))
+
+        // 全字母词避免 NLTokenizer 把数字拆成独立 token。
+        let alphabet = Array("abcdefghijklmnopqrstuvwxyz")
+        let words = (0..<40).map { index in
+            String([alphabet[index / 26], alphabet[index % 26]]) + "q"
+        }
+        let tokens = TextAnalyzer.ftsSignificantTokens(words.joined(separator: " "))
+        XCTAssertEqual(tokens.count, TextAnalyzer.maxSignificantTokens)
+        XCTAssertEqual(Set(tokens).count, tokens.count, "显著 token 必须去重")
+        XCTAssertTrue(tokens.contains(words[0]))
+        XCTAssertFalse(tokens.contains(words[39]), "超出上限的短尾 token 应被截断")
+    }
+
+    /// 混合检索先融合 rowid/分数再 hydrate：RRF 选出的 Top1 才读正文，
+    /// 并保留两路各自的原始分数。
+    func testHybridSearchFusesBeforeHydratingTopK() throws {
+        let store = try VectorStore(dbPath: directory.appendingPathComponent("hybrid.sqlite").path,
+                                    dimension: 2)
+        let chunks = [
+            Chunk(text: "apple banana fruit", source: "vector.md", chunkIndex: 0),
+            Chunk(text: "banana turbine", source: "fts.md", chunkIndex: 0),
+        ]
+        // 查询向量更接近 vector.md，但 fts.md 额外命中全文通道。
+        _ = try store.add(chunks: chunks, vectors: [[1, 0], [0.2, 0.98]])
+
+        let hits = try store.hybridSearch(vector: [1, 0], query: "turbine", topK: 1)
+        XCTAssertEqual(hits.count, 1, "只 hydrate RRF 定出的前 topK 条")
+        XCTAssertEqual(hits.first?.source, "fts.md")
+        XCTAssertNotNil(hits.first?.rrfScore)
+        XCTAssertNotNil(hits.first?.vectorScore)
+        XCTAssertNotNil(hits.first?.ftsScore)
+        store.close()
     }
 
     func testChunkCounterPersistsAcrossReopenAndLegacyFallback() throws {
