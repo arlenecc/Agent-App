@@ -5,8 +5,12 @@ import SwiftSoup
 enum HTMLMarkdown {
 
     /// 转换整篇文档，并返回标题大纲。
+    ///
+    /// - Parameter includeSVGText: 提取 `<svg><text>` 里的文字。固定版式 EPUB
+    ///   常把整页正文画在 SVG 文本节点里，默认跳过 svg 会只剩页码/目录。
     static func convert(_ document: Document,
-                        removeBoilerplate: Bool) -> (markdown: String, headings: [OutlineEntry]) {
+                        removeBoilerplate: Bool,
+                        includeSVGText: Bool = false) -> (markdown: String, headings: [OutlineEntry]) {
         guard let root = document.body() ?? document.children().first() else {
             return ("", [])
         }
@@ -27,7 +31,8 @@ enum HTMLMarkdown {
 
         var blocks: [String] = []
         var headings: [OutlineEntry] = []
-        renderChildren(root, blocks: &blocks, headings: &headings, listDepth: 0)
+        renderChildren(root, blocks: &blocks, headings: &headings,
+                       listDepth: 0, includeSVGText: includeSVGText)
 
         var markdown = blocks
             .filter { !$0.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty }
@@ -42,7 +47,8 @@ enum HTMLMarkdown {
     private static func renderChildren(_ element: Element,
                                        blocks: inout [String],
                                        headings: inout [OutlineEntry],
-                                       listDepth: Int) {
+                                       listDepth: Int,
+                                       includeSVGText: Bool) {
         // 只遍历元素会丢掉裸文本（手写 HTML、导出页常把正文直接写在
         // `<body>`/`<div>` 下而没有 `<p>` 包裹），按节点顺序逐个处理。
         for node in element.getChildNodes() {
@@ -51,7 +57,8 @@ enum HTMLMarkdown {
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 if !text.isEmpty { blocks.append(text) }
             } else if let child = node as? Element {
-                renderBlock(child, blocks: &blocks, headings: &headings, listDepth: listDepth)
+                renderBlock(child, blocks: &blocks, headings: &headings,
+                            listDepth: listDepth, includeSVGText: includeSVGText)
             }
         }
     }
@@ -59,7 +66,8 @@ enum HTMLMarkdown {
     private static func renderBlock(_ element: Element,
                                     blocks: inout [String],
                                     headings: inout [OutlineEntry],
-                                    listDepth: Int) {
+                                    listDepth: Int,
+                                    includeSVGText: Bool) {
         let tag = element.tagName().lowercased()
 
         switch tag {
@@ -96,10 +104,19 @@ enum HTMLMarkdown {
             var inner: [String] = []
             var ignoredHeadings: [OutlineEntry] = []
             renderChildren(element, blocks: &inner,
-                           headings: &ignoredHeadings, listDepth: listDepth)
+                           headings: &ignoredHeadings, listDepth: listDepth,
+                           includeSVGText: includeSVGText)
             let text = inner.joined(separator: "\n\n")
             if !text.isEmpty {
                 blocks.append(prefixLines(text, prefix: "> "))
+            }
+
+        case "svg":
+            // 固定版式 EPUB 的整页正文常是 `<svg><text>…</text></svg>`；
+            // 仅 EPUB 开启，网页/普通 HTML 保持原行为。
+            if includeSVGText {
+                let lines = svgTextLines(element)
+                if !lines.isEmpty { blocks.append(lines.joined(separator: "\n")) }
             }
 
         case "br", "hr", "script", "style", "noscript", "nav",
@@ -107,13 +124,14 @@ enum HTMLMarkdown {
              // body，若不跳过会把标题文本当成正文），框架/多媒体的回退内容
              // 也不是正文——框架正文由本地框架接力单独读取。
              "head", "title", "meta", "link", "base", "template",
-             "iframe", "frame", "frameset", "embed", "object", "svg", "canvas":
+             "iframe", "frame", "frameset", "embed", "object", "canvas":
             break
 
         default:
             if hasBlockChildren(element) {
                 renderChildren(element, blocks: &blocks,
-                               headings: &headings, listDepth: listDepth)
+                               headings: &headings, listDepth: listDepth,
+                               includeSVGText: includeSVGText)
             } else if let heading = boldOnlyHeading(of: element) {
                 // Calibre 等工具常用 <div><b>…</b></div> 排版小节标题。
                 blocks.append(heading.markdown)
@@ -310,6 +328,23 @@ enum HTMLMarkdown {
         return element.getChildNodes().map { rawText($0) }.joined()
     }
 
+    /// 收集 SVG 里 `<text>`（含 `<tspan>`）的文字，按文档顺序逐行返回。
+    private static func svgTextLines(_ svg: Element) -> [String] {
+        var lines: [String] = []
+        func walk(_ element: Element) {
+            if element.tagName().lowercased() == "text" {
+                let value = inlineText(of: element)
+                    .replacingOccurrences(of: "\n", with: " ")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if !value.isEmpty { lines.append(value) }
+                return
+            }
+            for child in element.children() { walk(child) }
+        }
+        walk(svg)
+        return lines
+    }
+
     private static func normalizeInlineWhitespace(_ text: String) -> String {
         var result = text.replacingOccurrences(of: "[ \t]+", with: " ",
                                                options: .regularExpression)
@@ -350,6 +385,9 @@ enum HTMLMarkdown {
         "fieldset", "figcaption", "figure", "footer", "form", "h1", "h2", "h3", "h4",
         "h5", "h6", "header", "hr", "li", "main", "nav", "ol", "p", "pre", "section",
         "table", "ul", "tr", "td", "th",
+        // 固定版式 EPUB 常用 `<div><svg>…</svg></div>` 包裹整页；
+        // 列入块级后 `renderBlock` 才会走进 svg（是否取文本由 includeSVGText 决定）。
+        "svg",
     ]
 
     private static let languageRegex = try! NSRegularExpression(

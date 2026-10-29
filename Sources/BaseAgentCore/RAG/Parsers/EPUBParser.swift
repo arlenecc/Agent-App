@@ -17,10 +17,7 @@ enum RAGArchiveReader {
     }
 
     static func data(_ archive: Archive, path: String) -> Data? {
-        let normalized = path.hasPrefix("/") ? String(path.dropFirst()) : path
-        guard !normalized.isEmpty, let entry = archive[normalized], entry.type == .file else {
-            return nil
-        }
+        guard let entry = entry(archive, path: path) else { return nil }
         var data = Data()
         do {
             _ = try archive.extract(entry) { data.append($0) }
@@ -28,6 +25,26 @@ enum RAGArchiveReader {
         } catch {
             return nil
         }
+    }
+
+    static func contains(_ archive: Archive, path: String) -> Bool {
+        entry(archive, path: path) != nil
+    }
+
+    /// 精确查找失败时按「大小写不敏感 + Unicode 预组合」回退。
+    /// Windows 转制工具常写出与 ZIP 条目大小写/组合形式不一致的 href，
+    /// 旧实现直接返回 nil，整章被静默跳过。
+    private static func entry(_ archive: Archive, path: String) -> Entry? {
+        let normalized = RAGArchivePath.normalize(path)
+        guard !normalized.isEmpty else { return nil }
+        if let exact = archive[normalized], exact.type == .file { return exact }
+        let target = normalized.precomposedStringWithCanonicalMapping.lowercased()
+        for candidate in archive where candidate.type == .file {
+            if candidate.path.precomposedStringWithCanonicalMapping.lowercased() == target {
+                return candidate
+            }
+        }
+        return nil
     }
 
     static func filePaths(_ archive: Archive) -> [String] {
@@ -111,7 +128,9 @@ enum RAGXMLHelper {
 enum RAGArchivePath {
     static func normalize(_ path: String) -> String {
         var components: [String] = []
-        for rawComponent in path.split(separator: "/", omittingEmptySubsequences: false) {
+        // 部分转制工具写 Windows 反斜杠路径，ZIP 内实际是 `/`。
+        let unified = path.replacingOccurrences(of: "\\", with: "/")
+        for rawComponent in unified.split(separator: "/", omittingEmptySubsequences: false) {
             let component = String(rawComponent)
             if component.isEmpty || component == "." { continue }
             if component == ".." {
@@ -236,10 +255,15 @@ public final class EPUBParser: DocumentParser {
         let title = metadataTitle(opf.root)
         let manifest = parseManifest(opf.root, opfPath: opfPath)
         let spineElement = RAGXMLHelper.firstChild(opf.root, "spine")
-        let spinePaths = parseSpinePaths(spineElement, manifest: manifest, archive: archive)
+        let spine = parseSpinePaths(spineElement, manifest: manifest, archive: archive)
+        let spinePaths = spine.paths
 
         guard !spinePaths.isEmpty else {
             throw AgentError.parse("EPUB 未找到可读的 spine 章节：\(url.lastPathComponent)")
+        }
+        if spine.recovered > 0 {
+            AgentLog.warning(
+                "EPUB: spine 只含封面/目录，已从 manifest/归档补齐 \(spine.recovered) 个正文章节")
         }
 
         let tocID = spineElement.flatMap { RAGXMLHelper.attribute($0, ["toc"]) }
@@ -265,12 +289,17 @@ public final class EPUBParser: DocumentParser {
 
         for (index, path) in spinePaths.enumerated() {
             guard let data = RAGArchiveReader.data(archive, path: path), !data.isEmpty else {
+                AgentLog.warning("EPUB: spine 条目无法读取，已跳过：\(path)")
                 continue
             }
-            let xhtml = DocumentTextDecoder.decode(data)
-            guard let document = try? SwiftSoup.parse(xhtml, path) else { continue }
+            let xhtml = DocumentTextDecoder.decodeHTML(data)
+            guard let document = try? SwiftSoup.parse(xhtml, path) else {
+                AgentLog.warning("EPUB: spine 条目无法解析为 HTML，已跳过：\(path)")
+                continue
+            }
 
-            let (markdown, documentHeadings) = HTMLMarkdown.convert(document, removeBoilerplate: false)
+            let (markdown, documentHeadings) = HTMLMarkdown.convert(
+                document, removeBoilerplate: false, includeSVGText: true)
             let imagePaths = Self.imagePaths(in: document, chapterPath: path)
 
             var chapter = markdown
@@ -355,6 +384,9 @@ public final class EPUBParser: DocumentParser {
             metadata["ocr_pages"] = String(ocrPages)
             metadata["scanned_chapters"] = String(scannedChapters)
         }
+        if spine.recovered > 0 {
+            metadata["recovered_chapters"] = String(spine.recovered)
+        }
         if !title.isEmpty { metadata["title"] = title }
 
         var parsed = ParsedDocument(text: chapters.joined(separator: "\n\n"),
@@ -379,8 +411,11 @@ public final class EPUBParser: DocumentParser {
     private func parseManifest(_ root: AEXMLElement, opfPath: String) -> [ManifestItem] {
         let manifestElement = RAGXMLHelper.firstChild(root, "manifest") ?? root
         return RAGXMLHelper.children(manifestElement, "item").compactMap { item in
-            guard let id = RAGXMLHelper.attribute(item, ["id"]),
-                  let href = RAGXMLHelper.attribute(item, ["href"]) else { return nil }
+            guard let rawID = RAGXMLHelper.attribute(item, ["id"]),
+                  let rawHref = RAGXMLHelper.attribute(item, ["href"]) else { return nil }
+            let id = rawID.trimmingCharacters(in: .whitespacesAndNewlines)
+            let href = rawHref.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !id.isEmpty, !href.isEmpty else { return nil }
             return ManifestItem(
                 id: id,
                 href: href,
@@ -390,42 +425,112 @@ public final class EPUBParser: DocumentParser {
         }
     }
 
-    /// spine 缺失时回退到 manifest 中的 XHTML 项，再回退到归档内全部 HTML/XHTML。
+    private struct SpineResolution {
+        let paths: [String]
+        /// 从 manifest / 归档补齐的正文条目数（不含封面与目录页）。
+        let recovered: Int
+    }
+
+    /// spine 缺失或不完整时回退到 manifest 中的 XHTML 项，再回退到归档内全部
+    /// HTML/XHTML。
+    ///
+    /// 只看 `paths.isEmpty` 不够：相当一部分转制书 spine 里只有封面和目录页，
+    /// 正文 XHTML 都在 manifest 里却没被 spine 引用，旧实现会静默丢掉正文，
+    /// 最终只剩书名/目录。
     private func parseSpinePaths(_ spine: AEXMLElement?,
                                  manifest: [ManifestItem],
-                                 archive: Archive) -> [String] {
+                                 archive: Archive) -> SpineResolution {
         var paths: [String] = []
         var seen = Set<String>()
 
+        func append(_ path: String) {
+            guard !path.isEmpty, seen.insert(path).inserted else { return }
+            paths.append(path)
+        }
+
+        var spineItems: [ManifestItem] = []
         if let spine {
             for itemref in RAGXMLHelper.children(spine, "itemref") {
-                guard let idref = RAGXMLHelper.attribute(itemref, ["idref"]),
-                      let item = manifest.first(where: { $0.id == idref }),
-                      seen.insert(item.path).inserted else { continue }
-                paths.append(item.path)
+                guard let rawIDRef = RAGXMLHelper.attribute(itemref, ["idref"]) else { continue }
+                let idref = rawIDRef.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard let item = manifestItem(matching: idref, in: manifest) else { continue }
+                spineItems.append(item)
+                append(item.path)
             }
         }
 
-        if paths.isEmpty {
-            for item in manifest where item.isXHTML {
-                if seen.insert(item.path).inserted {
-                    paths.append(item.path)
-                }
+        // spine 是否至少包含一个实际存在的正文章节（排除封面/目录）。
+        let hasBody = spineItems.contains {
+            !isFrontMatter($0) && RAGArchiveReader.contains(archive, path: $0.path)
+        }
+
+        var recovered = 0
+        if paths.isEmpty || !hasBody {
+            for item in manifest where item.isXHTML && !isNavigation(item) {
+                guard !seen.contains(item.path) else { continue }
+                append(item.path)
+                if !isFrontMatter(item) { recovered += 1 }
             }
         }
 
-        if paths.isEmpty {
+        if paths.isEmpty || !hasBody {
+            // manifest 也没给出正文 → 扫描归档里的 HTML 文件作最后兜底。
             let htmlExtensions = ["xhtml", "html", "htm"]
             let candidates = RAGArchiveReader.filePaths(archive)
-                .filter { htmlExtensions.contains(($0 as NSString).pathExtension.lowercased()) }
+                .filter {
+                    htmlExtensions.contains(($0 as NSString).pathExtension.lowercased())
+                        && !Self.isNavigationName($0)
+                }
                 .sorted()
             for path in candidates {
-                if seen.insert(path).inserted {
-                    paths.append(path)
-                }
+                guard !seen.contains(path) else { continue }
+                append(path)
+                if !Self.isFrontMatterName(path) { recovered += 1 }
             }
         }
-        return paths
+
+        return SpineResolution(paths: paths, recovered: recovered)
+    }
+
+    private func manifestItem(matching idref: String, in manifest: [ManifestItem]) -> ManifestItem? {
+        manifest.first { $0.id == idref }
+            ?? manifest.first { $0.id.caseInsensitiveCompare(idref) == .orderedSame }
+    }
+
+    /// 目录页：`properties="nav"` 的 EPUB3 nav，或 nav/toc/contents 命名的 XHTML。
+    private func isNavigation(_ item: ManifestItem) -> Bool {
+        if item.properties.split(separator: " ").contains("nav") { return true }
+        return Self.isNavigationName(item.path)
+    }
+
+    private static func isNavigationName(_ path: String) -> Bool {
+        let stem = ((path as NSString).lastPathComponent as NSString)
+            .deletingPathExtension.lowercased()
+        return ["nav", "toc", "contents"].contains(stem)
+    }
+
+    /// 封面页/封面图：id 或文件名以 cover 开头（封面不算补齐的正文）。
+    private func isCover(_ item: ManifestItem) -> Bool {
+        item.id.lowercased().hasPrefix("cover") || Self.isCoverName(item.path)
+    }
+
+    private static func isCoverName(_ path: String) -> Bool {
+        ((path as NSString).lastPathComponent as NSString)
+            .deletingPathExtension.lowercased().hasPrefix("cover")
+    }
+
+    /// 前置页（不算正文）：封面、目录、扉页、版权页等。
+    /// 这些页面常被工具写进 spine，若当成正文就会误判 spine 完整而不再补齐后续章节。
+    private static func isFrontMatterName(_ path: String) -> Bool {
+        if isNavigationName(path) || isCoverName(path) { return true }
+        let stem = ((path as NSString).lastPathComponent as NSString)
+            .deletingPathExtension.lowercased()
+        return ["titlepage", "title-page", "halftitle", "half-title",
+                "copyright", "imprint", "colophon", "dedication", "epigraph"].contains(stem)
+    }
+
+    private func isFrontMatter(_ item: ManifestItem) -> Bool {
+        isCover(item) || Self.isFrontMatterName(item.path)
     }
 
     // MARK: - 目录（NCX / nav.xhtml）
@@ -486,7 +591,7 @@ public final class EPUBParser: DocumentParser {
     }
 
     private func parseNav(_ data: Data, navPath: String) -> [NavigationEntry] {
-        let html = DocumentTextDecoder.decode(data)
+        let html = DocumentTextDecoder.decodeHTML(data)
         guard let document = try? SwiftSoup.parse(html, navPath) else { return [] }
 
         let navElements = (try? document.select("nav").array()) ?? []
@@ -541,37 +646,82 @@ public final class EPUBParser: DocumentParser {
         for path in spinePaths {
             guard let data = RAGArchiveReader.data(archive, path: path), !data.isEmpty,
                   let document = try? SwiftSoup.parse(
-                      DocumentTextDecoder.decode(data), path) else { continue }
+                      DocumentTextDecoder.decodeHTML(data), path) else { continue }
             let images = imagePaths(in: document, chapterPath: path).count
             guard images > 0 else { continue }
             totalImages += images
             totalChars += DocumentCleaner.effectiveCharacterCount(
-                HTMLMarkdown.convert(document, removeBoilerplate: false).markdown)
+                HTMLMarkdown.convert(document, removeBoilerplate: false,
+                                     includeSVGText: true).markdown)
         }
         guard totalImages >= 10 else { return false }
         return Double(totalChars) / Double(totalImages) < 150
     }
 
-    /// 按文档顺序收集 XHTML 中的图片路径（兼容 `<img src>` 与 SVG `<image xlink:href>`）。
+    /// 按文档顺序收集 XHTML 中的图片路径。
+    ///
+    /// 除 `<img src>` / SVG `<image>` 外，还识别转制工具常用的其他引用方式：
+    /// `srcset`、`data-src`、`<object data>`、`<video poster>`、内联
+    /// `style="background-image:url(...)"`。漏掉这些会让纯图片页被当成空文本
+    /// 直接跳过，扫描页 OCR 也就不会触发。
     private static func imagePaths(in document: Document, chapterPath: String) -> [String] {
         var result: [String] = []
         var seen = Set<String>()
 
+        func add(_ raw: String) {
+            var value = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            // CSS 里可能带引号：url('a.png')
+            value = value.trimmingCharacters(in: CharacterSet(charactersIn: "'\""))
+            guard !value.isEmpty, !value.lowercased().hasPrefix("data:") else { return }
+            let path = RAGArchivePath.resolve(value, relativeTo: chapterPath)
+            if !path.isEmpty, seen.insert(path).inserted {
+                result.append(path)
+            }
+        }
+
+        func addSrcset(_ value: String) {
+            let trimmed = value.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !trimmed.lowercased().hasPrefix("data:") else { return }
+            // "a.png 1x, b.png 2x" → 逐个 URL（逗号只作分隔符）。
+            for candidate in trimmed.split(separator: ",") {
+                let url = candidate.trimmingCharacters(in: .whitespacesAndNewlines)
+                    .split(separator: " ", maxSplits: 1, omittingEmptySubsequences: true)
+                    .first.map(String.init) ?? ""
+                add(url)
+            }
+        }
+
+        func addStyleBackgrounds(_ value: String) {
+            var rest = Substring(value)
+            while let range = rest.range(of: "url(", options: .caseInsensitive) {
+                rest = rest[range.upperBound...]
+                guard let end = rest.firstIndex(of: ")") else { break }
+                add(String(rest[..<end]))
+                rest = rest[rest.index(after: end)...]
+            }
+        }
+
         func walk(_ node: Node) {
             if let element = node as? Element {
                 let tag = element.tagName().lowercased()
-                if tag == "img" || tag == "image" {
-                    var raw = (try? element.attr("src")) ?? ""
-                    if raw.isEmpty { raw = (try? element.attr("xlink:href")) ?? "" }
-                    if raw.isEmpty { raw = (try? element.attr("href")) ?? "" }
-                    raw = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-                    if !raw.isEmpty, !raw.hasPrefix("data:") {
-                        let path = RAGArchivePath.resolve(raw, relativeTo: chapterPath)
-                        if !path.isEmpty, seen.insert(path).inserted {
-                            result.append(path)
-                        }
-                    }
+                switch tag {
+                case "img":
+                    add((try? element.attr("src")) ?? "")
+                    add((try? element.attr("data-src")) ?? "")
+                    add((try? element.attr("data-original")) ?? "")
+                    addSrcset((try? element.attr("srcset")) ?? "")
+                case "image":
+                    add((try? element.attr("xlink:href")) ?? "")
+                    add((try? element.attr("href")) ?? "")
+                    add((try? element.attr("src")) ?? "")
+                case "object":
+                    add((try? element.attr("data")) ?? "")
+                case "video":
+                    add((try? element.attr("poster")) ?? "")
+                default:
+                    break
                 }
+                addStyleBackgrounds((try? element.attr("style")) ?? "")
             }
             for child in node.getChildNodes() { walk(child) }
         }

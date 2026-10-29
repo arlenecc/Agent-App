@@ -612,6 +612,289 @@ final class ParserTests: XCTestCase {
         XCTAssertEqual(parsed.metadata["scanned_chapters"], "1")
     }
 
+    /// 真实失败形态：spine 只有封面和目录页，正文文件都在 manifest 里但没被
+    /// spine 引用。旧实现只在 spine 完全为空时回退，结果只抽出书名/目录。
+    func testEPUBIncompleteSpineRecoversManifestChapters() throws {
+        let url = directory.appendingPathComponent("partial-spine.epub")
+        try writeEPUB(at: url, entries: [
+            ("mimetype", Data("application/epub+zip".utf8)),
+            ("META-INF/container.xml", Data(Self.containerXML.utf8)),
+            ("OEBPS/content.opf", Data("""
+            <?xml version="1.0"?>
+            <package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id">
+              <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+                <dc:title>只有书名和目录</dc:title><dc:identifier id="id">partial</dc:identifier>
+              </metadata>
+              <manifest>
+                <item id="cover" href="cover.xhtml" media-type="application/xhtml+xml"/>
+                <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
+                <item id="ch1" href="ch1.xhtml" media-type="application/xhtml+xml"/>
+                <item id="ch2" href="ch2.xhtml" media-type="application/xhtml+xml"/>
+              </manifest>
+              <spine><itemref idref="cover"/><itemref idref="nav"/></spine>
+            </package>
+            """.utf8)),
+            ("OEBPS/cover.xhtml", Data("""
+            <html xmlns="http://www.w3.org/1999/xhtml"><body><h1>只有书名和目录</h1></body></html>
+            """.utf8)),
+            ("OEBPS/nav.xhtml", Data("""
+            <html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><body>
+            <nav epub:type="toc"><ol>
+              <li><a href="ch1.xhtml">第一章 起点</a></li>
+              <li><a href="ch2.xhtml">第二章 转折</a></li>
+            </ol></nav></body></html>
+            """.utf8)),
+            ("OEBPS/ch1.xhtml", Data("""
+            <html xmlns="http://www.w3.org/1999/xhtml"><body><h1>第一章 起点</h1>
+            <p>他推开那扇门，真正的第一章正文从这里开始。</p></body></html>
+            """.utf8)),
+            ("OEBPS/ch2.xhtml", Data("""
+            <html xmlns="http://www.w3.org/1999/xhtml"><body><h1>第二章 转折</h1>
+            <p>第二章正文继续讲述后面的故事。</p></body></html>
+            """.utf8)),
+        ])
+
+        let parser = EPUBParser()
+        let parsed = try awaitSync {
+            try await parser.parse(url: url, options: ParserOptions(), progress: nil)
+        }
+        XCTAssertTrue(parsed.text.contains("真正的第一章正文从这里开始"), parsed.text)
+        XCTAssertTrue(parsed.text.contains("第二章正文继续讲述后面的故事"), parsed.text)
+        XCTAssertEqual(parsed.metadata["recovered_chapters"], "2")
+    }
+
+    /// 部分转制工具在 OPF 里写 Windows 反斜杠路径，ZIP 内实际是 `/`。
+    func testEPUBBackslashHrefResolvesToArchiveEntry() throws {
+        let url = directory.appendingPathComponent("backslash.epub")
+        try writeEPUB(at: url, entries: [
+            ("mimetype", Data("application/epub+zip".utf8)),
+            ("META-INF/container.xml", Data(Self.containerXML.utf8)),
+            ("OEBPS/content.opf", Data("""
+            <?xml version="1.0"?>
+            <package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id">
+              <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+                <dc:title>反斜杠路径</dc:title><dc:identifier id="id">slash</dc:identifier>
+              </metadata>
+              <manifest>
+                <item id="ch1" href="Text\\Chapter1.xhtml" media-type="application/xhtml+xml"/>
+              </manifest>
+              <spine><itemref idref="ch1"/></spine>
+            </package>
+            """.utf8)),
+            ("OEBPS/Text/Chapter1.xhtml", Data("""
+            <html xmlns="http://www.w3.org/1999/xhtml"><body>
+            <p>反斜杠路径章节正文。</p></body></html>
+            """.utf8)),
+        ])
+
+        let parsed = try awaitSync {
+            try await EPUBParser().parse(url: url, options: ParserOptions(), progress: nil)
+        }
+        XCTAssertTrue(parsed.text.contains("反斜杠路径章节正文"), parsed.text)
+    }
+
+    /// OPF href 与 ZIP 条目大小写不一致（Windows 工具常见），需按大小写
+    /// 不敏感回退查找，否则整章被静默跳过。
+    func testEPUBHrefCaseMismatchResolvesToArchiveEntry() throws {
+        let url = directory.appendingPathComponent("case-mismatch.epub")
+        try writeEPUB(at: url, entries: [
+            ("mimetype", Data("application/epub+zip".utf8)),
+            ("META-INF/container.xml", Data(Self.containerXML.utf8)),
+            ("OEBPS/content.opf", Data("""
+            <?xml version="1.0"?>
+            <package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id">
+              <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+                <dc:title>大小写不一致</dc:title><dc:identifier id="id">case</dc:identifier>
+              </metadata>
+              <manifest>
+                <item id="ch1" href="text/chapter1.xhtml" media-type="application/xhtml+xml"/>
+              </manifest>
+              <spine><itemref idref="ch1"/></spine>
+            </package>
+            """.utf8)),
+            ("OEBPS/Text/Chapter1.xhtml", Data("""
+            <html xmlns="http://www.w3.org/1999/xhtml"><body>
+            <p>大小写不一致的章节正文仍然可读。</p></body></html>
+            """.utf8)),
+        ])
+
+        let parsed = try awaitSync {
+            try await EPUBParser().parse(url: url, options: ParserOptions(), progress: nil)
+        }
+        XCTAssertTrue(parsed.text.contains("大小写不一致的章节正文仍然可读"), parsed.text)
+    }
+
+    /// 固定版式 EPUB 常把正文画在 SVG `<text>` 里；旧实现整块跳过 svg，
+    /// 章节只剩目录/页码文字。
+    func testEPUBSVGTextIsExtracted() throws {
+        let url = directory.appendingPathComponent("svg-text.epub")
+        try writeEPUB(at: url, entries: [
+            ("mimetype", Data("application/epub+zip".utf8)),
+            ("META-INF/container.xml", Data(Self.containerXML.utf8)),
+            ("OEBPS/content.opf", Data("""
+            <?xml version="1.0"?>
+            <package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id">
+              <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+                <dc:title>固定版式</dc:title><dc:identifier id="id">svg</dc:identifier>
+              </metadata>
+              <manifest>
+                <item id="nav" href="nav.xhtml" media-type="application/xhtml+xml" properties="nav"/>
+                <item id="page" href="page1.xhtml" media-type="application/xhtml+xml"/>
+              </manifest>
+              <spine><itemref idref="nav"/><itemref idref="page"/></spine>
+            </package>
+            """.utf8)),
+            ("OEBPS/nav.xhtml", Data("""
+            <html xmlns="http://www.w3.org/1999/xhtml" xmlns:epub="http://www.idpf.org/2007/ops"><body>
+            <nav epub:type="toc"><ol><li><a href="page1.xhtml">第一页</a></li></ol></nav></body></html>
+            """.utf8)),
+            ("OEBPS/page1.xhtml", Data("""
+            <html xmlns="http://www.w3.org/1999/xhtml"><body>
+            <div class="page"><svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 600 800">
+              <text x="40" y="80" font-size="24">固定版式 SVG 正文第一行</text>
+              <text x="40" y="120" font-size="24">第二行也在 SVG 里</text>
+            </svg></div></body></html>
+            """.utf8)),
+        ])
+
+        let parsed = try awaitSync {
+            try await EPUBParser().parse(url: url, options: ParserOptions(), progress: nil)
+        }
+        XCTAssertTrue(parsed.text.contains("固定版式 SVG 正文第一行"), parsed.text)
+        XCTAssertTrue(parsed.text.contains("第二行也在 SVG 里"), parsed.text)
+    }
+
+    /// 部分书 spine 只有封面 + 扉页（titlepage），正文全在 manifest 里。
+    /// 扉页不属于正文章节，否则会被误判为「spine 完整」。
+    func testEPUBSpineWithOnlyFrontMatterRecoversBody() throws {
+        let url = directory.appendingPathComponent("front-matter-spine.epub")
+        try writeEPUB(at: url, entries: [
+            ("mimetype", Data("application/epub+zip".utf8)),
+            ("META-INF/container.xml", Data(Self.containerXML.utf8)),
+            ("OEBPS/content.opf", Data("""
+            <?xml version="1.0"?>
+            <package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id">
+              <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+                <dc:title>扉页之后</dc:title><dc:identifier id="id">front</dc:identifier>
+              </metadata>
+              <manifest>
+                <item id="cover" href="cover.xhtml" media-type="application/xhtml+xml"/>
+                <item id="titlepage" href="titlepage.xhtml" media-type="application/xhtml+xml"/>
+                <item id="ch1" href="ch1.xhtml" media-type="application/xhtml+xml"/>
+              </manifest>
+              <spine><itemref idref="cover"/><itemref idref="titlepage"/></spine>
+            </package>
+            """.utf8)),
+            ("OEBPS/cover.xhtml", Data("""
+            <html xmlns="http://www.w3.org/1999/xhtml"><body><h1>扉页之后</h1></body></html>
+            """.utf8)),
+            ("OEBPS/titlepage.xhtml", Data("""
+            <html xmlns="http://www.w3.org/1999/xhtml"><body><p>扉页</p></body></html>
+            """.utf8)),
+            ("OEBPS/ch1.xhtml", Data("""
+            <html xmlns="http://www.w3.org/1999/xhtml"><body><h1>第一章</h1>
+            <p>扉页之后的正文终于出现在这里。</p></body></html>
+            """.utf8)),
+        ])
+
+        let parsed = try awaitSync {
+            try await EPUBParser().parse(url: url, options: ParserOptions(), progress: nil)
+        }
+        XCTAssertTrue(parsed.text.contains("扉页之后的正文终于出现在这里"), parsed.text)
+        XCTAssertEqual(parsed.metadata["recovered_chapters"], "1")
+    }
+
+    /// 非 UTF-8 的 XHTML（常见于繁体 EPUB）必须按 `<meta charset>` 解码，
+    /// 否则整章变成乱码或空文本。
+    func testEPUBDeclaredBig5EncodingIsDecoded() throws {
+        let phrase = "繁體中文正文測試，這一頁的內容應該完整可讀。"
+        let big5 = String.Encoding(rawValue: CFStringConvertEncodingToNSStringEncoding(
+            CFStringEncoding(CFStringEncodings.big5.rawValue)))
+        let html = """
+        <html><head><meta charset="big5"/></head><body><p>\(phrase)</p></body></html>
+        """
+        let data = try XCTUnwrap(html.data(using: big5), "Big5 编码失败")
+
+        let url = directory.appendingPathComponent("big5.epub")
+        try writeEPUB(at: url, entries: [
+            ("mimetype", Data("application/epub+zip".utf8)),
+            ("META-INF/container.xml", Data(Self.containerXML.utf8)),
+            ("OEBPS/content.opf", Data("""
+            <?xml version="1.0"?>
+            <package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id">
+              <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+                <dc:title>Big5 書</dc:title><dc:identifier id="id">big5</dc:identifier>
+              </metadata>
+              <manifest>
+                <item id="ch1" href="ch1.xhtml" media-type="application/xhtml+xml"/>
+              </manifest>
+              <spine><itemref idref="ch1"/></spine>
+            </package>
+            """.utf8)),
+            ("OEBPS/ch1.xhtml", data),
+        ])
+
+        let parsed = try awaitSync {
+            try await EPUBParser().parse(url: url, options: ParserOptions(), progress: nil)
+        }
+        XCTAssertTrue(parsed.text.contains(phrase), parsed.text)
+    }
+
+    /// 图片页不一定用 `<img src>`：背景图、srcset、`<object data>` 都要能
+    /// 被扫描页判定捕获，否则整章被当成空文本跳过。
+    func testEPUBNonImgSrcImagesTriggerOCR() throws {
+        let url = directory.appendingPathComponent("image-refs.epub")
+        let image = try makePNGData(width: 320, height: 480)
+        try writeEPUB(at: url, entries: [
+            ("mimetype", Data("application/epub+zip".utf8)),
+            ("META-INF/container.xml", Data(Self.containerXML.utf8)),
+            ("OEBPS/content.opf", Data("""
+            <?xml version="1.0"?>
+            <package xmlns="http://www.idpf.org/2007/opf" version="3.0" unique-identifier="id">
+              <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+                <dc:title>图片引用</dc:title><dc:identifier id="id">refs</dc:identifier>
+              </metadata>
+              <manifest>
+                <item id="p1" href="page1.xhtml" media-type="application/xhtml+xml"/>
+                <item id="p2" href="page2.xhtml" media-type="application/xhtml+xml"/>
+                <item id="p3" href="page3.xhtml" media-type="application/xhtml+xml"/>
+                <item id="i1" href="images/page1.png" media-type="image/png"/>
+                <item id="i2" href="images/page2.png" media-type="image/png"/>
+                <item id="i3" href="images/page3.png" media-type="image/png"/>
+              </manifest>
+              <spine><itemref idref="p1"/><itemref idref="p2"/><itemref idref="p3"/></spine>
+            </package>
+            """.utf8)),
+            ("OEBPS/page1.xhtml", Data("""
+            <html xmlns="http://www.w3.org/1999/xhtml"><body>
+            <div style="background-image:url('images/page1.png');width:100%;height:100%"></div>
+            </body></html>
+            """.utf8)),
+            ("OEBPS/page2.xhtml", Data("""
+            <html xmlns="http://www.w3.org/1999/xhtml"><body>
+            <img srcset="images/page2.png 1x" alt=""/>
+            </body></html>
+            """.utf8)),
+            ("OEBPS/page3.xhtml", Data("""
+            <html xmlns="http://www.w3.org/1999/xhtml"><body>
+            <object data="images/page3.png" type="image/png"></object>
+            </body></html>
+            """.utf8)),
+            ("OEBPS/images/page1.png", image),
+            ("OEBPS/images/page2.png", image),
+            ("OEBPS/images/page3.png", image),
+        ])
+
+        let fake = FakeVLM()
+        let parsed = try awaitSync {
+            try await EPUBParser(vlm: fake).parse(
+                url: url, options: ParserOptions(epubOCREngine: .ovis), progress: nil)
+        }
+        XCTAssertEqual(fake.calls, 3, "三种非 <img src> 的图片引用都应触发 OCR")
+        XCTAssertEqual(parsed.metadata["scanned_chapters"], "3")
+        XCTAssertEqual(parsed.metadata["ocr_pages"], "3")
+    }
+
     // MARK: 配置迁移
 
     func testConfigMigrationRemovesDoclingAndMarker() throws {
@@ -652,8 +935,10 @@ final class ParserTests: XCTestCase {
         XCTAssertEqual(config.ragChunkSize, 800)
         XCTAssertEqual(config.ragChunkOverlap, 80)
         XCTAssertEqual(config.ragSearchMaxTotalChars, 12_000)
-        XCTAssertEqual(config.ragAuxSummarizeMinChars, 4_000)
+        XCTAssertEqual(config.ragAuxSummarizeMinChars, 8_000)
         XCTAssertEqual(config.ragAuxSummarizeMaxChars, 12_000)
+        XCTAssertEqual(config.ragVectorOverfetch, 2,
+                       "混合检索先融合 rowid/分数，内层只需 1-2 倍召回")
         let options = ChunkingOptions(config: config)
         XCTAssertEqual(options.chunkSizeTokens, 800, "切片预算按 token 计，含 overlap")
         XCTAssertEqual(options.overlapTokens, 80, "overlap 占 10%，计入 800 token 总预算")
@@ -669,6 +954,34 @@ final class ParserTests: XCTestCase {
         XCTAssertEqual(loaded.ragSearchMaxTotalChars, 10_000)
         XCTAssertEqual(loaded.ragRerankThreshold, 0.55)
         XCTAssertEqual(loaded.export()["rag_aux_summarize_min_chars"] as? Int, 3_000)
+    }
+
+    /// embedding token 预算与指纹校验开关：默认值、持久化与越界收口。
+    func testConfigEmbeddingTokenBudgetAndFingerprintVerify() throws {
+        let defaults = AgentConfig()
+        XCTAssertEqual(defaults.ragEmbeddingTokenBudgetMin, 4_096)
+        XCTAssertEqual(defaults.ragEmbeddingTokenBudgetMax, 8_192)
+        XCTAssertEqual(defaults.ragEmbeddingTokenBudgetInitial, 6_144)
+        XCTAssertEqual(defaults.ragEmbeddingTokenBudgetStep, 512)
+        XCTAssertFalse(defaults.ragVerifyFingerprint, "默认信任 mtime + size")
+        XCTAssertEqual(defaults.ragANNProbe, 4, "离线评测后默认探 4 个簇")
+        XCTAssertEqual(defaults.ragANNRescore, 64)
+
+        let path = directory.appendingPathComponent("config-token-budget.json")
+        let json = #"{"rag_embedding_token_budget_min":8192,"#
+            + #""rag_embedding_token_budget_max":2048,"#
+            + #""rag_embedding_token_budget_initial":1000,"#
+            + #""rag_embedding_token_budget_step":64,"#
+            + #""rag_verify_fingerprint":true}"#
+        try json.write(to: path, atomically: true, encoding: .utf8)
+        let loaded = AgentConfig.load(path.path)
+        XCTAssertEqual(loaded.ragEmbeddingTokenBudgetMin, 8_192)
+        XCTAssertEqual(loaded.ragEmbeddingTokenBudgetMax, 8_192, "上限不得低于下限")
+        XCTAssertEqual(loaded.ragEmbeddingTokenBudgetInitial, 8_192, "初始预算夹在区间内")
+        XCTAssertEqual(loaded.ragEmbeddingTokenBudgetStep, 128, "步进至少 128")
+        XCTAssertTrue(loaded.ragVerifyFingerprint)
+        XCTAssertEqual(loaded.export()["rag_verify_fingerprint"] as? Bool, true)
+        XCTAssertEqual(loaded.export()["rag_embedding_token_budget_min"] as? Int, 8_192)
     }
 
     /// 旧默认 nomic MLX int8 应迁移到 jina-v3 MLX int4，并把旧默认 512 维收口到 256。
@@ -1110,6 +1423,28 @@ final class ParserTests: XCTestCase {
         ]
         for (path, content) in files {
             let data = Data(content.utf8)
+            try archive.addEntry(with: path, type: .file,
+                                 uncompressedSize: Int64(data.count),
+                                 compressionMethod: path == "mimetype" ? .none : .deflate,
+                                 provider: { position, size in
+                data.subdata(in: Int(position)..<Int(position) + size)
+            })
+        }
+    }
+
+    private static let containerXML = """
+    <?xml version="1.0"?>
+    <container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+      <rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
+    </container>
+    """
+
+    /// 按给定条目直接写 EPUB；用于构造路径/编码/图片引用等边缘形态。
+    private func writeEPUB(at url: URL, entries: [(String, Data)]) throws {
+        guard let archive = try Archive(url: url, accessMode: .create) else {
+            throw AgentError.parse("无法创建 EPUB 归档")
+        }
+        for (path, data) in entries {
             try archive.addEntry(with: path, type: .file,
                                  uncompressedSize: Int64(data.count),
                                  compressionMethod: path == "mimetype" ? .none : .deflate,
