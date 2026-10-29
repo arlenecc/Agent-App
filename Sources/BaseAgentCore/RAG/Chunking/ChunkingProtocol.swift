@@ -12,8 +12,9 @@ public enum ChunkVariant: String, Sendable {
 }
 
 public struct ChunkingOptions: Sendable {
-    /// 单片 token 预算（含 overlap）。bge-small-zh 上下文 512 token，
-    /// 默认 500 并给 [CLS]/[SEP] 与估算误差留出余量。
+    /// 单片 token 预算（含 overlap）。配置默认 800/80（jina-v3 推理前统一压到
+    /// 1024 token）；这里的 500/50 只是无配置时的保守回退，实际生效值由
+    /// `RAGEngine.resolvedChunkingOptions` 按 embedding 模型窗口收口。
     public var chunkSizeTokens: Int
     /// 相邻切片重叠的 token 数（默认 10%），计入 `chunkSizeTokens` 总预算。
     public var overlapTokens: Int

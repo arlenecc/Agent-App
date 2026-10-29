@@ -1,10 +1,10 @@
 import Foundation
 
-/// 近似 bge-small-zh（中文 BERT）分词器的 token 计数器。
+/// 近似中文分词器的 token 计数器（按 bge 词表标定，对当前 embedding 模型偏保守）。
 ///
 /// 切片发生在 embedding 之前，用标定过的估算器控制预算；估算取偏保守的上界
 /// （实测中文、英文、代码、哈希、数字表格等语料，估算均 ≥ 实际 token），
-/// 宁可切小一点，也不让块超出 bge-small-zh 的 512 token 窗口。
+/// 宁可切小一点，也不让块超出 embedding 模型的输入窗口。
 /// 实际 ingest 时若模型分词器可用，`RAGEngine` 会改用精确计数。
 public enum EmbeddingTokenEstimator {
     /// 估算文本 token 数（空文本为 0）。

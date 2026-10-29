@@ -8,7 +8,7 @@ public final class TextChunker: TextChunkingStrategy {
 
     public init(options: ChunkingOptions) {
         self.options = options
-        self.similarity = { BGESentenceSimilarity().adjacentCosines($0) }
+        self.similarity = { PotionSentenceSimilarity().adjacentCosines($0) }
     }
 
     /// 测试注入相似度实现，避免依赖内置模型。
@@ -76,7 +76,7 @@ public final class TextChunker: TextChunkingStrategy {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return SectionPieces(texts: [], mergeable: false) }
 
-        // 短章节整章即一个切片（按 token 预算对齐切片大小设置，默认 500 token）。
+        // 短章节整章即一个切片（按 token 预算对齐切片大小设置，默认 800 token）。
         // 长章节必须走语义/递归切分，禁止退化为按页切。
         if options.tokenCounter(trimmed) <= options.chunkSizeTokens {
             return SectionPieces(texts: [trimmed], mergeable: false)

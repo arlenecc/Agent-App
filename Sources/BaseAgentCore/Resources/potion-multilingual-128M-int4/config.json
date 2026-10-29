@@ -1,0 +1,37 @@
+{
+  "model_type": "model2vec-onnx",
+  "variant": "int4",
+  "source_model": "minishlab/potion-multilingual-128M",
+  "base_model": "jealk/TTC-L2V-supervised-2",
+  "language": [
+    "multilingual"
+  ],
+  "vocab_size": 500353,
+  "dim": 256,
+  "normalize": true,
+  "max_length": 512,
+  "median_token_length": 7,
+  "unk_token_id": 1,
+  "pooling": "mean",
+  "onnx_opset": 18,
+  "inputs": {
+    "input_ids": "int64[batch,seq]",
+    "attention_mask": "int64[batch,seq]"
+  },
+  "outputs": {
+    "embeddings": "float32[batch,256]"
+  },
+  "quantization": {
+    "bits": 4,
+    "block_size": 32,
+    "scheme": "asymmetric",
+    "table_bytes": 80056480,
+    "fp32_bytes": 512361472,
+    "compression": 6.4,
+    "weight_rmse": 0.0683026909828186,
+    "row_relative_l2_mean": 0.08014165610074997,
+    "row_relative_l2_p99": 0.0972045511007309,
+    "row_relative_l2_max": 0.12898533046245575,
+    "row_cosine_min": 0.0
+  }
+}

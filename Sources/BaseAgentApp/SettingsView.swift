@@ -690,7 +690,7 @@ struct SettingsView: View {
                             Stepper("内存阈值：\(embeddingMemoryLimitMB)MB",
                                     value: $embeddingMemoryLimitMB,
                                     in: 1_024...32_768, step: 512)
-                                .help("进程 footprint 超过该值立即下调子批；bge 单独运行峰值约 1.6GB，默认 6144MB")
+                                .help("进程 footprint 超过该值立即下调子批；模型单独运行峰值可达数 GB，默认 6144MB")
                             Stepper("吞吐容差：\(Int((embeddingThroughputTolerance * 100).rounded()))%",
                                     value: $embeddingThroughputTolerance,
                                     in: 0.01...0.50, step: 0.01)

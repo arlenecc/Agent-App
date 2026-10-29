@@ -122,7 +122,7 @@ OvisOCR2 的 MLX 权重使用 `model_type=qwen3_5`（Qwen3.5-0.8B 后训练）�
 `TextChunker` 使用 Apple **NaturalLanguage**（`NLTokenizer`）完成句子与词级切分：
 
 1. 结构切片：按 Markdown / 中文章节 / 编号标题切分章节；
-2. 语义切片：相邻句子 embedding 相似度低谷断开，embedding 不可用时退化为词重叠；
+2. 语义切片：内置 `potion-multilingual-128M`（int4 ONNX，纯 CPU，无 512 token 位置上限）计算相邻句余弦，在相似度低谷处断开；模型不可用时退化为词重叠；
 3. 递归回退：段落 → 换行 → 句号 → 空格 → token 窗口，严格遵守 token 预算；
 4. 块间按 token 数添加 overlap（计入总预算）。
 

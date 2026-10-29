@@ -1,7 +1,7 @@
 import Foundation
 
 /// 句子级语义切片：在相邻句相似度低谷处断开。
-/// 相似度由内置 bge-small-zh-v1.5（int8 ONNX，纯 CPU）计算；
+/// 相似度由内置 potion-multilingual-128M（int4 ONNX，纯 CPU）计算；
 /// 不可用时退化为词重叠相似度（仍可用，只是更粗糙）。
 struct SemanticChunker {
 
@@ -18,7 +18,7 @@ struct SemanticChunker {
 
     static func split(_ text: String, options: ChunkingOptions,
                       similarity: @escaping AdjacentSimilarity = {
-                          BGESentenceSimilarity().adjacentCosines($0)
+                          PotionSentenceSimilarity().adjacentCosines($0)
                       }) async -> [String]? {
         let sentences = TextAnalyzer.sentences(text)
             .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -190,10 +190,13 @@ struct SemanticChunker {
 
     /// 用相似度分布的低分位作为断点阈值：语义切分关心「相对低谷」，
     /// 固定阈值在长文档/短句上会要么切得过碎、要么完全不断。
+    /// 取样本 25 分位（下标按 n-1 计）；floor 0.15 避免低相似度模型
+    /// （如 potion 的余弦整体偏低）把普通相邻句也当作主题边界。
     private static func adaptiveThreshold(_ values: [Double], fallback: Double) -> Double {
         guard values.count >= 4 else { return fallback }
         let sorted = values.sorted()
-        let index = max(0, min(sorted.count - 1, Int(Double(sorted.count) * 0.25)))
+        let index = max(0, min(sorted.count - 1,
+                              Int(Double(sorted.count - 1) * 0.25)))
         return max(0.15, min(fallback, sorted[index]))
     }
 }

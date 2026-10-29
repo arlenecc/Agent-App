@@ -152,11 +152,11 @@ final class EmbeddingPathBenchTests: XCTestCase {
                          recursiveSorted.last ?? 0,
                          recursiveTokens.reduce(0, +)))
 
-            // 抽查 Apple NL 词向量是否可用（不可用则语义切片退化为词法相似度）。
+            // 抽查内置 potion 语义模型是否可用（不可用则语义切片退化为词法相似度）。
             let probe = Array(TextAnalyzer.sentences(String(book.prefix(4_000))).prefix(80))
-            let cosines = BGESentenceSimilarity().adjacentCosines(probe)
+            let cosines = PotionSentenceSimilarity().adjacentCosines(probe)
             let sample = cosines?.prefix(6).map { String(format: "%.2f", $0) } ?? []
-            print("[path-bench] NL 相似度可用: \(cosines != nil)；样本 \(sample)")
+            print("[path-bench] 语义相似度可用: \(cosines != nil)；样本 \(sample)")
             let sentenceCount = TextAnalyzer.sentences(book).count
             print("[path-bench] 全书句子数 \(sentenceCount)，语义切片块数 \(bookChunks.count)"
                 + "（比值 \(String(format: "%.2f", Double(bookChunks.count) / Double(max(sentenceCount, 1))))）")

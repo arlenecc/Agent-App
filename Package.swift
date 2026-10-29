@@ -54,6 +54,7 @@ let package = Package(
                 "llama",
                 .product(name: "Jinja", package: "swift-jinja"),
                 .product(name: "Tokenizers", package: "swift-transformers"),
+                .product(name: "Hub", package: "swift-transformers"),
                 .product(name: "MLXLLM", package: "mlx-swift-lm"),
                 .product(name: "MLXLMCommon", package: "mlx-swift-lm"),
                 .product(name: "MLXVLM", package: "mlx-swift-lm"),
@@ -66,8 +67,9 @@ let package = Package(
             ],
             path: "Sources/BaseAgentCore",
             resources: [
-                // 语义切片专用：bge-small-zh-v1.5 int8 ONNX（约 24 MB），随 App 固化分发。
-                .copy("Resources/bge-small-zh-v1.5-int8"),
+                // 语义切片专用：potion-multilingual-128M int4 ONNX（约 99 MB），
+                // 静态词向量模型，无 512 token 位置上限，随 App 固化分发。
+                .copy("Resources/potion-multilingual-128M-int4"),
             ],
             swiftSettings: [.swiftLanguageMode(.v5)],
             linkerSettings: [.linkedLibrary("sqlite3")]
