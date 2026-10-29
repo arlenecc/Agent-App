@@ -98,7 +98,10 @@ final class BookSummaryStoreTests: XCTestCase {
         let finished = doc("finished.md")
         let pending = doc("pending.md")
         let bookOnly = doc("book-only.md")
-        for item in [finished, pending, bookOnly] {
+        // 没有任何可识别章节的文档：完成后不应反复进入候选，避免每个
+        // 空闲会话都尝试一次注定失败的全书摘要。
+        let empty = doc("empty.md")
+        for item in [finished, pending, bookOnly, empty] {
             try store.upsertDocument(docName: item.docName, digest: item.digest,
                                      chapters: item.chapters, mdPath: item.mdPath,
                                      contentHash: item.contentHash)
@@ -109,6 +112,8 @@ final class BookSummaryStoreTests: XCTestCase {
             docID: finished.docID, summary: "完成"))
         try store.upsertSummaryJob(SummaryJobRecord(
             docID: bookOnly.docID, status: .summarizingBook, nextSection: 3, totalSections: 3))
+        try store.upsertSummaryJob(SummaryJobRecord(
+            docID: empty.docID, status: .completed, nextSection: 0, totalSections: 0))
 
         let candidates = try store.summaryCandidates(limit: 10)
         XCTAssertEqual(Set(candidates.map(\.docID)), Set([pending.docID, bookOnly.docID]))

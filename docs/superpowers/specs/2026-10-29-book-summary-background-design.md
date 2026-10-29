@@ -222,7 +222,9 @@ LEFT JOIN book_summaries b ON b.doc_id = d.doc_id
 WHERE d.md_path != ''
   AND (j.doc_id IS NULL
        OR j.status IN ('pending', 'summarizing_book', 'failed')
-       OR (j.status = 'completed' AND b.doc_id IS NULL))
+       -- 完成但没有章节的文档不再进入候选，避免重复失败
+       OR (j.status = 'completed' AND b.doc_id IS NULL
+           AND j.total_sections > 0))
 ORDER BY COALESCE(j.updated_at, 0), d.updated_at
 LIMIT ?
 ```
@@ -284,4 +286,6 @@ LIMIT ?
   防止卸载权重与摘要的在途生成并发。
 - `AppModel.init` 末尾主动 `scheduleIdleUnload()`：API 模式或辅助模型未启用时
   `preloadModels` 会提前返回，仍需要空闲计时来启动摘要任务。
+- `summaryCandidates` 排除「已完成但没有章节」的文档（`total_sections = 0`），
+  避免无标题纯正文在每次空闲会话重复触发注定失败的 `processBookSummary`。
 - 实测：`swift build` 通过；全量 `swift test` 350 项、20 项环境依赖跳过、0 失败。
