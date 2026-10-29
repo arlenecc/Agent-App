@@ -1,4 +1,6 @@
-# base-agent（Swift 原生重构版）
+Lightning-RAG
+
+一个使用swift实现的极简超轻量RAG，可以纯本地使用（2B以上模型即可，所有主流电脑都可以无压力运行），并指定使用各环节使用的模型，swift直接实现针对pdf，epub，word，html等各类文件的解析、识别、抽取、、提取、清洗、格式化，也提供可单独使用的信息抽取工具，速度极快，可作为本地知识库使用，或阅读辅助工具使用，内置极简Agent，交互过程中进行多层信息压缩，把上下文控制在30k以内，可以从skill库学习和检索，并自动蒸馏使用过程中的经验形成新的skill，在使用中形成个性化的各项能力，具备成长性
 
 macOS 原生自主 Agent。控制流是**三态自动机 + 五级上下文压缩**，能力层是工具集，经验层是事实抽取与 L4 蒸馏，知识层是 **SQLite + sqlite-vec + FTS5** 的本地 RAG。
 
@@ -230,7 +232,7 @@ PDF Ovis 引擎按 `rag_ocr_model_path` / `rag_ocr_model_name` 加载，不受 `
 }
 ```
 
-旧版 Python 配置键（`llm_mode`、`llm_backend`、`llm_model_path`、`aux_llm_*`、`rag_embedding_backend`、`rag_embedding_model_path`、`rag_rerank_backend`、`rag_rerank_model_path`、`rag_rerank_mlx_model_path`）在 canonical 键缺失时自动兼容；`mlx` / `mlx_lm` 归一化为 `mlx-lm`，`llama.cpp` / `llama_cpp` 归一化为 `gguf`，`openai` 归一化为 `api`。
+旧版  配置键（`llm_mode`、`llm_backend`、`llm_model_path`、`aux_llm_*`、`rag_embedding_backend`、`rag_embedding_model_path`、`rag_rerank_backend`、`rag_rerank_model_path`、`rag_rerank_mlx_model_path`）在 canonical 键缺失时自动兼容；`mlx` / `mlx_lm` 归一化为 `mlx-lm`，`llama.cpp` / `llama_cpp` 归一化为 `gguf`，`openai` 归一化为 `api`。
 
 使用纯 API 模式时设置：
 
@@ -282,4 +284,4 @@ docs/软件设计文档.md
 
 ## License
 
-Apache-2.0（见 [LICENSE](LICENSE)）。
+GPLv3（见 [LICENSE](LICENSE)）。
