@@ -316,4 +316,26 @@ final class BookSummaryCoordinatorTests: XCTestCase {
         await coordinator.endSession()
         XCTAssertTrue(transient.unloaded)
     }
+
+    func testCancelCurrentBlocksFurtherTicksUntilNextSession() async throws {
+        let store = try makeStore()
+        _ = try insertDocument(store, markdown: chapterMarkdown(1))
+        let resident = CoordinatorStubLLM()
+        let coordinator = makeCoordinator(store: store, resident: resident)
+
+        let began = await coordinator.beginSession(mode: .resident)
+        XCTAssertTrue(began)
+        await coordinator.cancelCurrent()
+        let stopped = await coordinator.runTick(mode: .resident)
+        XCTAssertEqual(stopped, .noWork)
+        XCTAssertEqual(resident.calls, 0)
+
+        await coordinator.endSession()
+        let resumed = await coordinator.beginSession(mode: .resident)
+        XCTAssertTrue(resumed)
+        let outcome = await coordinator.runTick(mode: .resident)
+        guard case .processedChapter = outcome else {
+            return XCTFail("新会话应恢复处理，实际 \(outcome)")
+        }
+    }
 }

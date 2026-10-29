@@ -20,6 +20,8 @@ public final class BookSummaryCoordinator: @unchecked Sendable {
     private var transientLLM: LLMService?
     private var tickTask: Task<BookSummaryTickOutcome, Never>?
     private var cancelRequested = false
+    /// 会话级停止：`cancelCurrent` 之后不再开始新的 tick，直到下个会话。
+    private var stopRequested = false
     private var retryCounts: [String: Int] = [:]
     private var currentDocName: String?
     private var currentSection = 0
@@ -63,6 +65,7 @@ public final class BookSummaryCoordinator: @unchecked Sendable {
             sessionMode = .resident
             retryCounts.removeAll()
             cancelRequested = false
+            stopRequested = false
             lock.unlock()
             log("章节摘要：开始常驻辅助模型空闲会话（900 秒/章）")
             return true
@@ -88,6 +91,7 @@ public final class BookSummaryCoordinator: @unchecked Sendable {
         transientLLM = llm
         retryCounts.removeAll()
         cancelRequested = false
+        stopRequested = false
         lock.unlock()
         log("章节摘要：开始临时辅助模型空闲会话（300 秒/章）")
         return true
@@ -95,6 +99,11 @@ public final class BookSummaryCoordinator: @unchecked Sendable {
 
     /// 执行一次节流 tick；同一时间只允许一个 tick 在跑。
     public func runTick(mode: BookSummaryMode) async -> BookSummaryTickOutcome {
+        lock.lock()
+        let stopping = stopRequested
+        lock.unlock()
+        guard !stopping else { return .noWork }
+
         let llm: LLMService?
         switch mode {
         case .resident:
@@ -168,6 +177,7 @@ public final class BookSummaryCoordinator: @unchecked Sendable {
     public func cancelCurrent() async {
         lock.lock()
         cancelRequested = true
+        stopRequested = true
         let task = tickTask
         lock.unlock()
         task?.cancel()
@@ -191,6 +201,7 @@ public final class BookSummaryCoordinator: @unchecked Sendable {
         currentSection = 0
         currentTotal = 0
         cancelRequested = false
+        stopRequested = false
         lock.unlock()
 
         if let llm {
@@ -275,7 +286,7 @@ public final class BookSummaryCoordinator: @unchecked Sendable {
     private var isCancelled: Bool {
         lock.lock()
         defer { lock.unlock() }
-        return cancelRequested
+        return cancelRequested || stopRequested
     }
 
     private func isCancellation(_ error: Error) -> Bool {

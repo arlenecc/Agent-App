@@ -180,6 +180,8 @@ final class AppViewModel: ObservableObject {
     @Published var isBuildingANN = false
     /// ANN 索引摘要（设置窗口显示，来自 RAG status 快照）。
     @Published var annStatusText = "ANN 索引未构建"
+    /// 闲时后台章节摘要的进度（设置窗口显示）。
+    @Published var bookSummaryStatusText = "章节摘要：空闲"
     /// 当前索引与配置不匹配，需要用户显式重建。
     @Published var vectorRebuildRequired = false
     @Published var vectorRebuildReason = ""
@@ -197,6 +199,14 @@ final class AppViewModel: ObservableObject {
     private var syncTask: Task<Void, Never>?
     /// 空闲内存回收：无前台活动一段时间后释放 aux 权重与 Embedding/Reranker/OCR。
     private var idleUnloadTask: Task<Void, Never>?
+    /// 闲时章节摘要会话；只在该会话内使用辅助模型，结束后卸载临时模型。
+    private var summarySessionTask: Task<Void, Never>?
+    /// 当前会话的协调器。懒创建，避免启动时在同步路径上打开大向量库。
+    private var summaryCoordinator: BookSummaryCoordinator?
+    /// 会话收尾任务：同步/退出/配置切换等需要串行等待模型释放。
+    private var summaryStopTask: Task<Void, Never>?
+    /// 每次开始/停止会话递增，旧会话的迟到回调不能覆盖新状态。
+    private var summarySessionToken = 0
     /// 每次同步/取消同步递增，旧同步的收尾不能清掉新同步的状态。
     private var syncGeneration = 0
     private var runGeneration = 0
@@ -235,6 +245,9 @@ final class AppViewModel: ObservableObject {
             await preloadModels(main: shouldPreloadMain,
                                 aux: config.auxEnabled)
         }
+        // 即使无需预加载模型（API 模式/未启用辅助模型），也要让闲时摘要
+        // 在启动后按空闲计时自动开始。
+        scheduleIdleUnload()
     }
 
     // MARK: Agent 生命周期
@@ -295,6 +308,8 @@ final class AppViewModel: ObservableObject {
         cancelFlag.set(true)
         oldTask?.cancel()
         Task { [weak self] in
+            // 摘要会话可能正占用辅助模型与向量库；先等它收尾，再关闭旧 Agent。
+            await self?.stopSummaryIdleSession()
             _ = await oldTask?.value
             await MainActor.run {
                 guard let self else { return }
@@ -415,6 +430,8 @@ final class AppViewModel: ObservableObject {
         statusText = "模型加载中…"
 
         Task { [weak self] in
+            // 替换模型前先让闲时摘要释放对辅助模型的占用。
+            await self?.stopSummaryIdleSession()
             _ = await oldTask?.value
             guard let self, self.configGeneration == generation else { return }
             guard let agent = self.agent else {
@@ -622,10 +639,16 @@ final class AppViewModel: ObservableObject {
     /// 卸载辅助模型；主模型不受影响。
     func unloadAuxModel() {
         guard !isRunning, !isModelLoading, !isWarmingUp, !isDeduplicating else { return }
-        agent?.unloadAuxLLM()
-        LocalModelFactory.shared.unloadLLMCaches()
-        auxModelLoaded = false
-        appendLog("[model] 辅助模型已卸载")
+        // 闲时摘要可能正在使用辅助模型，必须等会话结束再 close，否则会与在途
+        // 生成并发释放权重。
+        Task { [weak self] in
+            guard let self else { return }
+            await self.stopSummaryIdleSession()
+            self.agent?.unloadAuxLLM()
+            LocalModelFactory.shared.unloadLLMCaches()
+            self.auxModelLoaded = false
+            self.appendLog("[model] 辅助模型已卸载")
+        }
     }
 
     func resetConversation() {
@@ -733,6 +756,8 @@ final class AppViewModel: ObservableObject {
     /// 不做这步直接退出，MLX 的 asyncEval 会与进程退出并发而崩溃。
     func prepareForTermination() async {
         cancelIdleUnload()
+        // 等待闲时摘要会话退出并卸载临时辅助模型，避免和退出流程并发。
+        await stopSummaryIdleSession()
         cancelFlag.set(true)
         runGeneration += 1
         let running = runTask
@@ -762,7 +787,9 @@ final class AppViewModel: ObservableObject {
             guard !self.isRunning, !self.isModelLoading, !self.isWarmingUp,
                   !self.isSyncing, !self.isDeduplicating, !self.isBuildingANN,
                   (self.agent?.isBackgroundIdle() ?? true) else { return }
-            // 主模型 / 辅助模型 / Reranker 常驻；只回收按需使用的 Embedding 与 OCR。
+            // 先开启闲时章节摘要会话（内部按 15/5 分钟节流逐章处理），
+            // 再回收 Embedding/OCR 权重；摘要会话在独立 Task 里继续运行。
+            self.startSummaryIdleSession()
             await LocalModelFactory.shared.unloadIdleRAGModelWeights()
         }
     }
@@ -770,6 +797,139 @@ final class AppViewModel: ObservableObject {
     private func cancelIdleUnload() {
         idleUnloadTask?.cancel()
         idleUnloadTask = nil
+        requestSummaryStop()
+    }
+
+    // MARK: 闲时章节摘要
+
+    /// 3 分钟空闲后开启一个摘要会话；一次只处理一个章节/一次全书摘要。
+    /// 临时辅助模型由会话创建和卸载，常驻辅助模型只借用、不关闭。
+    private func startSummaryIdleSession() {
+        guard summarySessionTask == nil, summaryCoordinator == nil,
+              summaryStopTask == nil, let agent else { return }
+        summarySessionToken += 1
+        let token = summarySessionToken
+        // 常驻条件：已启用且已加载。未加载时走临时模型，结束后释放。
+        let mode: BookSummaryMode = (config.auxEnabled && auxModelLoaded
+            && agent.auxLLM != nil) ? .resident : .temporary
+        bookSummaryStatusText = "章节摘要：准备中…"
+        summarySessionTask = Task.detached(priority: .utility) { [weak self, weak agent] in
+            guard let agent, !Task.isCancelled else { return }
+            let coordinator: BookSummaryCoordinator
+            do {
+                coordinator = try agent.ragEngine.makeBookSummaryCoordinator(
+                    residentAuxProvider: { agent.auxLLM },
+                    transientAuxFactory: { config in
+                        LocalModelFactory.shared.makeTransientAuxLLM(config: config)
+                    },
+                    log: { line in
+                        Task { @MainActor [weak self] in self?.appendLog(line) }
+                    })
+            } catch {
+                let message = error.localizedDescription
+                await MainActor.run { [weak self] in
+                    guard let self, self.summarySessionToken == token else { return }
+                    self.summarySessionTask = nil
+                    self.bookSummaryStatusText = "章节摘要：不可用"
+                    self.appendLog("章节摘要：初始化失败 — \(message)")
+                }
+                return
+            }
+            await MainActor.run { [weak self] in
+                guard let self, self.summarySessionToken == token else { return }
+                self.summaryCoordinator = coordinator
+                self.bookSummaryStatusText = "章节摘要：准备辅助模型…"
+            }
+            guard await coordinator.beginSession(mode: mode) else {
+                await coordinator.endSession()
+                await MainActor.run { [weak self] in
+                    guard let self, self.summarySessionToken == token else { return }
+                    self.summaryCoordinator = nil
+                    self.summarySessionTask = nil
+                    self.bookSummaryStatusText = "章节摘要：辅助模型不可用"
+                }
+                return
+            }
+            await MainActor.run { [weak self] in
+                guard let self, self.summarySessionToken == token else { return }
+                self.bookSummaryStatusText = coordinator.statusSnapshot()
+            }
+            session: while !Task.isCancelled {
+                let outcome = await coordinator.runTick(mode: mode)
+                await MainActor.run { [weak self] in
+                    guard let self, self.summarySessionToken == token else { return }
+                    self.bookSummaryStatusText = coordinator.statusSnapshot()
+                    if case .failed(let docName, let message) = outcome {
+                        self.appendLog("章节摘要：\(docName) 处理失败 — \(message)")
+                    }
+                }
+                switch outcome {
+                case .processedChapter, .processedBook:
+                    continue session
+                case .throttled(let waitSeconds):
+                    // wait=0 表示另一个 tick 正在收尾，短暂让出后重试。
+                    let seconds = waitSeconds > 0 ? waitSeconds : 5
+                    do {
+                        try await Task.sleep(
+                            nanoseconds: UInt64(seconds * 1_000_000_000))
+                    } catch {
+                        break session
+                    }
+                case .failed:
+                    // 协调器对同一文档每次会话最多重试 2 次；失败后稍等再换书。
+                    do { try await Task.sleep(nanoseconds: 30_000_000_000) }
+                    catch { break session }
+                case .noWork:
+                    await MainActor.run { [weak self] in
+                        guard let self, self.summarySessionToken == token else { return }
+                        self.appendLog("章节摘要：本次空闲会话没有待处理章节")
+                    }
+                    break session
+                }
+            }
+            await coordinator.endSession()
+            await MainActor.run { [weak self] in
+                guard let self, self.summarySessionToken == token else { return }
+                self.summaryCoordinator = nil
+                self.summarySessionTask = nil
+                self.bookSummaryStatusText = "章节摘要：空闲"
+            }
+        }
+    }
+
+    /// 请求停止摘要会话；不等待完成，供前台操作即时取消。
+    private func requestSummaryStop() {
+        guard summaryStopTask == nil,
+              summarySessionTask != nil || summaryCoordinator != nil else { return }
+        summaryStopTask = Task { @MainActor [weak self] in
+            await self?.performSummaryStop()
+        }
+    }
+
+    /// 等待摘要会话彻底结束（含临时模型卸载）；可重复调用。
+    private func stopSummaryIdleSession() async {
+        requestSummaryStop()
+        if let task = summaryStopTask {
+            _ = await task.value
+        }
+    }
+
+    private func performSummaryStop() async {
+        let session = summarySessionTask
+        let coordinator = summaryCoordinator
+        summarySessionTask = nil
+        summarySessionToken += 1
+        session?.cancel()
+        // runTick 内部是独立 Task，外层取消不会自动传递；先取消当前章节。
+        if let coordinator {
+            await coordinator.cancelCurrent()
+        }
+        if let session {
+            _ = await session.value
+        }
+        summaryCoordinator = nil
+        summaryStopTask = nil
+        bookSummaryStatusText = "章节摘要：空闲"
     }
 
     // MARK: 流式更新
@@ -1346,9 +1506,6 @@ final class AppViewModel: ObservableObject {
         } else {
             appendLog("[rag] 同步开始：先卸载\(modelNote)，结束后重新加载并预热主模型")
         }
-        // 同步期间卸载已加载的主/辅模型，释放权重与 KV cache。
-        suspendModelsForSync()
-
         statusText = rebuildVector ? "正在重建向量库…" : (force ? "强制同步知识库…" : "同步知识库…")
         let syncGen = generation
         syncTask = Task.detached(priority: .userInitiated) { [weak self, weak agent] in
@@ -1360,6 +1517,12 @@ final class AppViewModel: ObservableObject {
                     self.syncTask = nil
                 }
                 return
+            }
+            // 先等闲时摘要会话退出并释放辅助模型，再卸载本地模型：
+            // 避免「同步卸载」与摘要的在途生成并发释放同一份权重。
+            await self?.stopSummaryIdleSession()
+            await MainActor.run { [weak self] in
+                self?.suspendModelsForSync()
             }
             // 给 MLX/GGUF 的异步卸载一点收尾时间，避免刚释放的权重与
             // RAG 的 embedding 模型抢内存。GGUF 是同步释放，这里几乎无感知。

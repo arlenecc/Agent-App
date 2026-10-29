@@ -437,6 +437,15 @@ public final class LocalModelFactory: @unchecked Sendable {
 
     /// 辅助 LLM。参数使用 aux_* 配置，模型加载逻辑与主 LLM 一致。
     public func makeAuxLLM(config: AgentConfig) -> LLMService {
+        makeAuxLLM(config: config, sharedCache: true)
+    }
+
+    /// 临时辅助 LLM：不写入共享缓存，空闲会话结束后可独立卸载。
+    public func makeTransientAuxLLM(config: AgentConfig) -> LLMService {
+        makeAuxLLM(config: config, sharedCache: false)
+    }
+
+    private func makeAuxLLM(config: AgentConfig, sharedCache: Bool) -> LLMService {
         switch config.auxLLMProvider.lowercased() {
         case "api":
             return OpenAILLMClient(
@@ -483,7 +492,7 @@ public final class LocalModelFactory: @unchecked Sendable {
                 ? nil : URL(fileURLWithPath: tokenizerPath)
             let key = "aux-onnx:\(value):\(config.effectiveAuxContextTokens):"
                 + "\(config.auxMaxTokens):\(tokenizerPath)"
-            return llms.value(for: key) {
+            return auxValue(key: key, sharedCache: sharedCache) {
                 do {
                     let directory = try LocalModelRegistry.resolveDirectory(
                         kind: .aux, value: value, config: config)
@@ -510,7 +519,7 @@ public final class LocalModelFactory: @unchecked Sendable {
         }
         if backend == "mlx-vlm" {
             let key = "aux-vlm:\(value):\(config.effectiveAuxContextTokens):\(config.auxMaxTokens)"
-            return llms.value(for: key) {
+            return auxValue(key: key, sharedCache: sharedCache) {
                 do {
                     let directory = try LocalModelRegistry.resolveDirectory(
                         kind: .aux, value: value, config: config)
@@ -536,7 +545,7 @@ public final class LocalModelFactory: @unchecked Sendable {
         }
         if backend == "gguf" {
             let key = "aux-gguf:\(value):\(config.effectiveAuxContextTokens):\(config.auxMaxTokens):\(config.auxKvReuse):\(config.auxKvCacheInt8)"
-            return llms.value(for: key) {
+            return auxValue(key: key, sharedCache: sharedCache) {
                 do {
                     let file = try GGUFFileResolver.resolve(
                         kind: .aux, value: value, config: config)
@@ -577,7 +586,7 @@ public final class LocalModelFactory: @unchecked Sendable {
             kvInt8: config.auxKvCacheInt8
         )
 
-        return llms.value(for: key) {
+        return auxValue(key: key, sharedCache: sharedCache) {
             do {
                 let directory = try LocalModelRegistry.resolveDirectory(
                     kind: .aux,
@@ -606,6 +615,12 @@ public final class LocalModelFactory: @unchecked Sendable {
                 )
             }
         }
+    }
+
+    /// 常驻辅助模型走共享缓存；临时辅助模型每次独立构建，避免占用缓存实例。
+    private func auxValue(key: String, sharedCache: Bool,
+                          build: () -> LLMService) -> LLMService {
+        sharedCache ? llms.value(for: key, build: build) : build()
     }
 
     // MARK: - VLM

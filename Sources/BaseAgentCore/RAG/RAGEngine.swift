@@ -2142,6 +2142,27 @@ public final class RAGEngine {
         (try? withStore { $0.listDocuments() }) ?? []
     }
 
+    /// 创建闲时章节摘要协调器：与检索复用同一个 `VectorStore` 实例。
+    ///
+    /// 调用方必须在 `close()` / `reload()` 之前结束协调器会话，否则连接会在
+    /// 摘要任务使用期间被关闭。打开大库可能耗时（遗留 WAL 恢复），调用方应
+    /// 在后台线程创建，避免阻塞启动/UI。
+    public func makeBookSummaryCoordinator(
+        residentAuxProvider: @escaping @Sendable () -> LLMService?,
+        transientAuxFactory: (@Sendable (AgentConfig) -> LLMService)? = nil,
+        log: @escaping @Sendable (String) -> Void = { _ in }
+    ) throws -> BookSummaryCoordinator {
+        let store = try ensureStore()
+        let config = self.config
+        return BookSummaryCoordinator(
+            engine: BookSummaryEngine(store: store),
+            store: store,
+            configProvider: { config },
+            residentAuxProvider: residentAuxProvider,
+            transientAuxFactory: transientAuxFactory,
+            log: log)
+    }
+
     /// 知识库状态。默认复用最近一次快照，避免在轮次/检索热路径上做全表扫描。
     ///
     /// `sourceLimit` 只返回前 N 个来源名，避免 7 万本书时把全部路径读进内存。
