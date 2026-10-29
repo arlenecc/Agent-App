@@ -19,6 +19,12 @@ public final class VectorStore: @unchecked Sendable {
     public static let vectorTable = "chunk_vectors"
     public static let ftsTable = "chunks_fts"
     public static let documentsTable = "documents"
+    public static let chapterSummariesTable = "chapter_summaries"
+    public static let chapterSegmentsTable = "chapter_summary_segments"
+    public static let bookSummariesTable = "book_summaries"
+    public static let bookSegmentsTable = "book_summary_segments"
+    public static let summaryJobTable = "summary_job_state"
+    public static let summaryRuntimeTable = "summary_runtime"
 
     public let db: SQLiteDatabase
     /// 当前向量维度。极少数模型（缺少 config.json）会在首次推理后才发现
@@ -153,11 +159,69 @@ public final class VectorStore: @unchecked Sendable {
             digest TEXT NOT NULL DEFAULT '',
             chapters TEXT NOT NULL DEFAULT '',
             md_path TEXT NOT NULL DEFAULT '',
+            content_hash TEXT NOT NULL DEFAULT '',
             updated_at REAL NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_documents_name ON documents(doc_name);
         CREATE INDEX IF NOT EXISTS idx_documents_md_path ON documents(md_path);
+
+        CREATE TABLE IF NOT EXISTS chapter_summaries (
+            doc_id TEXT NOT NULL,
+            section_index INTEGER NOT NULL,
+            heading TEXT NOT NULL DEFAULT '',
+            title TEXT NOT NULL DEFAULT '',
+            level INTEGER NOT NULL DEFAULT 1,
+            summary TEXT NOT NULL DEFAULT '',
+            content_hash TEXT NOT NULL DEFAULT '',
+            updated_at REAL NOT NULL,
+            PRIMARY KEY (doc_id, section_index)
+        );
+
+        CREATE TABLE IF NOT EXISTS chapter_summary_segments (
+            doc_id TEXT NOT NULL,
+            section_index INTEGER NOT NULL,
+            segment_index INTEGER NOT NULL,
+            segment_hash TEXT NOT NULL DEFAULT '',
+            summary TEXT NOT NULL DEFAULT '',
+            updated_at REAL NOT NULL,
+            PRIMARY KEY (doc_id, section_index, segment_index)
+        );
+
+        CREATE TABLE IF NOT EXISTS book_summaries (
+            doc_id TEXT PRIMARY KEY,
+            summary TEXT NOT NULL DEFAULT '',
+            outline TEXT NOT NULL DEFAULT '',
+            chapter_count INTEGER NOT NULL DEFAULT 0,
+            source_hash TEXT NOT NULL DEFAULT '',
+            updated_at REAL NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS book_summary_segments (
+            doc_id TEXT NOT NULL,
+            group_index INTEGER NOT NULL,
+            group_hash TEXT NOT NULL DEFAULT '',
+            summary TEXT NOT NULL DEFAULT '',
+            updated_at REAL NOT NULL,
+            PRIMARY KEY (doc_id, group_index)
+        );
+
+        CREATE TABLE IF NOT EXISTS summary_job_state (
+            doc_id TEXT PRIMARY KEY,
+            status TEXT NOT NULL DEFAULT 'pending',
+            next_section INTEGER NOT NULL DEFAULT 0,
+            total_sections INTEGER NOT NULL DEFAULT 0,
+            last_error TEXT NOT NULL DEFAULT '',
+            updated_at REAL NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS summary_runtime (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL
+        );
         """)
+        // 旧库没有 content_hash：补列后才能判断正文是否变化。
+        try ensureColumn(table: Self.documentsTable, column: "content_hash",
+                         definition: "TEXT NOT NULL DEFAULT ''")
 
         let stored = try db.scalar(
             "SELECT value FROM meta WHERE key = ?", [.text(Self.dimensionKey)]).stringValue
@@ -227,6 +291,12 @@ public final class VectorStore: @unchecked Sendable {
             try db.execute("DELETE FROM \(Self.chunksTable)")
             try db.execute("DELETE FROM \(Self.ftsTable)")
             try db.execute("DELETE FROM \(Self.documentsTable)")
+            try db.execute("DELETE FROM \(Self.chapterSummariesTable)")
+            try db.execute("DELETE FROM \(Self.chapterSegmentsTable)")
+            try db.execute("DELETE FROM \(Self.bookSummariesTable)")
+            try db.execute("DELETE FROM \(Self.bookSegmentsTable)")
+            try db.execute("DELETE FROM \(Self.summaryJobTable)")
+            try db.execute("DELETE FROM \(Self.summaryRuntimeTable)")
             try db.execute(
                 "INSERT INTO meta(key, value) VALUES('\(Self.chunkCountKey)', '0') "
                 + "ON CONFLICT(key) DO UPDATE SET value = excluded.value")
@@ -582,6 +652,12 @@ public final class VectorStore: @unchecked Sendable {
                     try db.execute("DELETE FROM \(Self.vectorTable)")
                 }
                 try db.execute("DELETE FROM \(Self.documentsTable)")
+                try db.execute("DELETE FROM \(Self.chapterSummariesTable)")
+                try db.execute("DELETE FROM \(Self.chapterSegmentsTable)")
+                try db.execute("DELETE FROM \(Self.bookSummariesTable)")
+                try db.execute("DELETE FROM \(Self.bookSegmentsTable)")
+                try db.execute("DELETE FROM \(Self.summaryJobTable)")
+                try db.execute("DELETE FROM \(Self.summaryRuntimeTable)")
                 // ANN 索引里的 rowid 与维度都失效，直接丢弃（表可能还没建）。
                 try? resetANNIndexLocked()
                 self.cachedChunkCount = 0
@@ -612,6 +688,12 @@ public final class VectorStore: @unchecked Sendable {
                 try db.execute("DELETE FROM \(Self.chunksTable)")
                 try db.execute("DELETE FROM \(Self.ftsTable)")
                 try db.execute("DELETE FROM \(Self.documentsTable)")
+                try db.execute("DELETE FROM \(Self.chapterSummariesTable)")
+                try db.execute("DELETE FROM \(Self.chapterSegmentsTable)")
+                try db.execute("DELETE FROM \(Self.bookSummariesTable)")
+                try db.execute("DELETE FROM \(Self.bookSegmentsTable)")
+                try db.execute("DELETE FROM \(Self.summaryJobTable)")
+                try db.execute("DELETE FROM \(Self.summaryRuntimeTable)")
                 try? resetANNIndexLocked()
                 enabled = try recreateVectorTableLocked()
                 self.cachedChunkCount = 0
@@ -1212,81 +1294,443 @@ public final class VectorStore: @unchecked Sendable {
 
     // MARK: - Documents
 
-    public func upsertDocument(docName: String, digest: String, chapters: String = "", mdPath: String = "") throws {
+    public func upsertDocument(docName: String, digest: String, chapters: String = "",
+                               mdPath: String = "", contentHash: String = "") throws {
         let docID = Self.hashSource(mdPath.isEmpty ? docName : mdPath)
         let now = Date().timeIntervalSince1970
         try db.transaction {
+            // 先找出同名/同 id 的旧记录：正文变化时摘要必须一起失效。
+            let existing = try db.query(
+                "SELECT doc_id, content_hash FROM \(Self.documentsTable) "
+                + "WHERE doc_id = ? OR doc_name = ?",
+                [.text(docID), .text(docName)])
+            let staleIDs = Set(existing.compactMap { $0["doc_id"]?.stringValue })
+            let contentChanged = !contentHash.isEmpty && existing.contains {
+                ($0["content_hash"]?.stringValue ?? "") != contentHash
+            }
+            if contentChanged {
+                for id in staleIDs where !id.isEmpty {
+                    try deleteSummaryRowsLocked(docID: id)
+                }
+                // 新 doc_id 也可能是首次出现；清一次无副作用。
+                try deleteSummaryRowsLocked(docID: docID)
+            }
+
             try db.execute("DELETE FROM \(Self.documentsTable) WHERE doc_id = ?", [.text(docID)])
             if !mdPath.isEmpty {
                 try db.execute("DELETE FROM \(Self.documentsTable) WHERE doc_name = ? AND md_path != ?",
                                [.text(docName), .text(mdPath)])
             }
             try db.execute("""
-            INSERT INTO \(Self.documentsTable)(doc_id, doc_name, digest, chapters, md_path, updated_at)
-            VALUES(?, ?, ?, ?, ?, ?)
+            INSERT INTO \(Self.documentsTable)(doc_id, doc_name, digest, chapters, md_path, content_hash, updated_at)
+            VALUES(?, ?, ?, ?, ?, ?, ?)
             """, [.text(docID), .text(docName), .text(digest), .text(chapters),
-                  .text(mdPath), .double(now)])
+                  .text(mdPath), .text(contentHash), .double(now)])
         }
     }
 
+    /// 目录修复专用：只更新 digest/chapters，不改变 content_hash，也不失效摘要。
+    public func updateDocumentOutline(docID: String, digest: String, chapters: String) throws {
+        guard !docID.isEmpty else { return }
+        try db.execute("""
+        UPDATE \(Self.documentsTable) SET digest = ?, chapters = ? WHERE doc_id = ?
+        """, [.text(digest), .text(chapters), .text(docID)])
+    }
+
     public func getDocumentDigest(docName: String) -> DocumentRecord? {
-        let rows = allDocumentRows()
-        let target = docName.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let target = docName.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !target.isEmpty else { return nil }
-        if let exact = rows.first(where: {
-            $0.docName.lowercased() == target ||
-            ($0.docName as NSString).lastPathComponent.lowercased() == target
-        }) { return exact }
-        return rows.first {
-            let name = $0.docName.lowercased()
-            return name.contains(target) || target.contains(name)
+        guard let candidates = try? lookupDocuments(query: target, limit: 50),
+              !candidates.isEmpty else { return nil }
+        let lower = target.lowercased()
+        let standardized = (target as NSString).standardizingPath
+        let exact = candidates.filter {
+            $0.docName.lowercased() == lower
+                || ($0.docName as NSString).lastPathComponent.lowercased() == lower
+                || (!standardized.isEmpty
+                    && ($0.mdPath as NSString).standardizingPath == standardized)
         }
+        if exact.count == 1 { return exact[0] }
+        if exact.count > 1 { return nil }
+        let fuzzy = candidates.filter {
+            let name = $0.docName.lowercased()
+            return name.contains(lower) || lower.contains(name)
+        }
+        // 旧 API 无歧义返回值：唯一模糊命中才返回，多候选交给 lookupDocument。
+        return fuzzy.count == 1 ? fuzzy[0] : nil
     }
 
     public func allDocumentRows() -> [DocumentRecord] {
         guard let rows = try? db.query("""
-        SELECT doc_id, doc_name, digest, chapters, md_path FROM \(Self.documentsTable)
+        SELECT doc_id, doc_name, digest, chapters, md_path, content_hash
+        FROM \(Self.documentsTable)
         WHERE doc_name != '' ORDER BY doc_name
         """) else { return [] }
-        return rows.map {
-            DocumentRecord(
-                docID: $0["doc_id"]?.stringValue ?? "",
-                docName: $0["doc_name"]?.stringValue ?? "",
-                digest: $0["digest"]?.stringValue ?? "",
-                chapters: $0["chapters"]?.stringValue ?? "",
-                mdPath: $0["md_path"]?.stringValue ?? ""
-            )
-        }
+        return rows.map { Self.documentRecord(from: $0) }
     }
 
     public func listDocuments() -> [String] {
-        allDocumentRows().map(\.docName)
+        (try? documentNames(limit: 1_000_000)) ?? []
+    }
+
+    /// SQL 限量列出文档名。`rag_outline` 列表不要再把整表读进内存。
+    public func documentNames(limit: Int, offset: Int = 0) throws -> [String] {
+        guard limit > 0 else { return [] }
+        let rows = try db.query("""
+        SELECT doc_name FROM \(Self.documentsTable)
+        WHERE doc_name != '' ORDER BY doc_name LIMIT ? OFFSET ?
+        """, [.int(Int64(max(0, limit))), .int(Int64(max(0, offset)))])
+        return rows.compactMap { $0["doc_name"]?.stringValue }
+    }
+
+    public func documentCount() throws -> Int {
+        Int(try db.scalar(
+            "SELECT COUNT(*) FROM \(Self.documentsTable) WHERE doc_name != ''").intValue ?? 0)
     }
 
     public func getDocumentByMdPath(_ mdPath: String) -> DocumentRecord? {
         guard !mdPath.isEmpty else { return nil }
         let target = (mdPath as NSString).standardizingPath
-        return allDocumentRows().first {
-            !$0.mdPath.isEmpty && ($0.mdPath as NSString).standardizingPath == target
-        }
+        guard let rows = try? db.query("""
+        SELECT doc_id, doc_name, digest, chapters, md_path, content_hash
+        FROM \(Self.documentsTable) WHERE md_path = ? LIMIT 1
+        """, [.text(target)]) else { return nil }
+        return rows.first.map(Self.documentRecord(from:))
+    }
+
+    public func document(docID: String) throws -> DocumentRecord? {
+        guard !docID.isEmpty else { return nil }
+        let rows = try db.query("""
+        SELECT doc_id, doc_name, digest, chapters, md_path, content_hash
+        FROM \(Self.documentsTable) WHERE doc_id = ? LIMIT 1
+        """, [.text(docID)])
+        return rows.first.map(Self.documentRecord(from:))
+    }
+
+    /// SQL 侧候选过滤：精确 doc_name / md_path，或 `instr` 模糊包含。
+    /// 不在 SQL 里做 basename / 唯一性判断，调用方拿到候选后统一解析。
+    public func lookupDocuments(query: String, limit: Int = 50) throws -> [DocumentRecord] {
+        let raw = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty, limit > 0 else { return [] }
+        let standardized = (raw as NSString).standardizingPath
+        let rows = try db.query("""
+        SELECT doc_id, doc_name, digest, chapters, md_path, content_hash
+        FROM \(Self.documentsTable)
+        WHERE doc_name != '' AND (
+            doc_name = ? COLLATE NOCASE
+            OR md_path = ? COLLATE NOCASE
+            OR instr(lower(doc_name), lower(?)) > 0
+        )
+        ORDER BY doc_name LIMIT ?
+        """, [.text(raw), .text(standardized), .text(raw), .int(Int64(limit))])
+        return rows.map { Self.documentRecord(from: $0) }
     }
 
     public func deleteDocument(docName: String) throws {
         let docID = Self.hashSource(docName)
-        try db.execute("DELETE FROM \(Self.documentsTable) WHERE doc_id = ? OR doc_name = ?",
-                       [.text(docID), .text(docName)])
+        try db.transaction {
+            let rows = try db.query(
+                "SELECT doc_id FROM \(Self.documentsTable) WHERE doc_id = ? OR doc_name = ?",
+                [.text(docID), .text(docName)])
+            for id in Set(rows.compactMap { $0["doc_id"]?.stringValue }) {
+                try deleteSummaryRowsLocked(docID: id)
+            }
+            try db.execute("DELETE FROM \(Self.documentsTable) WHERE doc_id = ? OR doc_name = ?",
+                           [.text(docID), .text(docName)])
+        }
     }
 
     public func deleteDocumentByMdPath(_ mdPath: String) throws -> Bool {
         guard !mdPath.isEmpty else { return false }
         let target = (mdPath as NSString).standardizingPath
-        let before = try db.scalar("SELECT COUNT(*) FROM \(Self.documentsTable) WHERE md_path = ?",
-                                   [.text(target)]).intValue ?? 0
-        try db.execute("DELETE FROM \(Self.documentsTable) WHERE md_path = ?", [.text(target)])
-        return before > 0
+        var removed = false
+        try db.transaction {
+            let rows = try db.query(
+                "SELECT doc_id FROM \(Self.documentsTable) WHERE md_path = ?",
+                [.text(target)])
+            for id in Set(rows.compactMap { $0["doc_id"]?.stringValue }) {
+                try deleteSummaryRowsLocked(docID: id)
+            }
+            removed = rows.count > 0
+            try db.execute("DELETE FROM \(Self.documentsTable) WHERE md_path = ?", [.text(target)])
+        }
+        return removed
+    }
+
+    // MARK: - Chapter summaries
+
+    public func upsertChapterSummary(_ record: ChapterSummaryRecord) throws {
+        try db.execute("""
+        INSERT INTO \(Self.chapterSummariesTable)
+            (doc_id, section_index, heading, title, level, summary, content_hash, updated_at)
+        VALUES(?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(doc_id, section_index) DO UPDATE SET
+            heading = excluded.heading,
+            title = excluded.title,
+            level = excluded.level,
+            summary = excluded.summary,
+            content_hash = excluded.content_hash,
+            updated_at = excluded.updated_at
+        """, [.text(record.docID), .int(Int64(record.sectionIndex)), .text(record.heading),
+              .text(record.title), .int(Int64(record.level)), .text(record.summary),
+              .text(record.contentHash), .double(record.updatedAt)])
+    }
+
+    public func chapterSummaries(docID: String) throws -> [ChapterSummaryRecord] {
+        let rows = try db.query("""
+        SELECT doc_id, section_index, heading, title, level, summary, content_hash, updated_at
+        FROM \(Self.chapterSummariesTable) WHERE doc_id = ? ORDER BY section_index
+        """, [.text(docID)])
+        return rows.map(Self.chapterSummaryRecord(from:))
+    }
+
+    public func chapterSummary(docID: String, sectionIndex: Int) throws -> ChapterSummaryRecord? {
+        let rows = try db.query("""
+        SELECT doc_id, section_index, heading, title, level, summary, content_hash, updated_at
+        FROM \(Self.chapterSummariesTable) WHERE doc_id = ? AND section_index = ? LIMIT 1
+        """, [.text(docID), .int(Int64(sectionIndex))])
+        return rows.first.map(Self.chapterSummaryRecord(from:))
+    }
+
+    public func deleteChapterSummary(docID: String, sectionIndex: Int) throws {
+        try db.execute(
+            "DELETE FROM \(Self.chapterSummariesTable) WHERE doc_id = ? AND section_index = ?",
+            [.text(docID), .int(Int64(sectionIndex))])
+    }
+
+    // MARK: - Chapter segments
+
+    public func upsertChapterSegment(_ record: ChapterSegmentRecord) throws {
+        try db.execute("""
+        INSERT INTO \(Self.chapterSegmentsTable)
+            (doc_id, section_index, segment_index, segment_hash, summary, updated_at)
+        VALUES(?, ?, ?, ?, ?, ?)
+        ON CONFLICT(doc_id, section_index, segment_index) DO UPDATE SET
+            segment_hash = excluded.segment_hash,
+            summary = excluded.summary,
+            updated_at = excluded.updated_at
+        """, [.text(record.docID), .int(Int64(record.sectionIndex)),
+              .int(Int64(record.segmentIndex)),
+              .text(record.segmentHash), .text(record.summary), .double(record.updatedAt)])
+    }
+
+    public func chapterSegments(docID: String, sectionIndex: Int) throws -> [ChapterSegmentRecord] {
+        let rows = try db.query("""
+        SELECT doc_id, section_index, segment_index, segment_hash, summary, updated_at
+        FROM \(Self.chapterSegmentsTable)
+        WHERE doc_id = ? AND section_index = ? ORDER BY segment_index
+        """, [.text(docID), .int(Int64(sectionIndex))])
+        return rows.map {
+            ChapterSegmentRecord(
+                docID: $0["doc_id"]?.stringValue ?? "",
+                sectionIndex: Int($0["section_index"]?.intValue ?? 0),
+                segmentIndex: Int($0["segment_index"]?.intValue ?? 0),
+                segmentHash: $0["segment_hash"]?.stringValue ?? "",
+                summary: $0["summary"]?.stringValue ?? "",
+                updatedAt: $0["updated_at"]?.doubleValue ?? 0)
+        }
+    }
+
+    public func deleteChapterSegments(docID: String, sectionIndex: Int) throws {
+        try db.execute("""
+        DELETE FROM \(Self.chapterSegmentsTable) WHERE doc_id = ? AND section_index = ?
+        """, [.text(docID), .int(Int64(sectionIndex))])
+    }
+
+    // MARK: - Book summaries
+
+    public func upsertBookSummary(_ record: BookSummaryRecord) throws {
+        try db.execute("""
+        INSERT INTO \(Self.bookSummariesTable)
+            (doc_id, summary, outline, chapter_count, source_hash, updated_at)
+        VALUES(?, ?, ?, ?, ?, ?)
+        ON CONFLICT(doc_id) DO UPDATE SET
+            summary = excluded.summary,
+            outline = excluded.outline,
+            chapter_count = excluded.chapter_count,
+            source_hash = excluded.source_hash,
+            updated_at = excluded.updated_at
+        """, [.text(record.docID), .text(record.summary), .text(record.outline),
+              .int(Int64(record.chapterCount)), .text(record.sourceHash),
+              .double(record.updatedAt)])
+    }
+
+    public func bookSummary(docID: String) throws -> BookSummaryRecord? {
+        let rows = try db.query("""
+        SELECT doc_id, summary, outline, chapter_count, source_hash, updated_at
+        FROM \(Self.bookSummariesTable) WHERE doc_id = ? LIMIT 1
+        """, [.text(docID)])
+        return rows.first.map {
+            BookSummaryRecord(
+                docID: $0["doc_id"]?.stringValue ?? "",
+                summary: $0["summary"]?.stringValue ?? "",
+                outline: $0["outline"]?.stringValue ?? "",
+                chapterCount: Int($0["chapter_count"]?.intValue ?? 0),
+                sourceHash: $0["source_hash"]?.stringValue ?? "",
+                updatedAt: $0["updated_at"]?.doubleValue ?? 0)
+        }
+    }
+
+    public func upsertBookSummarySegment(_ record: BookSummarySegmentRecord) throws {
+        try db.execute("""
+        INSERT INTO \(Self.bookSegmentsTable)
+            (doc_id, group_index, group_hash, summary, updated_at)
+        VALUES(?, ?, ?, ?, ?)
+        ON CONFLICT(doc_id, group_index) DO UPDATE SET
+            group_hash = excluded.group_hash,
+            summary = excluded.summary,
+            updated_at = excluded.updated_at
+        """, [.text(record.docID), .int(Int64(record.groupIndex)), .text(record.groupHash),
+              .text(record.summary), .double(record.updatedAt)])
+    }
+
+    public func bookSummarySegments(docID: String) throws -> [BookSummarySegmentRecord] {
+        let rows = try db.query("""
+        SELECT doc_id, group_index, group_hash, summary, updated_at
+        FROM \(Self.bookSegmentsTable) WHERE doc_id = ? ORDER BY group_index
+        """, [.text(docID)])
+        return rows.map {
+            BookSummarySegmentRecord(
+                docID: $0["doc_id"]?.stringValue ?? "",
+                groupIndex: Int($0["group_index"]?.intValue ?? 0),
+                groupHash: $0["group_hash"]?.stringValue ?? "",
+                summary: $0["summary"]?.stringValue ?? "",
+                updatedAt: $0["updated_at"]?.doubleValue ?? 0)
+        }
+    }
+
+    public func deleteBookSummarySegments(docID: String) throws {
+        try db.execute("DELETE FROM \(Self.bookSegmentsTable) WHERE doc_id = ?", [.text(docID)])
+    }
+
+    // MARK: - Summary jobs
+
+    public func upsertSummaryJob(_ record: SummaryJobRecord) throws {
+        try db.execute("""
+        INSERT INTO \(Self.summaryJobTable)
+            (doc_id, status, next_section, total_sections, last_error, updated_at)
+        VALUES(?, ?, ?, ?, ?, ?)
+        ON CONFLICT(doc_id) DO UPDATE SET
+            status = excluded.status,
+            next_section = excluded.next_section,
+            total_sections = excluded.total_sections,
+            last_error = excluded.last_error,
+            updated_at = excluded.updated_at
+        """, [.text(record.docID), .text(record.status.rawValue),
+              .int(Int64(record.nextSection)), .int(Int64(record.totalSections)),
+              .text(record.lastError), .double(record.updatedAt)])
+    }
+
+    public func summaryJob(docID: String) throws -> SummaryJobRecord? {
+        let rows = try db.query("""
+        SELECT doc_id, status, next_section, total_sections, last_error, updated_at
+        FROM \(Self.summaryJobTable) WHERE doc_id = ? LIMIT 1
+        """, [.text(docID)])
+        return rows.first.map {
+            SummaryJobRecord(
+                docID: $0["doc_id"]?.stringValue ?? "",
+                status: BookSummaryJobStatus(rawValue: $0["status"]?.stringValue ?? "") ?? .pending,
+                nextSection: Int($0["next_section"]?.intValue ?? 0),
+                totalSections: Int($0["total_sections"]?.intValue ?? 0),
+                lastError: $0["last_error"]?.stringValue ?? "",
+                updatedAt: $0["updated_at"]?.doubleValue ?? 0)
+        }
+    }
+
+    /// 候选书：未开始、章节未完成、全书摘要待生成或上次失败。
+    /// 已完成且有全书摘要的书不再进入队列。
+    public func summaryCandidates(limit: Int) throws -> [DocumentRecord] {
+        guard limit > 0 else { return [] }
+        let rows = try db.query("""
+        SELECT d.doc_id, d.doc_name, d.digest, d.chapters, d.md_path, d.content_hash
+        FROM \(Self.documentsTable) d
+        LEFT JOIN \(Self.summaryJobTable) j ON j.doc_id = d.doc_id
+        LEFT JOIN \(Self.bookSummariesTable) b ON b.doc_id = d.doc_id
+        WHERE d.md_path != '' AND (
+            j.doc_id IS NULL
+            OR j.status IN ('pending', 'summarizing_book', 'failed')
+            OR (j.status = 'completed' AND b.doc_id IS NULL)
+        )
+        ORDER BY COALESCE(j.updated_at, 0), d.updated_at
+        LIMIT ?
+        """, [.int(Int64(limit))])
+        return rows.map { Self.documentRecord(from: $0) }
+    }
+
+    public func summaryProgress(docID: String) throws -> DocumentSummaryProgress {
+        let total = Int(try db.scalar("""
+        SELECT COUNT(*) FROM \(Self.chapterSummariesTable) WHERE doc_id = ?
+        """, [.text(docID)]).intValue ?? 0)
+        let job = try summaryJob(docID: docID)
+        let book = try bookSummary(docID: docID)
+        return DocumentSummaryProgress(
+            docID: docID,
+            chapterCount: max(total, job?.totalSections ?? 0),
+            completedChapters: total,
+            hasBookSummary: !(book?.summary.isEmpty ?? true),
+            jobStatus: job?.status)
+    }
+
+    /// 上次实际处理时间：跨重启仍遵守 15/5 分钟节流。
+    public func summaryLastTickAt() throws -> Double? {
+        let value = try db.scalar(
+            "SELECT value FROM \(Self.summaryRuntimeTable) WHERE key = 'last_tick_at'").stringValue
+        return value.flatMap(Double.init)
+    }
+
+    public func setSummaryLastTickAt(_ value: Double) throws {
+        try db.execute("""
+        INSERT INTO \(Self.summaryRuntimeTable)(key, value) VALUES('last_tick_at', ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+        """, [.text(String(value))])
+    }
+
+    public func deleteSummaries(docID: String) throws {
+        guard !docID.isEmpty else { return }
+        try db.transaction {
+            try deleteSummaryRowsLocked(docID: docID)
+        }
+    }
+
+    private func deleteSummaryRowsLocked(docID: String) throws {
+        guard !docID.isEmpty else { return }
+        try db.execute("DELETE FROM \(Self.chapterSummariesTable) WHERE doc_id = ?", [.text(docID)])
+        try db.execute("DELETE FROM \(Self.chapterSegmentsTable) WHERE doc_id = ?", [.text(docID)])
+        try db.execute("DELETE FROM \(Self.bookSummariesTable) WHERE doc_id = ?", [.text(docID)])
+        try db.execute("DELETE FROM \(Self.bookSegmentsTable) WHERE doc_id = ?", [.text(docID)])
+        try db.execute("DELETE FROM \(Self.summaryJobTable) WHERE doc_id = ?", [.text(docID)])
     }
 
     // MARK: - Helpers
+
+    private static func documentRecord(from row: [String: SQLValue]) -> DocumentRecord {
+        DocumentRecord(
+            docID: row["doc_id"]?.stringValue ?? "",
+            docName: row["doc_name"]?.stringValue ?? "",
+            digest: row["digest"]?.stringValue ?? "",
+            chapters: row["chapters"]?.stringValue ?? "",
+            mdPath: row["md_path"]?.stringValue ?? "",
+            contentHash: row["content_hash"]?.stringValue ?? "")
+    }
+
+    private static func chapterSummaryRecord(from row: [String: SQLValue]) -> ChapterSummaryRecord {
+        ChapterSummaryRecord(
+            docID: row["doc_id"]?.stringValue ?? "",
+            sectionIndex: Int(row["section_index"]?.intValue ?? 0),
+            heading: row["heading"]?.stringValue ?? "",
+            title: row["title"]?.stringValue ?? "",
+            level: Int(row["level"]?.intValue ?? 1),
+            summary: row["summary"]?.stringValue ?? "",
+            contentHash: row["content_hash"]?.stringValue ?? "",
+            updatedAt: row["updated_at"]?.doubleValue ?? 0)
+    }
+
+    /// 旧库增量补列。SQLite 没有 `ADD COLUMN IF NOT EXISTS`，先查 table_info。
+    private func ensureColumn(table: String, column: String, definition: String) throws {
+        let rows = try db.query("PRAGMA table_info(\(table))")
+        guard !rows.contains(where: { $0["name"]?.stringValue == column }) else { return }
+        try db.execute("ALTER TABLE \(table) ADD COLUMN \(column) \(definition)")
+    }
 
     /// 原项目使用 md5(source)[:12] 作为稳定短哈希，这里保持一致。
     public static func hashSource(_ source: String) -> String {

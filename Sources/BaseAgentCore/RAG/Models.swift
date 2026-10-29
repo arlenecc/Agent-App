@@ -80,14 +80,18 @@ public struct DocumentRecord: Sendable, Equatable {
     public var digest: String
     public var chapters: String
     public var mdPath: String
+    /// 入库时的正文哈希；空字符串表示旧库记录。
+    public var contentHash: String
 
     public init(docID: String, docName: String, digest: String,
-                chapters: String = "", mdPath: String = "") {
+                chapters: String = "", mdPath: String = "",
+                contentHash: String = "") {
         self.docID = docID
         self.docName = docName
         self.digest = digest
         self.chapters = chapters
         self.mdPath = mdPath
+        self.contentHash = contentHash
     }
 }
 
