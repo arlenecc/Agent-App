@@ -288,4 +288,17 @@ LIMIT ?
   `preloadModels` 会提前返回，仍需要空闲计时来启动摘要任务。
 - `summaryCandidates` 排除「已完成但没有章节」的文档（`total_sections = 0`），
   避免无标题纯正文在每次空闲会话重复触发注定失败的 `processBookSummary`。
-- 实测：`swift build` 通过；全量 `swift test` 350 项、20 项环境依赖跳过、0 失败。
+- 复查加固：失败（Markdown 缺失、模型/存储错误、章节摘要与目录不一致）也会
+  推进 `summary_job_state.updated_at`，并保留引擎写入的阶段与 `next_section`；
+  否则队首 10 本持续失败的文档会在每个新会话反复占满候选窗口，后面的书永久饥饿。
+- 复查加固：临时模型在「预加载失败」「加载中被取消」「正常会话结束」三条路径
+  都通过 `unloadAndWait()` 等待权重真正释放后再 `close()`；`MLXLLMService` 与
+  `MLXVLMLLMService` 补齐 `AsyncUnloadableLLMService` 一致性，避免退出流程与
+  仍在执行的 GPU 工作并发。
+- 复查加固：协调器读取候选失败不再用 `try?` 静默返回 `.noWork`，而是返回
+  `.failed` 让会话按连续失败上限收尾；`checkIdleWork()` 在预加载前按页扫描候选，
+  Markdown 不可读的候选会记为失败并推进 `updated_at` 轮转到队尾，避免前 10 本
+  失联文档长期占住窗口导致后面的书饿死；单次最多轮转 100 本，达到上限返回
+  `.rotated`，AppModel 一分钟后重新检查；提前取消的同步也会恢复空闲计时，
+  避免闲时摘要调度永久停摆。
+- 实测：`swift build` 通过；全量 `swift test` 367 项、22 项环境依赖跳过、0 失败。

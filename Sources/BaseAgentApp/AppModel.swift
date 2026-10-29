@@ -359,6 +359,9 @@ final class AppViewModel: ObservableObject {
                                                  aux: wasAuxLoaded)
                     }
                 }
+                // 配置应用会先取消空闲计时；若本次不触发预加载/同步，也必须
+                // 重新计时，否则闲时摘要要等到下一次前台活动才会恢复。
+                self.scheduleIdleUnload()
             }
         }
     }
@@ -518,6 +521,8 @@ final class AppViewModel: ObservableObject {
 
             if self.configGeneration == generation {
                 self.isModelLoading = false
+                // 单槽位重载前已取消空闲计时；重载结束后恢复闲时摘要调度。
+                if !self.isRunning { self.scheduleIdleUnload() }
             }
         }
     }
@@ -627,27 +632,42 @@ final class AppViewModel: ObservableObject {
 
     /// 卸载主模型，保留会话与 RAG；再次对话前需要在配置窗口重新加载。
     func unloadMainModel() {
-        // 生成/加载/预热期间切换 LLM 会让在途请求使用已关闭的模型。
-        guard !isRunning, !isModelLoading, !isWarmingUp, !isDeduplicating else { return }
+        // 生成/加载/预热/维护期间切换 LLM 会让在途请求使用已关闭的模型。
+        guard !isRunning, !isModelLoading, !isWarmingUp, !isDeduplicating,
+              !isSyncing, !isBuildingANN else { return }
+        // 取消待触发的空闲计时，避免刚卸载完又被后台摘要重新拉起模型。
+        cancelIdleUnload()
         agent?.switchLLM(UnloadedLLMService())
         LocalModelFactory.shared.unloadLLMCaches()
         mainModelLoaded = false
         appendLog("[model] 主模型已卸载")
         statusText = "主模型未加载"
+        scheduleIdleUnload()
     }
 
     /// 卸载辅助模型；主模型不受影响。
     func unloadAuxModel() {
-        guard !isRunning, !isModelLoading, !isWarmingUp, !isDeduplicating else { return }
-        // 闲时摘要可能正在使用辅助模型，必须等会话结束再 close，否则会与在途
-        // 生成并发释放权重。
+        guard !isRunning, !isModelLoading, !isWarmingUp, !isDeduplicating,
+              !isSyncing, !isBuildingANN else { return }
+        // 取消待触发的空闲计时，并等当前摘要会话（可能正借用辅助模型）
+        // 彻底结束后再 close，避免与在途生成并发释放同一份权重。
+        cancelIdleUnload()
         Task { [weak self] in
             guard let self else { return }
             await self.stopSummaryIdleSession()
+            // 等待期间用户可能已经开始对话/同步/维护；此时不能再卸载。
+            guard !self.isRunning, !self.isModelLoading, !self.isWarmingUp,
+                  !self.isDeduplicating, !self.isSyncing,
+                  !self.isBuildingANN else {
+                self.appendLog("[model] 前台任务已开始，暂不卸载辅助模型")
+                self.scheduleIdleUnload()
+                return
+            }
             self.agent?.unloadAuxLLM()
             LocalModelFactory.shared.unloadLLMCaches()
             self.auxModelLoaded = false
             self.appendLog("[model] 辅助模型已卸载")
+            self.scheduleIdleUnload()
         }
     }
 
@@ -699,13 +719,18 @@ final class AppViewModel: ObservableObject {
         agent?.discardPersistedPlan()
         plan = nil
         appendLog(wasRunning ? "已请求终止，并清空任务计划" : "任务计划已清空")
-        guard let task else { return }
+        guard let task else {
+            // 没有在途任务：本次操作结束即可恢复空闲计时。
+            scheduleIdleUnload()
+            return
+        }
         Task { [weak self] in
             _ = await task.value
             await MainActor.run {
                 guard let self else { return }
                 self.agent?.discardPersistedPlan()
                 self.plan = nil
+                self.scheduleIdleUnload()
             }
         }
     }
@@ -737,7 +762,16 @@ final class AppViewModel: ObservableObject {
 
         runTask = Task { [weak self, weak agent] in
             guard let self, let agent else { return }
-            let answer = await agent.run(text)
+            // 闲时摘要可能正借用同一个辅助模型（临时会话还会加载/卸载权重）；
+            // 模型服务依赖调用串行，必须等摘要会话彻底退出再开始本轮生成。
+            await self.stopSummaryIdleSession()
+            // 等待期间用户可能已点「终止」，或配置切换已作废旧一轮。
+            let answer: String
+            if Task.isCancelled || self.runGeneration != generation {
+                answer = ""
+            } else {
+                answer = await agent.run(text)
+            }
             await MainActor.run {
                 guard self.runGeneration == generation else { return }
                 self.finishSummaryFilter()
@@ -776,22 +810,41 @@ final class AppViewModel: ObservableObject {
 
     // MARK: 空闲内存回收
 
-    /// 延迟 3 分钟无前台活动后，释放所有可重建的内存：
-    /// 主模型对话 KV、辅助模型权重、Embedding/Reranker/OCR 权重。
-    /// provider / 服务对象保留，下次使用自动按需重载。
-    private func scheduleIdleUnload() {
+    /// 延迟 3 分钟无前台活动后，开启闲时章节摘要会话，并释放可重建的
+    /// Embedding/Reranker/OCR 权重。模型服务对象保留，下次使用自动重载。
+    private func scheduleIdleUnload(delay: UInt64 = 180_000_000_000) {
         idleUnloadTask?.cancel()
         idleUnloadTask = Task { [weak self] in
-            try? await Task.sleep(nanoseconds: 180_000_000_000)
-            guard let self, !Task.isCancelled else { return }
-            guard !self.isRunning, !self.isModelLoading, !self.isWarmingUp,
-                  !self.isSyncing, !self.isDeduplicating, !self.isBuildingANN,
-                  (self.agent?.isBackgroundIdle() ?? true) else { return }
-            // 先开启闲时章节摘要会话（内部按 15/5 分钟节流逐章处理），
-            // 再回收 Embedding/OCR 权重；摘要会话在独立 Task 里继续运行。
-            self.startSummaryIdleSession()
-            await LocalModelFactory.shared.unloadIdleRAGModelWeights()
+            guard let self else { return }
+            var wait = delay
+            while !Task.isCancelled {
+                do {
+                    try await Task.sleep(nanoseconds: wait)
+                } catch {
+                    return
+                }
+                guard !Task.isCancelled else { return }
+                guard self.canStartIdleWork else {
+                    // 前台对话/加载/同步或 Agent 后台任务尚未结束：一分钟后
+                    // 再检查，避免一次短暂忙碌让本次空闲窗口被永久跳过。
+                    wait = 60_000_000_000
+                    continue
+                }
+                // 摘要会话在独立 Task 里继续运行（内部按 15/5 分钟节流逐章处理），
+                // 这里只负责启动和回收按需权重。
+                self.startSummaryIdleSession()
+                await LocalModelFactory.shared.unloadIdleRAGModelWeights()
+                return
+            }
         }
+    }
+
+    /// 闲时摘要/回收的启动条件；忙碌时由上面的计时任务每分钟重试。
+    private var canStartIdleWork: Bool {
+        !isRunning && !isModelLoading && !isWarmingUp && !isSyncing
+            && !isDeduplicating && !isBuildingANN
+            && summaryStopTask == nil
+            && (agent?.isBackgroundIdle() ?? true)
     }
 
     private func cancelIdleUnload() {
@@ -809,12 +862,21 @@ final class AppViewModel: ObservableObject {
               summaryStopTask == nil, let agent else { return }
         summarySessionToken += 1
         let token = summarySessionToken
-        // 常驻条件：已启用且已加载。未加载时走临时模型，结束后释放。
-        let mode: BookSummaryMode = (config.auxEnabled && auxModelLoaded
-            && agent.auxLLM != nil) ? .resident : .temporary
+        // 常驻条件：辅助引擎已启用且当前可用。API 客户端无需预加载，实例存在
+        // 即可复用；本地模型必须已成功预加载，否则交给临时会话加载并及时释放。
+        let canUseResident: Bool
+        if config.auxEnabled, let aux = agent.auxLLM {
+            canUseResident = auxModelLoaded || !(aux is PreloadableLLMService)
+        } else {
+            canUseResident = false
+        }
+        let mode: BookSummaryMode = canUseResident ? .resident : .temporary
         bookSummaryStatusText = "章节摘要：准备中…"
         summarySessionTask = Task.detached(priority: .utility) { [weak self, weak agent] in
             guard let agent, !Task.isCancelled else { return }
+            // 日志闭包会在会话期间多次逃逸执行；先取不可变弱引用，
+            // 避免嵌套 Task 直接捕获外层并发闭包里的 var self。
+            let model = self
             let coordinator: BookSummaryCoordinator
             do {
                 coordinator = try agent.ragEngine.makeBookSummaryCoordinator(
@@ -823,7 +885,7 @@ final class AppViewModel: ObservableObject {
                         LocalModelFactory.shared.makeTransientAuxLLM(config: config)
                     },
                     log: { line in
-                        Task { @MainActor [weak self] in self?.appendLog(line) }
+                        Task { @MainActor in model?.appendLog(line) }
                     })
             } catch {
                 let message = error.localizedDescription
@@ -834,6 +896,30 @@ final class AppViewModel: ObservableObject {
                     self.appendLog("章节摘要：初始化失败 — \(message)")
                 }
                 return
+            }
+            // 加载临时辅助模型前先检查候选：既避免为必然失败的 tick 空转一次
+            // 大模型加载，也把 Markdown 已失联的候选轮转到队尾，防止它们长期
+            // 占住队首导致后面的书永远排不到。
+            switch coordinator.checkIdleWork() {
+            case .noWork:
+                await MainActor.run { [weak self] in
+                    guard let self, self.summarySessionToken == token else { return }
+                    self.summarySessionTask = nil
+                    self.bookSummaryStatusText = "章节摘要：空闲"
+                }
+                return
+            case .rotated:
+                // 本轮只清理了失联文档；一分钟后再检查一次，避免为了必然
+                // 失败的 tick 反复加载辅助模型。
+                await MainActor.run { [weak self] in
+                    guard let self, self.summarySessionToken == token else { return }
+                    self.summarySessionTask = nil
+                    self.bookSummaryStatusText = "章节摘要：稍后继续"
+                    self.scheduleIdleUnload(delay: 60_000_000_000)
+                }
+                return
+            case .ready:
+                break
             }
             await MainActor.run { [weak self] in
                 guard let self, self.summarySessionToken == token else { return }
@@ -854,6 +940,7 @@ final class AppViewModel: ObservableObject {
                 guard let self, self.summarySessionToken == token else { return }
                 self.bookSummaryStatusText = coordinator.statusSnapshot()
             }
+            var consecutiveFailures = 0
             session: while !Task.isCancelled {
                 let outcome = await coordinator.runTick(mode: mode)
                 await MainActor.run { [weak self] in
@@ -865,6 +952,7 @@ final class AppViewModel: ObservableObject {
                 }
                 switch outcome {
                 case .processedChapter, .processedBook:
+                    consecutiveFailures = 0
                     continue session
                 case .throttled(let waitSeconds):
                     // wait=0 表示另一个 tick 正在收尾，短暂让出后重试。
@@ -876,7 +964,16 @@ final class AppViewModel: ObservableObject {
                         break session
                     }
                 case .failed:
-                    // 协调器对同一文档每次会话最多重试 2 次；失败后稍等再换书。
+                    // 连续失败达到上限后及时结束会话；可能是模型配置/存储等
+                    // 系统性故障，继续逐本重试只会空转并占用资源。
+                    consecutiveFailures += 1
+                    if consecutiveFailures >= 2 {
+                        await MainActor.run { [weak self] in
+                            guard let self, self.summarySessionToken == token else { return }
+                            self.appendLog("章节摘要：连续处理失败，结束本次空闲会话")
+                        }
+                        break session
+                    }
                     do { try await Task.sleep(nanoseconds: 30_000_000_000) }
                     catch { break session }
                 case .noWork:
@@ -1072,6 +1169,12 @@ final class AppViewModel: ObservableObject {
             showInfoAlert(title: "向量去重进行中", message: "正在排查或清理重复向量，请稍候。")
             return
         }
+        if isBuildingANN {
+            // 去重会 DELETE chunks/向量行，而 ANN 构建按 rowid 扫描同一批表；
+            // 两者并发可能产出引用已删除切片的索引，必须串行。
+            showInfoAlert(title: "暂不能向量去重", message: "ANN 索引维护正在进行，请稍后再试。")
+            return
+        }
         if isModelLoading || isWarmingUp {
             showInfoAlert(title: "暂不能向量去重", message: "模型正在加载或预热，请稍后再试。")
             return
@@ -1084,7 +1187,28 @@ final class AppViewModel: ObservableObject {
         isDeduplicating = true
         statusText = "正在扫描重复向量…"
         let target = ObjectIdentifier(agent)
-        Task.detached(priority: .utility) {
+        Task.detached(priority: .utility) { [weak self] in
+            // 摘要会话与向量维护共用同一个 SQLite 库；先等它退出，
+            // 避免维护期间仍有摘要写入或在途模型调用。
+            await self?.stopSummaryIdleSession()
+            let stillValid: Bool = await MainActor.run { [weak self] in
+                guard let self, self.isDeduplicating,
+                      let current = self.agent,
+                      ObjectIdentifier(current) == target else { return false }
+                return true
+            }
+            guard stillValid else {
+                await MainActor.run { [weak self] in
+                    guard let self else { return }
+                    self.isDeduplicating = false
+                    if !self.isRunning, !self.isSyncing, !self.isModelLoading,
+                       !self.isWarmingUp, !self.isBuildingANN {
+                        self.statusText = "就绪"
+                    }
+                    self.scheduleIdleUnload()
+                }
+                return
+            }
             let result: Result<VectorDedupPreview, Error>
             do {
                 result = .success(try agent.ragEngine.previewVectorDedupe())
@@ -1129,15 +1253,39 @@ final class AppViewModel: ObservableObject {
 
     /// 用户确认后执行实际删除。
     private func performVectorDedupe(agent: Agent, target: ObjectIdentifier) {
-        guard !isSyncing, !isDeduplicating, !isModelLoading, !isRunning, !isWarmingUp else {
+        guard !isSyncing, !isDeduplicating, !isBuildingANN,
+              !isModelLoading, !isRunning, !isWarmingUp else {
             showInfoAlert(title: "暂不能向量去重", message: "当前有任务正在进行，请稍后再试。")
+            // 扫描阶段已取消空闲计时；拒绝执行后要恢复，否则摘要要等下次前台活动。
+            scheduleIdleUnload()
             return
         }
         cancelIdleUnload()
         isDeduplicating = true
         statusText = "正在清理重复向量…"
         appendLog("[rag] 开始向量去重：清理重复切片，保留入库时间最早的一份")
-        Task.detached(priority: .utility) {
+        Task.detached(priority: .utility) { [weak self] in
+            // 确认弹窗期间配置可能已切换；真正删除前再等摘要会话退出并校验
+            // 目标 Agent 仍然有效，避免旧引擎继续操作已关闭/已换配置的库。
+            await self?.stopSummaryIdleSession()
+            let stillValid: Bool = await MainActor.run { [weak self] in
+                guard let self, self.isDeduplicating,
+                      let current = self.agent,
+                      ObjectIdentifier(current) == target else { return false }
+                return true
+            }
+            guard stillValid else {
+                await MainActor.run { [weak self] in
+                    guard let self else { return }
+                    self.isDeduplicating = false
+                    if !self.isRunning, !self.isSyncing, !self.isModelLoading,
+                       !self.isWarmingUp, !self.isBuildingANN {
+                        self.statusText = "就绪"
+                    }
+                    self.scheduleIdleUnload()
+                }
+                return
+            }
             let result: Result<VectorDedupStats, Error>
             do {
                 result = .success(try agent.ragEngine.deduplicateVectors())
@@ -1216,7 +1364,28 @@ final class AppViewModel: ObservableObject {
         isBuildingANN = true
         statusText = "正在读取 ANN 索引状态…"
         let target = ObjectIdentifier(agent)
-        Task.detached(priority: .utility) {
+        Task.detached(priority: .utility) { [weak self] in
+            // 摘要会话会周期性借用辅助模型；先让它退出，避免构建期间还有
+            // 后台模型调用，也避免配置切换后旧引擎与新 Agent 同时访问库。
+            await self?.stopSummaryIdleSession()
+            let stillValid: Bool = await MainActor.run { [weak self] in
+                guard let self, self.isBuildingANN,
+                      let current = self.agent,
+                      ObjectIdentifier(current) == target else { return false }
+                return true
+            }
+            guard stillValid else {
+                await MainActor.run { [weak self] in
+                    guard let self else { return }
+                    self.isBuildingANN = false
+                    if !self.isRunning, !self.isSyncing, !self.isDeduplicating,
+                       !self.isModelLoading, !self.isWarmingUp {
+                        self.statusText = "就绪"
+                    }
+                    self.scheduleIdleUnload()
+                }
+                return
+            }
             let status = agent.ragEngine.annIndexStatus()
             await MainActor.run { [weak self] in
                 guard let self else { return }
@@ -1247,6 +1416,8 @@ final class AppViewModel: ObservableObject {
         guard !isSyncing, !isDeduplicating, !isModelLoading, !isRunning, !isWarmingUp else {
             isBuildingANN = false
             showInfoAlert(title: "暂不能构建 ANN 索引", message: "当前有任务正在进行，请稍后再试。")
+            // 读取状态阶段已取消空闲计时；拒绝执行后恢复闲时摘要调度。
+            scheduleIdleUnload()
             return
         }
         cancelIdleUnload()
@@ -1254,7 +1425,28 @@ final class AppViewModel: ObservableObject {
         statusText = "正在构建 ANN 索引…"
         appendLog("[rag] 开始构建 ANN 索引：分块 IVF，块内 k-means + int8 量化；"
             + "构建期间知识检索与状态查询不受影响")
-        Task.detached(priority: .utility) {
+        Task.detached(priority: .utility) { [weak self] in
+            // 确认重建弹窗可能停留很久；真正开跑前再等摘要退出并校验目标
+            // Agent，防止旧引擎在配置切换后继续写同一份索引。
+            await self?.stopSummaryIdleSession()
+            let stillValid: Bool = await MainActor.run { [weak self] in
+                guard let self, self.isBuildingANN,
+                      let current = self.agent,
+                      ObjectIdentifier(current) == target else { return false }
+                return true
+            }
+            guard stillValid else {
+                await MainActor.run { [weak self] in
+                    guard let self else { return }
+                    self.isBuildingANN = false
+                    if !self.isRunning, !self.isSyncing, !self.isDeduplicating,
+                       !self.isModelLoading, !self.isWarmingUp {
+                        self.statusText = "就绪"
+                    }
+                    self.scheduleIdleUnload()
+                }
+                return
+            }
             let result = agent.ragEngine.buildANNIndex { update in
                 Task { @MainActor [weak self] in
                     guard let self, self.isBuildingANN else { return }
@@ -1325,10 +1517,31 @@ final class AppViewModel: ObservableObject {
             return
         }
         let target = ObjectIdentifier(agent)
+        cancelIdleUnload()
         isBuildingANN = true
         statusText = "正在删除 ANN 索引…"
         appendLog("[rag] 开始删除 ANN 索引（删除后检索回退精确扫描）")
-        Task.detached(priority: .utility) {
+        Task.detached(priority: .utility) { [weak self] in
+            // 与构建/去重路径保持一致：先等摘要会话退出，再校验目标 Agent。
+            await self?.stopSummaryIdleSession()
+            let stillValid: Bool = await MainActor.run { [weak self] in
+                guard let self, self.isBuildingANN,
+                      let current = self.agent,
+                      ObjectIdentifier(current) == target else { return false }
+                return true
+            }
+            guard stillValid else {
+                await MainActor.run { [weak self] in
+                    guard let self else { return }
+                    self.isBuildingANN = false
+                    if !self.isRunning, !self.isSyncing, !self.isDeduplicating,
+                       !self.isModelLoading, !self.isWarmingUp {
+                        self.statusText = "就绪"
+                    }
+                    self.scheduleIdleUnload()
+                }
+                return
+            }
             let result: Result<Void, Error>
             do {
                 try agent.ragEngine.dropANNIndex()
@@ -1471,6 +1684,9 @@ final class AppViewModel: ObservableObject {
                     if let restore, restore.main || restore.aux {
                         Task { await self.resumeModelsAfterSync(main: restore.main, aux: restore.aux) }
                     }
+                    // 本次同步在开始前就被取消，模型可能无需恢复；仍要重新
+                    // 计时，否则闲时摘要要等到下一次前台活动才会恢复。
+                    self.scheduleIdleUnload()
                     return
                 }
                 if self.isModelLoading || self.isWarmingUp {
@@ -1481,6 +1697,8 @@ final class AppViewModel: ObservableObject {
                     if let restore, restore.main || restore.aux {
                         Task { await self.resumeModelsAfterSync(main: restore.main, aux: restore.aux) }
                     }
+                    // 同上：同步未真正开始也不能让空闲计时永久停摆。
+                    self.scheduleIdleUnload()
                     return
                 }
                 self.startIngest(agent: agent, force: force,

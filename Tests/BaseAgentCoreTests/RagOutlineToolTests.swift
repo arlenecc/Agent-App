@@ -148,9 +148,53 @@ final class RagOutlineToolTests: XCTestCase {
         XCTAssertFalse(result.output.contains("全书摘要:"))
     }
 
+    func testRagOutlineReportsNoChaptersForPlainTextDocument() async throws {
+        try write("""
+        这是一段没有章节标题的纯正文。
+
+        另一段继续说明内容。
+        Additional sentences make the body long enough for indexing, so the document is kept in the knowledge base.
+        """, relativePath: "plain.md")
+        let engine = makeEngine()
+        _ = await engine.ingest()
+
+        let tool = RagOutlineTool(config: config, engine: engine)
+        let result = try await tool.run(["book_name": .string("plain.md")])
+        XCTAssertTrue(result.success, result.error)
+        XCTAssertTrue(result.output.contains("章节摘要进度: 0/0"), result.output)
+        XCTAssertTrue(result.output.contains("无可识别章节"), result.output)
+        XCTAssertFalse(result.output.contains("后台仍在补充"), result.output)
+    }
+
+    func testEnrichedOutlineCanBeLoadedDirectlyFromRecord() async throws {
+        try write("""
+        # 第一章 水果
+
+        苹果和香蕉都是常见水果。
+        Additional sentences make the body long enough for indexing, so the document is kept in the knowledge base.
+        """, relativePath: "book.md")
+        let engine = makeEngine()
+        _ = await engine.ingest()
+        guard let record = engine.getDocumentOutline(docName: "book.md") else {
+            return XCTFail("入库后应能查到文档记录")
+        }
+        let enriched = engine.getEnrichedOutline(for: record)
+        XCTAssertEqual(enriched?.record.docID, record.docID)
+    }
+
     func testRagOutlineListsAmbiguousCandidates() async throws {
-        try write("# 第一章 甲报告\n\nbookA 的独有正文。", relativePath: "bookA/report.md")
-        try write("# 第一章 乙报告\n\nbookB 的独有正文。", relativePath: "bookB/report.md")
+        try write("""
+        # 第一章 甲报告
+
+        bookA 的独有正文。
+        Additional sentences make the body long enough for indexing, so the document is kept in the knowledge base.
+        """, relativePath: "bookA/report.md")
+        try write("""
+        # 第一章 乙报告
+
+        bookB 的独有正文。
+        Additional sentences make the body long enough for indexing, so the document is kept in the knowledge base.
+        """, relativePath: "bookB/report.md")
         let engine = makeEngine()
         _ = await engine.ingest()
 

@@ -2215,17 +2215,26 @@ public final class RAGEngine {
     /// 增强目录：修复后的 TOC + 已完成的章节/全书摘要。
     public func getEnrichedOutline(docName: String) -> EnrichedDocumentOutline? {
         guard case .found(let record) = lookupDocument(docName) else { return nil }
+        return getEnrichedOutline(for: record)
+    }
+
+    /// 按已解析的记录读取增强目录：用 `doc_id` 直接命中，避免同名文档二次查找
+    /// 产生歧义，也不会在两次查询之间被路径变化影响。
+    public func getEnrichedOutline(for record: DocumentRecord) -> EnrichedDocumentOutline? {
+        guard !record.docID.isEmpty else { return nil }
         return try? withStore { store in
-            let chapters = try store.chapterSummaries(docID: record.docID)
-            let book = try store.bookSummary(docID: record.docID)
-            let progress = try store.summaryProgress(docID: record.docID)
+            // 以库内当前行为准；记录可能来自较早的查询。
+            let current = try store.document(docID: record.docID) ?? record
+            let chapters = try store.chapterSummaries(docID: current.docID)
+            let book = try store.bookSummary(docID: current.docID)
+            let progress = try store.summaryProgress(docID: current.docID)
             let outline = book?.outline.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             return EnrichedDocumentOutline(
-                record: record,
+                record: current,
                 chapterSummaries: chapters,
                 bookSummary: book,
                 jobProgress: progress,
-                repairedTOC: outline.isEmpty ? record.digest : outline)
+                repairedTOC: outline.isEmpty ? current.digest : outline)
         }
     }
 

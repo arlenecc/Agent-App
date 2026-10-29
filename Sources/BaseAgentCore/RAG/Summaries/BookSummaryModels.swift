@@ -17,6 +17,16 @@ public enum BookSummaryMode: String, Sendable, Equatable {
     }
 }
 
+/// 空闲会话开始前对候选队列的检查结果。
+public enum BookSummaryIdleAvailability: Sendable, Equatable {
+    /// 没有待处理文档。
+    case noWork
+    /// 队首已有可读候选，可以加载辅助模型。
+    case ready
+    /// 本轮只把不可读候选轮转到队尾，稍后应再次检查。
+    case rotated
+}
+
 public enum BookSummaryJobStatus: String, Sendable, Equatable {
     /// 仍有章节未摘要。
     case pending

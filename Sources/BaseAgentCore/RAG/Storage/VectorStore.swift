@@ -1314,6 +1314,12 @@ public final class VectorStore: @unchecked Sendable {
                 }
                 // 新 doc_id 也可能是首次出现；清一次无副作用。
                 try deleteSummaryRowsLocked(docID: docID)
+            } else {
+                // 正文未变但缓存路径变化：下面会删掉旧 doc_id 的文档行，
+                // 其摘要必须同步清理，避免成为永远无法访问的孤儿数据。
+                for id in staleIDs where !id.isEmpty && id != docID {
+                    try deleteSummaryRowsLocked(docID: id)
+                }
             }
 
             try db.execute("DELETE FROM \(Self.documentsTable) WHERE doc_id = ?", [.text(docID)])
@@ -1498,6 +1504,21 @@ public final class VectorStore: @unchecked Sendable {
             [.text(docID), .int(Int64(sectionIndex))])
     }
 
+    /// 目录收缩后清理越界章节：摘要与分段一起删除，避免进度被旧数据抬高。
+    public func deleteChapterSummaries(docID: String, fromSectionIndex: Int) throws {
+        guard !docID.isEmpty else { return }
+        try db.transaction {
+            try db.execute("""
+            DELETE FROM \(Self.chapterSummariesTable)
+            WHERE doc_id = ? AND section_index >= ?
+            """, [.text(docID), .int(Int64(max(0, fromSectionIndex)))])
+            try db.execute("""
+            DELETE FROM \(Self.chapterSegmentsTable)
+            WHERE doc_id = ? AND section_index >= ?
+            """, [.text(docID), .int(Int64(max(0, fromSectionIndex)))])
+        }
+    }
+
     // MARK: - Chapter segments
 
     public func upsertChapterSegment(_ record: ChapterSegmentRecord) throws {
@@ -1661,15 +1682,23 @@ public final class VectorStore: @unchecked Sendable {
     }
 
     public func summaryProgress(docID: String) throws -> DocumentSummaryProgress {
-        let total = Int(try db.scalar("""
-        SELECT COUNT(*) FROM \(Self.chapterSummariesTable) WHERE doc_id = ?
-        """, [.text(docID)]).intValue ?? 0)
         let job = try summaryJob(docID: docID)
+        let total = Int(try db.scalar("""
+        SELECT COUNT(*) FROM \(Self.chapterSummariesTable)
+        WHERE doc_id = ? AND summary != ''
+        """, [.text(docID)]).intValue ?? 0)
+        // 任务记录了当前目录的实际章节总数；不能用摘要行数反推，
+        // 否则目录收缩后遗留的旧行会把进度抬高到 total 之外。
+        let chapterCount = job?.totalSections ?? total
+        let completed = Int(try db.scalar("""
+        SELECT COUNT(*) FROM \(Self.chapterSummariesTable)
+        WHERE doc_id = ? AND summary != '' AND section_index < ?
+        """, [.text(docID), .int(Int64(max(0, chapterCount)))]).intValue ?? 0)
         let book = try bookSummary(docID: docID)
         return DocumentSummaryProgress(
             docID: docID,
-            chapterCount: max(total, job?.totalSections ?? 0),
-            completedChapters: total,
+            chapterCount: max(chapterCount, 0),
+            completedChapters: max(completed, 0),
             hasBookSummary: !(book?.summary.isEmpty ?? true),
             jobStatus: job?.status)
     }

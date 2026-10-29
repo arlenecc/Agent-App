@@ -1,4 +1,5 @@
 import Foundation
+import MLX
 import MLXVLM
 import MLXLMCommon
 
@@ -8,7 +9,8 @@ import MLXLMCommon
 /// 支持工具定义、thinking 标签拆分与流式输出。每个请求重建完整 prompt，
 /// 不做跨轮 KV 复用（VLM 容器的多模态 prepare 与纯文本缓存不兼容）。
 public final class MLXVLMLLMService: LLMService, PreloadableLLMService,
-                                     ClosableLLMService, @unchecked Sendable {
+                                     ClosableLLMService, AsyncUnloadableLLMService,
+                                     @unchecked Sendable {
     public let directory: URL
     public let modelName: String
     public let contextWindow: Int
@@ -60,6 +62,13 @@ public final class MLXVLMLLMService: LLMService, PreloadableLLMService,
 
     public func close() {
         Task { await state.unload() }
+    }
+
+    /// 等待 GPU 队列排空与容器释放；退出与临时摘要会话结束都依赖它。
+    public func unloadAndWait() async {
+        MLX.Stream.gpu.synchronize()
+        await state.unload()
+        MLX.Stream.gpu.synchronize()
     }
 
     public func chatStream(messages: [ChatMessage],

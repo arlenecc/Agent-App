@@ -118,7 +118,7 @@ public final class RagOutlineTool: AgentTool {
             }
             return .ok(lines.joined(separator: "\n"))
         case .found(let record):
-            guard let enriched = engine.getEnrichedOutline(docName: record.docName) else {
+            guard let enriched = engine.getEnrichedOutline(for: record) else {
                 return .fail("文档 \(record.docName) 没有可用大纲")
             }
             return .ok(Self.format(enriched))
@@ -129,16 +129,21 @@ public final class RagOutlineTool: AgentTool {
 
     private static func format(_ enriched: EnrichedDocumentOutline) -> String {
         let record = enriched.record
-        let summaries = enriched.chapterSummaries
         let parsedChapters = parseChapters(record.chapters)
-        let total = max(enriched.jobProgress.chapterCount, summaries.count,
-                        parsedChapters.count)
+        // 任务记录的是当前目录的章节总数；越界的旧摘要（目录收缩遗留）
+        // 不能算进进度，也不能出现在输出里。
+        let total = max(enriched.jobProgress.chapterCount, parsedChapters.count)
+        let summaries = total > 0
+            ? enriched.chapterSummaries.filter { $0.sectionIndex < total }
+            : []
         let completed = summaries.filter { !$0.summary.isEmpty }.count
         let hasBookSummary = !(enriched.bookSummary?.summary.isEmpty ?? true)
         let state: String
         if hasBookSummary {
             state = "全书摘要已完成"
-        } else if completed < total || total == 0 {
+        } else if total == 0 {
+            state = "无可识别章节"
+        } else if completed < total {
             state = "后台仍在补充"
         } else {
             state = "等待生成全书摘要"
@@ -153,7 +158,7 @@ public final class RagOutlineTool: AgentTool {
             lines.append(book.summary)
         } else if !summaries.isEmpty {
             lines.append("")
-            lines.append("内容概览（基于已完成章节摘要，后台仍在补充）:")
+            lines.append("内容概览（基于已完成章节摘要）:")
             for summary in summaries.prefix(20) where !summary.summary.isEmpty {
                 lines.append("- [\(summary.heading)] \(summary.summary)")
             }
@@ -170,7 +175,7 @@ public final class RagOutlineTool: AgentTool {
             }
         }
 
-        let tree = chapterTree(enriched)
+        let tree = chapterTree(enriched, summaries: summaries)
         if !tree.isEmpty {
             lines.append("")
             lines.append("章节结构:")
@@ -179,10 +184,11 @@ public final class RagOutlineTool: AgentTool {
         return lines.joined(separator: "\n")
     }
 
-    private static func chapterTree(_ enriched: EnrichedDocumentOutline) -> String {
+    private static func chapterTree(_ enriched: EnrichedDocumentOutline,
+                                    summaries visibleSummaries: [ChapterSummaryRecord]) -> String {
         let nodes = parseChapters(enriched.record.chapters)
         let summaries = Dictionary(
-            enriched.chapterSummaries.map { ($0.sectionIndex, $0) },
+            visibleSummaries.map { ($0.sectionIndex, $0) },
             uniquingKeysWith: { first, _ in first })
         if !nodes.isEmpty {
             let lines = nodes.enumerated().map { index, node -> String in
@@ -194,7 +200,7 @@ public final class RagOutlineTool: AgentTool {
             }
             return String(lines.joined(separator: "\n").prefix(20_000))
         }
-        let summaryLines = enriched.chapterSummaries
+        let summaryLines = visibleSummaries
             .sorted { $0.sectionIndex < $1.sectionIndex }
             .map { summary -> String in
                 let indent = String(repeating: "  ", count: max(0, min(summary.level - 1, 5)))

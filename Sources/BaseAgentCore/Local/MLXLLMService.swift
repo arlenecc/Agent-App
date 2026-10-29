@@ -9,7 +9,8 @@ import MLXLMCommon
 /// 历史被折叠/回滚时由内核调用 `invalidateKVCache()` 丢弃缓存。
 /// 模型权重通过 `ModelContainer` 单例复用；调用串行由 Agent 保证。
 public final class MLXLLMService: LLMService, PreloadableLLMService,
-    WarmupLLMService, ClosableLLMService, KVCacheInvalidating, @unchecked Sendable {
+    WarmupLLMService, ClosableLLMService, KVCacheInvalidating,
+    AsyncUnloadableLLMService, @unchecked Sendable {
     public let identifier: String
     public let supportsTools = true
     public let contextWindow: Int

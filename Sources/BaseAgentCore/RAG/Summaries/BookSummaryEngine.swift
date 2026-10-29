@@ -237,18 +237,34 @@ public final class BookSummaryEngine: @unchecked Sendable {
         }
 
         let job = try store.summaryJob(docID: document.docID)
-        var index = max(0, job?.nextSection ?? 0)
-        if job == nil || job?.totalSections != total {
-            try store.upsertSummaryJob(SummaryJobRecord(
-                docID: document.docID,
-                status: job?.status == .completed ? .completed : .pending,
-                nextSection: min(index, total), totalSections: total,
-                lastError: job?.lastError ?? "", updatedAt: now.timeIntervalSince1970))
-        } else if job?.status == .completed {
+        if job?.status == .completed, job?.totalSections == total {
             return ChapterProcessResult(
                 sectionIndex: max(0, total - 1), totalSections: total,
                 chapterCompleted: true, bookCompleted: true,
                 titleRepaired: resolved.hadRepairs, summary: "")
+        }
+
+        var stored = try store.chapterSummaries(docID: document.docID)
+        // 目录修复可能收缩章节数：越界的旧摘要不会再被覆盖，先清掉。
+        if stored.contains(where: { $0.sectionIndex >= total }) {
+            try? store.deleteChapterSummaries(docID: document.docID,
+                                             fromSectionIndex: total)
+            stored.removeAll { $0.sectionIndex >= total }
+        }
+        let storedByIndex = Dictionary(
+            stored.map { ($0.sectionIndex, $0) },
+            uniquingKeysWith: { first, _ in first })
+        let missing = Self.firstMissingSectionIndex(
+            sections: resolved.sections, storedByIndex: storedByIndex)
+        // next_section 只在正常推进时可信；目录/正文变化或任务缺失时，
+        // 以第一个真正缺少有效摘要的章节为准，避免跳过需要重做的章节。
+        var index = max(0, job?.nextSection ?? 0)
+        if missing < index { index = missing }
+        if job == nil || job?.totalSections != total || job?.nextSection != index {
+            try store.upsertSummaryJob(SummaryJobRecord(
+                docID: document.docID, status: .pending,
+                nextSection: index, totalSections: total,
+                lastError: job?.lastError ?? "", updatedAt: now.timeIntervalSince1970))
         }
 
         while index < total {
@@ -343,6 +359,9 @@ public final class BookSummaryEngine: @unchecked Sendable {
                 llm: llm, temperature: 0.2,
                 isCancelled: isCancelled)
             let summary = Self.normalizeSummary(raw, maxLength: 80, preferredCut: 20)
+            guard !summary.isEmpty else {
+                throw AgentError.llm("辅助模型未返回有效的分段摘要")
+            }
             try store.upsertChapterSegment(ChapterSegmentRecord(
                 docID: document.docID, sectionIndex: section.index,
                 segmentIndex: segmentIndex, segmentHash: hash,
@@ -412,17 +431,44 @@ public final class BookSummaryEngine: @unchecked Sendable {
                                              digest: resolved.digest,
                                              chapters: resolved.chaptersJSON)
         }
+        let sections = resolved.sections
+        guard !sections.isEmpty else {
+            try store.upsertSummaryJob(SummaryJobRecord(
+                docID: document.docID, status: .completed, nextSection: 0,
+                totalSections: 0, lastError: "", updatedAt: now.timeIntervalSince1970))
+            throw AgentError.storage("本书没有可识别章节，跳过全书摘要")
+        }
         let stored = try store.chapterSummaries(docID: document.docID)
-        let ordered = resolved.sections.compactMap { section in
-            stored.first {
-                $0.sectionIndex == section.index && !$0.summary.isEmpty
+        if stored.contains(where: { $0.sectionIndex >= sections.count }) {
+            try? store.deleteChapterSummaries(docID: document.docID,
+                                             fromSectionIndex: sections.count)
+        }
+        let storedByIndex = Dictionary(
+            stored.map { ($0.sectionIndex, $0) },
+            uniquingKeysWith: { first, _ in first })
+        var chapters: [ChapterSummaryRecord] = []
+        var firstMissing: Int?
+        for (offset, section) in sections.enumerated() {
+            if let row = storedByIndex[section.index],
+               row.contentHash == section.contentHash,
+               !row.summary.isEmpty {
+                chapters.append(row)
+            } else if firstMissing == nil {
+                firstMissing = offset
             }
         }
-        let chapters = ordered.isEmpty
-            ? stored.filter { !$0.summary.isEmpty }.sorted { $0.sectionIndex < $1.sectionIndex }
-            : ordered
-        guard !chapters.isEmpty else {
-            throw AgentError.storage("本书尚未生成章节摘要")
+        if let firstMissing {
+            // 目录修复或正文变化导致摘要与当前章节对不上：退回逐章阶段，
+            // 不能拿旧摘要生成全书摘要。
+            try store.upsertSummaryJob(SummaryJobRecord(
+                docID: document.docID, status: .pending, nextSection: firstMissing,
+                totalSections: sections.count,
+                lastError: "章节摘要与当前目录不一致，需要重新摘要",
+                updatedAt: now.timeIntervalSince1970))
+            throw AgentError.storage("章节摘要与当前目录不一致，已回到逐章处理")
+        }
+        guard chapters.count == sections.count else {
+            throw AgentError.storage("本书尚未生成完整的章节摘要")
         }
 
         let lines = chapters.map { "- [\($0.heading)] \($0.summary)" }
@@ -456,6 +502,9 @@ public final class BookSummaryEngine: @unchecked Sendable {
                 prompt: prompt, llm: llm, temperature: 0.2,
                 isCancelled: isCancelled)
             let summary = Self.normalizeSummary(raw, maxLength: 300, preferredCut: 100)
+            guard !summary.isEmpty else {
+                throw AgentError.llm("辅助模型未返回有效的分段摘要")
+            }
             try store.upsertBookSummarySegment(BookSummarySegmentRecord(
                 docID: document.docID, groupIndex: groupIndex, groupHash: hash,
                 summary: summary, updatedAt: now.timeIntervalSince1970))
@@ -473,19 +522,40 @@ public final class BookSummaryEngine: @unchecked Sendable {
             system: "你是专业的书籍摘要助手，只输出正文。",
             prompt: reducePrompt, llm: llm, temperature: 0.2,
             isCancelled: isCancelled)
-        let summary = Self.normalizeBookSummary(raw)
+        var summary = Self.normalizeBookSummary(raw)
+        if summary.count < 100 {
+            // 模型偶尔只回一行标题或极短概览；再给一次明确的长摘要机会，
+            // 但只接受更长的结果，避免重试反而更差。
+            try Self.ensureNotCancelled(isCancelled)
+            let retryPrompt = """
+            上一次全书摘要过短。请输出 300-500 字的中文全书摘要，覆盖主题、结构、核心观点与结论，只输出正文。
+
+            上一次结果：\(summary)
+            """
+            let retryRaw = try await complete(
+                system: "你是专业的书籍摘要助手，只输出正文。",
+                prompt: retryPrompt, llm: llm, temperature: 0.2,
+                isCancelled: isCancelled)
+            let retry = Self.normalizeBookSummary(retryRaw)
+            if retry.count > summary.count { summary = retry }
+        }
+        // 只返回标签（如「摘要：」）或空内容时不能落库，否则任务会被当成完成，
+        // 候选队列永远不再重试这本书。
+        guard !summary.isEmpty else {
+            throw AgentError.llm("辅助模型未返回有效的全书摘要")
+        }
         let sourceHash = Self.shortHash(chapters.map {
             "\($0.sectionIndex):\($0.contentHash):\($0.summary)"
         }.joined(separator: "\n"))
         let record = BookSummaryRecord(
             docID: document.docID, summary: summary, outline: resolved.digest,
-            chapterCount: resolved.sections.count, sourceHash: sourceHash,
+            chapterCount: sections.count, sourceHash: sourceHash,
             updatedAt: now.timeIntervalSince1970)
         try store.upsertBookSummary(record)
         try store.upsertSummaryJob(SummaryJobRecord(
             docID: document.docID, status: .completed,
-            nextSection: max(resolved.sections.count, chapters.count),
-            totalSections: resolved.sections.count,
+            nextSection: max(sections.count, chapters.count),
+            totalSections: sections.count,
             lastError: "", updatedAt: now.timeIntervalSince1970))
         return record
     }
@@ -514,6 +584,17 @@ public final class BookSummaryEngine: @unchecked Sendable {
     }
 
     // MARK: - 工具
+
+    /// 第一个没有“内容哈希匹配且非空”摘要的章节下标；全部有效时返回总数。
+    static func firstMissingSectionIndex(sections: [BookSection],
+                                         storedByIndex: [Int: ChapterSummaryRecord]) -> Int {
+        for (offset, section) in sections.enumerated() {
+            guard let row = storedByIndex[section.index],
+                  row.contentHash == section.contentHash,
+                  !row.summary.isEmpty else { return offset }
+        }
+        return sections.count
+    }
 
     private static func segmentBudget(contextWindow: Int) -> Int {
         min(maxSegmentBudget, max(1024, contextWindow - 1400))

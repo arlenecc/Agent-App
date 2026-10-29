@@ -10,12 +10,15 @@ private final class SummaryStubLLM: LLMService, @unchecked Sendable {
     private var callCountStorage = 0
     private let failOnCall: Int?
     private let response: String
+    private let responseForCall: ((Int) -> String)?
 
     init(contextWindow: Int = 32768, failOnCall: Int? = nil,
-         response: String = String(repeating: "章节内容概括。", count: 8)) {
+         response: String = String(repeating: "章节内容概括。", count: 8),
+         responseForCall: ((Int) -> String)? = nil) {
         self.contextWindow = contextWindow
         self.failOnCall = failOnCall
         self.response = response
+        self.responseForCall = responseForCall
     }
 
     var calls: Int {
@@ -37,6 +40,7 @@ private final class SummaryStubLLM: LLMService, @unchecked Sendable {
         let current = callCountStorage
         prompts.append(messages.last?.content ?? "")
         let shouldFail = failOnCall == current
+        let text = responseForCall?(current) ?? response
         lock.unlock()
 
         return AsyncThrowingStream { continuation in
@@ -44,7 +48,7 @@ private final class SummaryStubLLM: LLMService, @unchecked Sendable {
                 continuation.finish(throwing: AgentError.cancelled)
                 return
             }
-            continuation.yield(LLMStreamEvent(kind: .content, content: self.response))
+            continuation.yield(LLMStreamEvent(kind: .content, content: text))
             continuation.yield(LLMStreamEvent(kind: .done))
             continuation.finish()
         }
@@ -206,5 +210,122 @@ final class BookSummaryEngineTests: XCTestCase {
         XCTAssertEqual(record.chapterCount, sections)
         XCTAssertEqual(try store.summaryJob(docID: document.docID)?.status, .completed)
         XCTAssertGreaterThanOrEqual(stub.calls, groups.count + 1)
+    }
+
+    func testBookSummaryReturnsToChapterPhaseWhenChapterContentChanged() async throws {
+        let store = try makeStore()
+        let document = try insertDocument(store)
+        let engine = BookSummaryEngine(store: store)
+        let markdown = (0..<2).map { index in
+            "# 第\(index + 1)章\n\n" + String(repeating: "正文内容。", count: 20)
+        }.joined(separator: "\n\n")
+        let resolved = engine.resolve(document, markdown: markdown)
+        XCTAssertEqual(resolved.sections.count, 2)
+        for section in resolved.sections {
+            try store.upsertChapterSummary(ChapterSummaryRecord(
+                docID: document.docID, sectionIndex: section.index,
+                heading: section.heading, title: section.title,
+                level: section.level, summary: "过期章节摘要",
+                contentHash: "stale-\(section.index)"))
+        }
+        try store.upsertSummaryJob(SummaryJobRecord(
+            docID: document.docID, status: .summarizingBook,
+            nextSection: 2, totalSections: 2))
+        let stub = SummaryStubLLM(
+            response: String(repeating: "全书内容概括。", count: 50))
+
+        do {
+            _ = try await engine.processBookSummary(
+                document: document, markdown: markdown, llm: stub,
+                now: Date(), isCancelled: { false })
+            XCTFail("章节正文与摘要不一致时不应生成全书摘要")
+        } catch {
+            XCTAssertTrue(error.localizedDescription.contains("逐章"))
+        }
+        XCTAssertEqual(stub.calls, 0)
+        XCTAssertNil(try store.bookSummary(docID: document.docID))
+        let job = try store.summaryJob(docID: document.docID)
+        XCTAssertEqual(job?.status, .pending)
+        XCTAssertEqual(job?.nextSection, 0)
+    }
+
+    func testBookSummaryRejectsLabelOnlyOutputWithoutPersistingEmptySummary() async throws {
+        let store = try makeStore()
+        let document = try insertDocument(store)
+        let engine = BookSummaryEngine(store: store)
+        let markdown = (0..<2).map { index in
+            "# 第\(index + 1)章\n\n" + String(repeating: "正文内容。", count: 20)
+        }.joined(separator: "\n\n")
+        let resolved = engine.resolve(document, markdown: markdown)
+        for section in resolved.sections {
+            try store.upsertChapterSummary(ChapterSummaryRecord(
+                docID: document.docID, sectionIndex: section.index,
+                heading: section.heading, title: section.title,
+                level: section.level,
+                summary: String(repeating: "章节摘要内容。", count: 10),
+                contentHash: section.contentHash))
+        }
+        try store.upsertSummaryJob(SummaryJobRecord(
+            docID: document.docID, status: .summarizingBook,
+            nextSection: resolved.sections.count,
+            totalSections: resolved.sections.count))
+        let stub = SummaryStubLLM(responseForCall: { call in
+            // 第一组（唯一一组）正常，最终 reduce 与重试只返回标签。
+            call == 1 ? String(repeating: "全书内容概括。", count: 50) : "摘要："
+        })
+
+        do {
+            _ = try await engine.processBookSummary(
+                document: document, markdown: markdown, llm: stub,
+                now: Date(), isCancelled: { false })
+            XCTFail("规范化后为空的全书摘要不应写入数据库")
+        } catch {}
+        XCTAssertNil(try store.bookSummary(docID: document.docID))
+        XCTAssertEqual(try store.summaryJob(docID: document.docID)?.status,
+                       .summarizingBook)
+        XCTAssertGreaterThanOrEqual(stub.calls, 2)
+    }
+
+    func testShrunkOutlineRechecksChapterSummariesBeforeBookStage() async throws {
+        let store = try makeStore()
+        let document = try insertDocument(store)
+        let engine = BookSummaryEngine(store: store)
+        let oldMarkdown = [
+            "# 第一章 概述\n\n" + String(repeating: "旧版正文内容。", count: 20),
+            "# 第二章 细节\n\n" + String(repeating: "旧版细节内容。", count: 20),
+            "# 第三章 结论\n\n" + String(repeating: "旧版结论内容。", count: 20),
+        ].joined(separator: "\n\n")
+        let old = engine.resolve(document, markdown: oldMarkdown)
+        XCTAssertEqual(old.sections.count, 3)
+        for section in old.sections {
+            try store.upsertChapterSummary(ChapterSummaryRecord(
+                docID: document.docID, sectionIndex: section.index,
+                heading: section.heading, title: section.title,
+                level: section.level, summary: "旧版章节摘要",
+                contentHash: section.contentHash))
+        }
+        try store.upsertSummaryJob(SummaryJobRecord(
+            docID: document.docID, status: .summarizingBook,
+            nextSection: 3, totalSections: 3))
+
+        // 目录收缩且第一章正文变化：旧摘要全部失效，必须重新逐章摘要，
+        // 不能因为 next_section 已越过新总数就直接进入全书摘要。
+        let newMarkdown = "# 第一章 概述\n\n"
+            + String(repeating: "全新正文内容。", count: 20)
+        let stub = SummaryStubLLM()
+        let result = try await engine.processNextChapter(
+            document: document, markdown: newMarkdown, llm: stub,
+            now: Date(), isCancelled: { false })
+
+        XCTAssertEqual(result.totalSections, 1)
+        XCTAssertGreaterThan(stub.calls, 0)
+        XCTAssertFalse(result.summary.isEmpty)
+        XCTAssertEqual(try store.summaryJob(docID: document.docID)?.status,
+                       .summarizingBook)
+        XCTAssertEqual(try store.chapterSummary(docID: document.docID, sectionIndex: 0)?
+            .summary, result.summary)
+        XCTAssertTrue(try store.chapterSummaries(docID: document.docID)
+            .allSatisfy { $0.sectionIndex < 1 },
+            "目录收缩后越界的旧摘要应被清理")
     }
 }

@@ -165,6 +165,73 @@ final class BookSummaryStoreTests: XCTestCase {
         XCTAssertNil(try store.summaryJob(docID: record.docID))
     }
 
+    func testMovingDocumentPathWithoutContentChangeRemovesOrphanSummaries() throws {
+        let store = try makeStore()
+        let oldPath = directory.appendingPathComponent("old/book.md").path
+        let newPath = directory.appendingPathComponent("new/book.md").path
+        try store.upsertDocument(docName: "book.md", digest: "# 目录", chapters: "[]",
+                                 mdPath: oldPath, contentHash: "v1")
+        let oldID = VectorStore.hashSource(oldPath)
+        try store.upsertChapterSummary(ChapterSummaryRecord(
+            docID: oldID, sectionIndex: 0, title: "第一章", summary: "旧路径摘要"))
+        try store.upsertSummaryJob(SummaryJobRecord(
+            docID: oldID, status: .completed, nextSection: 1, totalSections: 1))
+
+        // 正文未变、仅缓存路径变化：旧文档行会被删除，摘要不能变成孤儿。
+        try store.upsertDocument(docName: "book.md", digest: "# 目录", chapters: "[]",
+                                 mdPath: newPath, contentHash: "v1")
+        let newID = VectorStore.hashSource(newPath)
+        XCTAssertNil(try store.document(docID: oldID))
+        XCTAssertTrue(try store.chapterSummaries(docID: oldID).isEmpty,
+                      "旧 doc_id 的章节摘要应随文档行一起清理")
+        XCTAssertNil(try store.summaryJob(docID: oldID))
+        XCTAssertNotNil(try store.document(docID: newID))
+        XCTAssertTrue(try store.chapterSummaries(docID: newID).isEmpty)
+    }
+
+    func testSummaryProgressIgnoresRowsBeyondJobTotal() throws {
+        let store = try makeStore()
+        let record = doc("book.md")
+        try store.upsertDocument(docName: record.docName, digest: record.digest,
+                                 chapters: record.chapters, mdPath: record.mdPath,
+                                 contentHash: record.contentHash)
+        for index in 0...2 {
+            try store.upsertChapterSummary(ChapterSummaryRecord(
+                docID: record.docID, sectionIndex: index, title: "第\(index + 1)章",
+                summary: "摘要\(index)"))
+        }
+        try store.upsertSummaryJob(SummaryJobRecord(
+            docID: record.docID, status: .summarizingBook,
+            nextSection: 2, totalSections: 2))
+
+        let progress = try store.summaryProgress(docID: record.docID)
+        XCTAssertEqual(progress.chapterCount, 2)
+        XCTAssertEqual(progress.completedChapters, 2,
+                       "目录收缩后越界的旧摘要不应计入进度")
+    }
+
+    func testDeleteChapterSummariesFromIndexRemovesOnlyTail() throws {
+        let store = try makeStore()
+        let record = doc("book.md")
+        try store.upsertDocument(docName: record.docName, digest: record.digest,
+                                 chapters: record.chapters, mdPath: record.mdPath,
+                                 contentHash: record.contentHash)
+        for index in 0...2 {
+            try store.upsertChapterSummary(ChapterSummaryRecord(
+                docID: record.docID, sectionIndex: index, title: "第\(index + 1)章",
+                summary: "摘要\(index)"))
+        }
+        try store.upsertChapterSegment(ChapterSegmentRecord(
+            docID: record.docID, sectionIndex: 2, segmentIndex: 0,
+            segmentHash: "tail-hash", summary: "尾段摘要"))
+
+        try store.deleteChapterSummaries(docID: record.docID, fromSectionIndex: 2)
+        XCTAssertEqual(try store.chapterSummaries(docID: record.docID)
+            .map(\.sectionIndex).sorted(), [0, 1])
+        XCTAssertTrue(try store.chapterSegments(docID: record.docID, sectionIndex: 2).isEmpty)
+        XCTAssertEqual(try store.chapterSegments(docID: record.docID, sectionIndex: 1).count, 0)
+    }
+
     func testLegacyDocumentsTableGetsContentHashColumn() throws {
         let path = directory.appendingPathComponent("legacy.sqlite").path
         let legacy = try SQLiteDatabase(path: path)

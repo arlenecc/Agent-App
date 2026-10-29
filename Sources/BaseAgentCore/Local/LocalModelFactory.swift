@@ -602,7 +602,7 @@ public final class LocalModelFactory: @unchecked Sendable {
                     topK: config.auxTopK,
                     repetitionPenalty: config.auxRepetitionPenalty,
                     enableThinking: config.auxLocalLLMEnableThinking,
-                    contextWindow: config.auxMaxContextTokens,
+                    contextWindow: config.effectiveAuxContextTokens,
                     promptBatchSize: config.auxPromptBatchSize,
                     kvReuse: config.auxKvReuse,
                     kvInt8: config.auxKvCacheInt8
