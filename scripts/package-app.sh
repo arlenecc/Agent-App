@@ -48,6 +48,25 @@ else
   echo "警告：未找到 $EMBEDDING_SRC，App 内不含默认 embedding 模型" >&2
 fi
 
+# 默认 Reranker：jina-reranker-v2-base-multilingual ONNX int8 随 App 分发
+#（model_quantized.onnx 约 267MB）。与 embedding 一样只复制运行时必需文件，
+# 不把 Python 参考脚本与缓存文件打进包。
+RERANKER_NAME="jina-reranker-v2-base-multilingual-onnx"
+RERANKER_SRC="$ROOT/models/$RERANKER_NAME"
+RERANKER_DST="$APP/Contents/Resources/models/$RERANKER_NAME"
+if [[ -d "$RERANKER_SRC" ]]; then
+  mkdir -p "$RERANKER_DST"
+  for file in model_quantized.onnx tokenizer.json tokenizer_config.json \
+              special_tokens_map.json config.json; do
+    if [[ -f "$RERANKER_SRC/$file" ]]; then
+      cp "$RERANKER_SRC/$file" "$RERANKER_DST/"
+    fi
+  done
+  echo "已打包默认 reranker：$RERANKER_NAME"
+else
+  echo "警告：未找到 $RERANKER_SRC，App 内不含默认 reranker" >&2
+fi
+
 # 动态框架：llama（GGUF 进程内推理）。onnxruntime 在本项目中静态链接，
 # 不需要单独拷贝。
 if [[ -e "$PRODUCTS/llama.framework" ]]; then
