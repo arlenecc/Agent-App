@@ -15,7 +15,7 @@ public enum DocumentProfile: Sendable {
     public static func defaultProfile(for url: URL) -> DocumentProfile {
         switch url.pathExtension.lowercased() {
         case "html", "htm", "xhtml", "epub",
-             "docx", "xlsx", "pptx",
+             "docx", "xlsx", "pptx", "doc", "xls", "ppt",
              "csv", "tsv", "json", "jsonl", "md", "markdown", "rst", "tex", "latex":
             return .structured
         default:

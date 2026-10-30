@@ -456,7 +456,8 @@ public final class RAGEngine {
 
     public static let supportedExtensions: Set<String> = [
         "pdf", "txt", "md", "markdown", "html", "htm", "xhtml",
-        "epub", "docx", "xlsx", "pptx", "csv", "json", "rst", "tex", "log",
+        "epub", "docx", "xlsx", "pptx", "doc", "xls", "ppt",
+        "csv", "json", "rst", "tex", "log",
         // 独立图片文件：Apple Vision OCR。
         "png", "jpg", "jpeg", "tiff", "tif", "bmp", "heic", "heif", "webp",
     ]

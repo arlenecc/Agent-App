@@ -173,6 +173,7 @@ public final class DocumentParserRegistry: @unchecked Sendable {
                 VisionPDFParser(),
                 EPUBParser(config: config),
                 OfficeParser(),
+                LegacyOfficeParser(),
                 HTMLParser(),
                 PlainTextParser(),
                 ImageParser(),
