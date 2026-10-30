@@ -14,6 +14,7 @@ macOS 原生自主 Agent。控制流是**三态自动机 + 五级上下文压缩
   - LLM：MLX-LM / MLX-VLM 模型目录、GGUF 文件、ONNX 解码器目录（`input_ids` + `logits`，可选 `past_key_values`）
   - OCR VLM：MLX 模型目录、GGUF + mmproj；ONNX VLM 暂无通用图适配
   - Embedding / Reranker：ONNX 模型目录（含 `tokenizer.json`）、MLX 模型目录或 GGUF 文件
+  - 默认 Embedding 为随 app 打包的 `jina-embeddings-v5-text-nano-mlx-int4`（EuroBERT-210M，int4），未配置时开箱可用；`jina-embeddings-v5-text-nano-onnx-int8` 为可选后端
   - 默认主模型 `models/qwen3.5-4b-agentic-coder-v4-4bit-mlx`；辅助模型默认 `models/Qwen3.5-2B-MLX-4bit`，但默认**不启用**，需要在配置窗口显式勾选「启用」
 - 运行时已随包内置：
   - GGUF：llama.cpp 官方 XCFramework，进程内直接加载模型，不再启动 `llama-server`
@@ -34,7 +35,7 @@ swift run BaseAgent
 swift test --disable-sandbox
 ```
 
-测试覆盖（共 422 个 XCTest；真实模型 E2E 在本地权重存在时随每次测试自动运行，缺少权重或需要外网/GGUF 等环境的用例会跳过）：sqlite-vec 事务写入/回滚、两段式 KNN、FTS5 中文分词、RRF 混合检索、RAG 增量/删除清理、重排序 TopN 决定最终条数（关闭时回到调用方 top_k）、EPUB/DOCX/HTML 解析、扫描版 EPUB 归一化 + OCR、PDF 文本层、Ovis 文本页快路径、NaturalLanguage 切片、切片参数一致性（模型窗口收口、检索呈现上限随切片放大、切片参数变化触发重建）、配置迁移与旧键兼容（含 `auto_preload_main` / `aux_enabled` 默认值、主/辅助 KV 复用与量化键的缺省跟随与读写往返）、Agent 工具循环、ask_user 续跑、checkpoint 同步、code_run 写护栏、L3 去重、大纲围栏，以及摘要溢出保留、代码围栏/中文换行/正文数字保留、技能索引入口回退、空库维度自愈、`models/` 相对路径解析，以及 KV 复用增量与完整 prompt 的逐 token 模板对齐、预热前缀对齐、清空对话时失效 KV cache；GGUF 模型路径/mmproj 解析、进程内 llama.cpp 框架加载、ONNX 缺少权重时的明确报错，合成 ONNX decoder 图的 past/present 管线，简单 HTML 表格转 Markdown、复杂表格保留 HTML、Markdown 语法/缩进保留、纯文本 HTML/实体/噪声清理、空行与空格密度压缩、跨目录副本与 content_hash 去重、手动向量去重保留最早入库切片并写副本 tombstone，以及切片缺失/旧版 manifest/失败页文件的增量重建。每次普通测试都会执行真实模型链路：jina-v3 的切片 → embedding → 256 维 Matryoshka 截断 → 重新归一化 → int8 入库（256B/行）→ 查询 top1；以及 nomic-int8 的 int8 + Matryoshka 512 召回与 fp32 全维（768）基线对比。
+测试覆盖（当前 488 个 XCTest；真实模型 E2E 在本地权重存在时随每次测试自动运行，缺少权重或需要外网/GGUF 等环境的用例会跳过）：sqlite-vec 事务写入/回滚、两段式 KNN、FTS5 中文分词、RRF 混合检索、RAG 增量/删除清理、重排序 TopN 决定最终条数（关闭时回到调用方 top_k）、EPUB/DOCX/HTML 解析、扫描版 EPUB 归一化 + OCR、PDF 文本层、Ovis 文本页快路径、NaturalLanguage 切片、切片参数一致性（模型窗口收口、检索呈现上限随切片放大、切片参数变化触发重建）、配置迁移与旧键兼容（含 `auto_preload_main` / `aux_enabled` 默认值、主/辅助 KV 复用与量化键的缺省跟随与读写往返）、Agent 工具循环、ask_user 续跑、checkpoint 同步、code_run 写护栏、L3 去重、大纲围栏，以及摘要溢出保留、代码围栏/中文换行/正文数字保留、技能索引入口回退、空库维度自愈、`models/` 相对路径解析，以及 KV 复用增量与完整 prompt 的逐 token 模板对齐、预热前缀对齐、清空对话时失效 KV cache；GGUF 模型路径/mmproj 解析、进程内 llama.cpp 框架加载、ONNX 缺少权重时的明确报错，合成 ONNX decoder 图的 past/present 管线，简单 HTML 表格转 Markdown、复杂表格保留 HTML、Markdown 语法/缩进保留、纯文本 HTML/实体/噪声清理、空行与空格密度压缩、跨目录副本与 content_hash 去重、手动向量去重保留最早入库切片并写副本 tombstone，以及切片缺失/旧版 manifest/失败页文件的增量重建。真实模型链路覆盖：jina-v5 的 `Query: `/`Document: ` 前缀 → 128 维截断 → 重新 L2 归一化 → int8 入库（128B/行）→ 查询 top1 与 `rag_search` 全链路；jina-v3 的切片 → embedding → 256 维 Matryoshka 截断 → 重新归一化 → int8 入库（256B/行）→ 查询 top1；以及 nomic-int8 的 int8 + Matryoshka 512 召回与 fp32 全维（768）基线对比。
 
 HTML 与 Office 解析另有专项覆盖：HTML 保存页的本地 iframe / frameset 接力（取正文最多的一份）、big5 等老编码嗅探、依赖 JavaScript 的页面给出明确失败原因、含 `h1` 的 `<header>` 保留、裸文本节点与 `<li>` 内块级元素、结构化清洗档保留 URL/IP 与段落空行；DOCX 编号列表与 `w:br`/`xml:space`、脚注编号与末尾列表、`styles.xml` 样式名解析标题；XLSX 日期与百分比格式、注音跳过、多行单元格不拆表；PPTX 演讲者备注与段内换行。旧版 Office 另有专项覆盖：OLE2 复合文档扇区/FAT/miniFAT 读取与损坏文件拒绝、`.doc` 字号标题/粗斜体/中文、`.xls` BIFF8 共享字符串/日期/百分比/公式与多 sheet、`.ppt` 幻灯片顺序、标题正文、演讲者备注与 Windows-1252 文本，以及 PPT95/加密/空文档/记录超限的明确报错。独立 Markdown 转换另覆盖单文件输出、目录相对结构、同名后缀、单文件失败不中断整批、输出目录跳过与不支持格式拒绝。
 
@@ -51,7 +52,7 @@ HTML 与 Office 解析另有专项覆盖：HTML 保存页的本地 iframe / fram
   - 辅助模型：标题后带「启用」复选框（对应 `aux_enabled`，默认关闭）。本地模式同主模型布局（含独立的「KV复用」「KV量化」开关），默认 `models/Qwen3.5-2B-MLX-4bit`；未启用时「加载模型 / 重新加载」按钮禁用。
   - 启动时按 `auto_preload_main`（默认开启）预加载主模型；辅助模型仅在 `aux_enabled=true` 时加载。关闭主模型启动预加载后，需在配置窗口手动点「加载模型」；同步结束后的模型恢复不受影响。未指定模型时使用默认主模型 `models/qwen3.5-4b-agentic-coder-v4-4bit-mlx`。加载会真正把参数应用到新创建的模型实例。
   - Agent 区底部「运行参数」行：「最大迭代」（`max_iterations`，默认 15，1...50），修改后点该行「应用配置」保存。
-- **配置窗口（知识同步）**：工作目录与知识库目录；Embedding 行 = 类型（FastEmbed / ONNX / MLX / GGUF）+ 本地路径 + 选择… +「语义切片」开关 /「切片大小」/「overlap」（都在「应用配置」「同步知识」之前）；Reranker 行 = 同布局 +「启用重排序」开关 /「TopN」/「阈值」+「向量去重」（排查并清理向量库内重复的切片，保留入库时间最早的一份）+「停止同步」。两行都按可用宽度自动折行（放不下时优先把按钮换到下一行，切片 / 重排控件仍与模型选择同行）。「启用重排序」对应 `rag_rerank_enabled`（默认开启），「TopN」对应 `rag_rerank_top_n`（默认 5，1...20），「阈值」对应 `rag_rerank_threshold`（默认 0.45，0...1），表示 reranker 之后保留的结果数量与分数过滤下限。Reranker 行之后是向量库与 ANN 索引合并行：向量元素类型 / Matryoshka 模式与截断维 /「ANN 检索」与「自动构建」开关 / ANN 索引摘要与「构建 ANN 索引 / 停止构建 / 删除索引」（放不下时整组折行），「重建向量库」按钮固定在该组行末。「ANN 检索」对应 `rag_ann_enabled`，「自动构建」对应 `rag_ann_auto_build`。高级区保留 PDF/EPUB OCR 引擎、OCR 模型（MLX / GGUF / ONNX）、mmproj、归一化/二值化，以及「RAG 参数设置」中的「查询超时」（`rag_query_timeout_seconds`，默认 5s，0 = 关闭）和「同步参数设置」中的「启动时自动同步」（`rag_auto_ingest`，默认关闭；开启后每次启动会自动增量扫描知识库，首次全量同步可能长时间占用 embedding 模型与磁盘 IO）、「同步并发」（`rag_ingest_concurrency`）、「OCR 并发」（`rag_vision_concurrency`）、「MLX 缓存」（`mlx_cache_limit_mb`）与「MLX 上限」（`mlx_memory_limit_mb`，0 = 自动）。向量库待重建时，红色提示显示在该合并行下方。
+- **配置窗口（知识同步）**：工作目录与知识库目录；Embedding 行 = 类型（FastEmbed / ONNX / MLX / GGUF）+ 本地路径 + 选择… +「语义切片」开关 /「切片大小」/「overlap」（都在「应用配置」「同步知识」之前）；Reranker 行 = 同布局 +「启用重排序」开关 /「TopN」/「阈值」+「向量去重」（排查并清理向量库内重复的切片，保留入库时间最早的一份）+「停止同步」。两行都按可用宽度自动折行（放不下时优先把按钮换到下一行，切片 / 重排控件仍与模型选择同行）。「启用重排序」对应 `rag_rerank_enabled`（默认开启），「TopN」对应 `rag_rerank_top_n`（默认 5，1...20），「阈值」对应 `rag_rerank_threshold`（默认 0.45，0...1），表示 reranker 之后保留的结果数量与分数过滤下限。Reranker 行之后是向量库与 ANN 索引合并行：向量元素类型（jina-v5 固定 int8，选择器禁用）/ Matryoshka 模式与截断维 /「ANN 检索」与「自动构建」开关 / ANN 索引摘要与「构建 ANN 索引 / 停止构建 / 删除索引」（放不下时整组折行），「重建向量库」按钮固定在该组行末。「ANN 检索」对应 `rag_ann_enabled`，「自动构建」对应 `rag_ann_auto_build`。高级区保留 PDF/EPUB OCR 引擎、OCR 模型（MLX / GGUF / ONNX）、mmproj、归一化/二值化，以及「RAG 参数设置」中的「查询超时」（`rag_query_timeout_seconds`，默认 5s，0 = 关闭）和「同步参数设置」中的「启动时自动同步」（`rag_auto_ingest`，默认关闭；开启后每次启动会自动增量扫描知识库，首次全量同步可能长时间占用 embedding 模型与磁盘 IO）、「同步并发」（`rag_ingest_concurrency`）、「OCR 并发」（`rag_vision_concurrency`）、「MLX 缓存」（`mlx_cache_limit_mb`）与「MLX 上限」（`mlx_memory_limit_mb`，0 = 自动）。向量库待重建时，红色提示显示在该合并行下方。
   - 高级区的「PDF OCR 设置」行末提供「转换工具」按钮，打开独立窗口，把单个文件或整个目录批量转换为 Markdown。复用知识同步的解析器（PDF / EPUB / HTML / TXT / 图片，Office 支持现代格式 `.docx` / `.xlsx` / `.pptx` 与旧版 `.doc` / `.xls` / `.ppt`），沿用打开窗口时面板上的 OCR / PDF / 归一化设置快照；不写回 `config.json`，也不重建 Agent。目录递归时保留相对子目录结构，输出目录位于输入目录内会自动跳过；同批同名（如 `a.txt` 与 `a.html`）依次生成 `a-2.md`、`a-3.md`；单个文件失败不会中断整批。进度区显示当前文件、当前环节（解析 / 图片归一化 / 图片识别 / 清洗与 Markdown 转换）与总体进度，关闭窗口会取消仍在进行的转换。转换按文件体积分批并发：达到 32MB 的文件单独成批串行，其余文件按同步并发（最多 6）并行；PDF 解析按体积收紧页级 worker / 在途页并分批产图，内嵌大图先按目标尺寸降采样，超过 200MP 回退有界栅格化。转换只到写出 Markdown，不做切片、embedding 与入库。
 - 确认弹窗默认按钮为「拒绝」；`ask_user` 的回答作为工具结果继续同一轮推理。
 - RAG 状态在后台线程查询，不在主线程建库/COUNT；状态只读取来源总数与前 256 个来源名，大知识库不会把全部路径读入内存。连续应用配置只生效最后一次，旧同步完成后只重载它自己的引擎，不会影响新 Agent。
@@ -126,7 +127,7 @@ OvisOCR2 的 MLX 权重使用 `model_type=qwen3_5`（Qwen3.5-0.8B 后训练）�
 3. 递归回退：段落 → 换行 → 句号 → 空格 → token 窗口，严格遵守 token 预算；
 4. 块间按 token 数添加 overlap（计入总预算）。
 
-默认 `chunk_size=800 token`、`overlap=80 token`（10%，含在 800 内）。同步时优先用模型自带 `tokenizer.json` 做精确计数（不含特殊 token），分词器不可用时退回标定过的保守估算器（`EmbeddingTokenEstimator`）：纯中文约 1 字 ≈ 1 token，中英混排约 1.8 字符/token，英文约 3.5 字符/token；因此 800 token 大致对应 800 字中文或 1000–1400 字混排。默认 jina-embeddings-v3 声明窗口为 8192 token，但 embedding 推理前会统一压到 1024 token，默认 800 token 的切片完整计算、不会被截断；若把切片大小调到超过推理输入上限（1024 token，或改用 bge 等更小的 512 窗口模型），同步时会自动压到该上限，overlap 同步压到上限的 10%，设置面板会显示「实际生效：N token」。所有切分路径都在句子结束处断开；旧配置里的默认 500/50 会在加载时自动迁移到 800/80，自定义组合保持不变。
+默认 `chunk_size=800 token`、`overlap=80 token`（10%，含在 800 内）。同步时优先用模型自带 `tokenizer.json` 做精确计数（不含特殊 token），分词器不可用时退回标定过的保守估算器（`EmbeddingTokenEstimator`）：纯中文约 1 字 ≈ 1 token，中英混排约 1.8 字符/token，英文约 3.5 字符/token；因此 800 token 大致对应 800 字中文或 1000–1400 字混排。默认 jina-embeddings-v5（与 jina-v3 一样）声明窗口为 8192 token，但 embedding 推理前会统一压到 1024 token，默认 800 token 的切片完整计算、不会被截断；若把切片大小调到超过推理输入上限（1024 token，或改用 bge 等更小的 512 窗口模型），同步时会自动压到该上限，overlap 同步压到上限的 10%，设置面板会显示「实际生效：N token」。所有切分路径都在句子结束处断开；旧配置里的默认 500/50 会在加载时自动迁移到 800/80，自定义组合保持不变。
 
 切片参数（大小 / overlap / 语义切片开关）只有设置面板一个来源，控件就排在「知识同步配置」的 Embedding 行里（模型类型 / 本地路径之后、「应用配置」之前）：切片环节统一读 `RAGEngine.resolvedChunkingOptions`，检索呈现的单条上限取 `max(配置值, 切片 token × 1.5 + 64)`（不再固定 1500 字符截短），而切片参数、embedding 后端与目录都进 manifest 的 ingest 签名，改任一项都会逐文件重建；「加载主/辅助模型」按钮在白名单（仅 LLM 参数）之外的配置有变化时会走完整 `applyConfig` 重建 Agent 与 RAGEngine，不会出现面板改了切片、运行时仍按旧快照切片。中途停止后已完成的文件保留，下次从剩余文件继续。
 
@@ -144,8 +145,8 @@ OvisOCR2 的 MLX 权重使用 `model_type=qwen3_5`（Qwen3.5-0.8B 后训练）�
 - **两段式 KNN**：先查 `chunk_vectors` 拿 rowid，再回 `chunks` 按 rowid 取正文，绝不 JOIN 虚拟表；
 - **过滤**：不依赖虚拟表过滤，统一 over-fetch 后在第二阶段过滤；定向检索自动放大召回；
 - **混合检索**：FTS5（预分词，含 CJK bigram） + 向量，RRF 融合；
-- **向量元素类型**：`rag_vector_element_type` 支持 int8（默认，256 维 256B/行）/ fp32 / bin（256 维 32B/行，汉明距离）；fp16 因 sqlite-vec 0.1.9 不支持，会在打开向量库时明确报错。int8 用对称量化 `round(x×127)`，入库与查询都包 `vec_int8(?)`；bin 用符号位 + LSB-first 位图，查询包 `vec_bit(?)`；
-- **Matryoshka**：默认 `rag_matryoshka=auto`（nomic / jina-embeddings-v3 启用）；两者都使用 `rag_matryoshka_dim`（默认 256，可选 128 / 256 / 512）指定的截断维；先截断，**强制重新归一化**，再按元素类型量化入库；查询侧执行完全相同的变换；
+- **向量元素类型**：`rag_vector_element_type` 支持 int8（默认）/ fp32 / bin；典型体积为 128 维 int8 128B/行（jina-v5 默认）、256 维 int8 256B/行、256 维 bin 32B/行（汉明距离）；fp16 因 sqlite-vec 0.1.9 不支持，会在打开向量库时明确报错。int8 用对称量化 `round(x×127)`，入库与查询都包 `vec_int8(?)`；bin 用符号位 + LSB-first 位图，查询包 `vec_bit(?)`。jina-v5 provider 通过 `EmbeddingVectorElementConstraining` 强制 int8：即使配置 fp32/bin，`RAGEngine.effectiveVectorElementType` 仍回落 int8，索引指纹、建库、ingest 签名与状态输出全部一致；
+- **Matryoshka**：默认 `rag_matryoshka=auto`（nomic / jina-embeddings-v3 启用）；两者使用 `rag_matryoshka_dim`（默认 128，可选 128 / 256 / 512）指定的截断维。jina-v5 provider 已固定输出 128 维并重新归一化，`MatryoshkaEmbedding.wrap` 直接放行，不会二次截断；其它模型先截断，**强制重新归一化**，再按生效元素类型量化入库；查询侧执行完全相同的变换；
 - sqlite-vec 静态编入进程（`SQLITE_CORE` 模式），无需安装扩展；若初始化失败则显式退化为精确余弦扫描，并在 `rag_status` 中标注。
 
 向量维度、元素类型与索引指纹（`embedding.identifier | dimension | matryoshkaDim | elementType`）写入 `meta`。配置变化时不再自动清空旧索引：非空库标记待重建，向量检索暂停、同步拒绝写入、全文检索仍可用，用户在设置面板执行「重建向量库」后才清空并按当前配置全量重新同步；空库直接采纳新配置。若向量库被删除但 manifest 残留，同步会自动识别并全量重建。空库遇到首次推理才发现的真实维度时会按实际输出维度重建。
@@ -165,8 +166,9 @@ manifest 条目同时记录 `chunkCount` 与 `complete`：增量跳过前会校�
   - GGUF：`LlamaCppLLMService` / `LlamaCppVLMService` 在进程内直接加载权重（Metal GPU offload、Jinja chat template、工具调用、mtmd 多模态），不启动 `llama-server`；Embedding 使用 pooled embedding，Reranker 要求 RANK pooling；
   - ONNX LLM：`ONNXLLMService` 用 onnxruntime-swift 直接运行 decoder 图（`input_ids` / `attention_mask` / `position_ids` + `past_key_values`），支持流式生成与工具调用；ONNX VLM 因缺少通用图适配暂未接入，会明确报错而不是回退 Python。
 - Embedding / Reranker：**onnxruntime-swift**（`OnnxRuntimeBindings`）+ `onnxruntime-swift-package-manager`，或 **mlx-swift-lm** 的 `MLXEmbedders` / `MLXRerankers`，或 GGUF（llama.cpp pooled embedding / RANK pooling）。类型支持 ONNX / FastEmbed / MLX / GGUF。
+  - jina-embeddings-v5-text-nano（默认）：MLX int4 与可选 ONNX int8 都不在通用工厂中。`JinaV5MLXModel` 直接读取 `model.safetensors`（兼容 `weights.safetensors`）推理 EuroBERT-210M（双向 attention + last-token pooling）；ONNX 图内完成 last-token + L2。两类后端统一截前 128 维、**重新 L2 归一化**、int8；文档切片前缀 `Document: `，检索查询前缀 `Query: `（provider 内部只加一次）；provider 强制 int8，Matryoshka 不再包装。
   - jina-embeddings-v3：MLX unified 权重（RoPE + task LoRA）不在 `MLXEmbedders` 默认工厂中，由 `JinaV3MLXModel` 直接读取 `weights.safetensors` 推理；ONNX 单文件用标量 `task_id` 选择任务。两类后端统一加 `passage: ` / `query: ` 前缀，文档切片用 `retrieval.passage`（task_id=1），检索用 `retrieval.query`（task_id=0）。
-  - **输入上限 1024 token**：模型声明窗口（jina-v3 8192、GGUF 2048）远大于默认 800 token 的切片，所有本地 embedding 后端在推理前都统一压到 1024 token（含特殊 token；模型窗口更小时按更小值），切片收口也读同一上限，避免为用不到的窗口容量做无效计算。
+  - **输入上限 1024 token**：模型声明窗口（jina-v5 / jina-v3 8192、GGUF 2048）远大于默认 800 token 的切片，所有本地 embedding 后端在推理前都统一压到 1024 token（含特殊 token；模型窗口更小时按更小值），切片收口也读同一上限，避免为用不到的窗口容量做无效计算。
 - Tokenizer：**swift-transformers** 的 `Tokenizers` 模块，读取模型目录内 `tokenizer.json`。
 - OpenAI 兼容 SSE 按事件边界聚合多行 `data:`（服务端把 JSON 拆成多行时不会丢增量），并忽略注释/心跳行。
 - 本地 MLX 的 `maxTokens` 会按「contextWindow - prompt 估算」动态收紧；文本兜底工具调用只接受本次请求声明过的工具名。
@@ -205,13 +207,13 @@ PDF Ovis 引擎按 `rag_ocr_model_path` / `rag_ocr_model_name` 加载，不受 `
   "aux_max_context_tokens": 32768,
   "embedding_provider": "local",
   "local_embedding_backend": "mlx",
-  "local_embedding_model": "jina-embeddings-v3-mlx-int4",
-  "local_embedding_model_path": "models/jina-embeddings-v3-mlx-int4",
+  "local_embedding_model": "jina-embeddings-v5-text-nano-mlx-int4",
+  "local_embedding_model_path": "models/jina-embeddings-v5-text-nano-mlx-int4",
   "rag_chunk_size": 800,
   "rag_chunk_overlap": 80,
   "rag_vector_element_type": "int8",
   "rag_matryoshka": "auto",
-  "rag_matryoshka_dim": 256,
+  "rag_matryoshka_dim": 128,
   "reranker_provider": "local",
   "local_reranker_backend": "onnx",
   "local_reranker_model": "jina-reranker-v2-base-multilingual-onnx",

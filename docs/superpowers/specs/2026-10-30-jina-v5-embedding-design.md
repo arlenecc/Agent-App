@@ -78,6 +78,9 @@ query text
 - 截断后必须重新归一化，不能复用截断前的范数。
 - 入库与查询共用同一个 provider 实例，保证两侧变换完全一致。
 - V5 provider 的 `dimension` 在加载时即为 128。
+- V5 provider 实现 `EmbeddingVectorElementConstraining`，要求落盘类型 `.int8`；
+  `RAGEngine.effectiveVectorElementType` 以该约束优先，索引指纹、建库、ingest
+  签名与状态输出都使用生效类型。用户配置 fp32/bin 时实际仍按 int8 入库/检索。
 
 ## 组件
 
@@ -92,7 +95,7 @@ query text
 - `matches(_:)`：名称/标识符包含 `jina-embeddings-v5`、`jina_v5`、`jina-v5`
 - `isJinaV5(directory:)`：目录名匹配，或 config 的 `base_model` 匹配，或 `model_type == "eurobert"` 且存在 `prefixes.query/doc` / `pooling` 为 last-token
 - `readConfig(directory:)` 复用 JinaV3 的实现方式
-- `weightsURL(in:)`：`model.safetensors`
+- `weightsURL(in:)`：优先 `weights.safetensors`，回退 `model.safetensors`
 - `truncateAndNormalize(_:dimension:)`：截前 N 维后重新 L2
 
 ### `JinaV5MLXModel`（新增）
@@ -122,6 +125,7 @@ query text
 - `identifier = "local:mlx-embedding:\(modelName)"`
 - `dimension = 128`
 - `maxConcurrentRuns = 1`
+- `requiredVectorElementType = .int8`（实现 `EmbeddingVectorElementConstraining`）
 - `embedDocuments`：加 `Document: ` 后调用 model。
 - `embedQuery`：加 `Query: ` 后调用 model。
 - 懒加载 model + tokenizer；`unload()` 释放。
@@ -137,6 +141,7 @@ query text
   - `pool` 对 2D 输出截前 128 维并重新归一化
   - 若输出 3D，按 attention mask 做 last-token pooling，再截断/归一化
   - 不要求 `task_id` 输入（V5 ONNX 图没有该输入）
+  - 实现 `EmbeddingVectorElementConstraining`，要求 `.int8`
 - `contentTokenLimit` 对 V5 使用 `.jinaV5` 的前缀预留。
 
 ### 前缀策略（修改 `EmbeddingPrefixStrategy`）
@@ -175,8 +180,9 @@ query text
 - `LocalModelRegistry.defaultName(for: .embedding)` 改 V5 MLX。
 - `LocalModelRegistry.applicationModelsDirectory()` 增加 app bundle `Contents/Resources/models`。
 - `LocalModelFactory.makeEmbedding`：MLX 且 `JinaV5Profile.isJinaV5(directory:)` → `JinaV5MLXEmbeddingProvider`；ONNX 继续通用 provider。
-- `SettingsView`：默认路径改 V5；V5 时显示“固定 128 维，Matryoshka 不生效”。
-- `package-app.sh`：复制 V5 MLX 的 `config.json`、`model.safetensors`、`tokenizer.json`、`README.md` 到 `Contents/Resources/models/...`。
+- `SettingsView`：默认路径改 V5；V5 时显示“固定 128 维 + int8（Matryoshka 不生效）”，元素类型选择器禁用，保存时写回 int8。
+- `RAGEngine`：新增 `effectiveVectorElementType`（provider 约束优先，否则用配置）；索引指纹、`VectorStore` 初始化、ingest 签名与 `status` 均读取生效类型。
+- `package-app.sh`：复制 V5 MLX 的 `config.json`、`model.safetensors` / `weights.safetensors`、`tokenizer.json`、`tokenizer_config.json`、`README.md` 到 `Contents/Resources/models/...`。
 
 ## 错误处理
 
@@ -199,7 +205,8 @@ query text
    - 与 Python 参考余弦对齐
 6. `JinaV5ONNXEmbeddingE2ETests`（ONNX 目录存在才跑）：同样断言。
 7. RAG 全链路：V5 入库/检索，int8 blob 长度为 128，Recall@1 正确。
-8. 全量 `swift test` 回归。
+8. 强制 int8：配置 fp32 时 `effectiveVectorElementType`、指纹与 `status` 仍为 int8。
+9. 全量 `swift test` 回归。
 
 ## 风险
 
