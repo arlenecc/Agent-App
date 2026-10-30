@@ -148,13 +148,13 @@ public final class LocalModelFactory: @unchecked Sendable {
         let name = config.localEmbeddingModel.isEmpty
             ? config.ragEmbeddingModel
             : config.localEmbeddingModel
-        // MLX 后端默认用独立的 MLX 权重目录名（jina-embeddings-v3 int4 混合量化，
-        // 1024 维、8192 窗口、支持 Matryoshka 截断），与 ONNX 量化名区分；
-        // 显式配置了 local_embedding_model / _path 时以用户配置为准。
+        // MLX 后端默认用随 App 分发的 jina-v5 int4（768→128 维、8192 窗口、
+        // 前缀即任务类型），与 ONNX 量化名区分；显式配置了
+        // local_embedding_model / _path 时以用户配置为准。
         let effectiveName = (backend == "mlx"
                              && config.localEmbeddingModel.isEmpty
                              && config.localEmbeddingModelPath.isEmpty)
-            ? "jina-embeddings-v3-mlx-int4"
+            ? "jina-embeddings-v5-text-nano-mlx-int4"
             : name
         let value = config.localEmbeddingModelPath.isEmpty
             ? effectiveName
@@ -193,8 +193,11 @@ public final class LocalModelFactory: @unchecked Sendable {
             // 实测多实例只是共享同一块 GPU，吞吐无收益且内存翻倍，
             // 因此固定单实例；并发由 AdaptiveEmbeddingScheduler 串行。
             return embeddings.value(for: key) {
-                // jina-v3-mlx 不在 MLXEmbedders 的工厂里，走自定义架构
-                //（RoPE + task LoRA + 混合量化）。
+                // jina-v5 / jina-v3 都不在 MLXEmbedders 的工厂里，走自定义架构。
+                if JinaV5Profile.isJinaV5(directory: directory) {
+                    return JinaV5MLXEmbeddingProvider(
+                        directory: directory, modelName: value)
+                }
                 if JinaV3Profile.isJinaV3(directory: directory) {
                     return JinaV3MLXEmbeddingProvider(
                         directory: directory, modelName: value)

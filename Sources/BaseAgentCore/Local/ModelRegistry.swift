@@ -102,6 +102,14 @@ public enum LocalModelRegistry {
             }
         }
 
+        // 打包后的 App 把模型放在 `Contents/Resources/models`；
+        // 优先于 App 所在目录外的 models，确保分发版使用内置权重。
+        if let bundled = bundledModelsDirectory(
+            resourceURL: Bundle.main.resourceURL,
+            bundleURL: Bundle.main.bundleURL) {
+            return bundled
+        }
+
         var directory = Bundle.main.bundleURL.standardizedFileURL
         if directory.pathExtension.lowercased() == "app" {
             // `.app` 包本身不能作为模型目录的宿主，从它所在目录开始找。
@@ -117,6 +125,24 @@ public enum LocalModelRegistry {
                 break
             }
             directory = parent
+        }
+        return nil
+    }
+
+    /// App bundle 内的模型目录（`Contents/Resources/models`）。
+    ///
+    /// 参数化 resource/bundle URL 便于用临时目录模拟 bundle 布局；
+    /// 找不到时返回 nil，调用方继续按 App 所在目录搜索。
+    static func bundledModelsDirectory(resourceURL: URL?, bundleURL: URL) -> URL? {
+        let fm = FileManager.default
+        var candidates: [URL] = []
+        if let resourceURL {
+            candidates.append(resourceURL.appendingPathComponent("models", isDirectory: true))
+        }
+        candidates.append(bundleURL.appendingPathComponent(
+            "Contents/Resources/models", isDirectory: true))
+        for candidate in candidates where fm.fileExists(atPath: candidate.path) {
+            return candidate
         }
         return nil
     }

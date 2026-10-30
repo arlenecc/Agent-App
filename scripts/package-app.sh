@@ -29,6 +29,25 @@ for bundle in "$PRODUCTS"/*.bundle; do
   cp -R "$bundle" "$APP/Contents/Resources/"
 done
 
+# 默认 Embedding：jina-embeddings-v5-text-nano int4 MLX 权重随 App 分发
+#（约 143MB）。未显式配置 embedding 模型时开箱可用；只拷贝运行时必需文件，
+# 不把示例脚本与 __pycache__ 打进包。
+EMBEDDING_NAME="jina-embeddings-v5-text-nano-mlx-int4"
+EMBEDDING_SRC="$ROOT/models/$EMBEDDING_NAME"
+EMBEDDING_DST="$APP/Contents/Resources/models/$EMBEDDING_NAME"
+if [[ -d "$EMBEDDING_SRC" ]]; then
+  mkdir -p "$EMBEDDING_DST"
+  for file in config.json model.safetensors weights.safetensors \
+              tokenizer.json tokenizer_config.json README.md; do
+    if [[ -f "$EMBEDDING_SRC/$file" ]]; then
+      cp "$EMBEDDING_SRC/$file" "$EMBEDDING_DST/"
+    fi
+  done
+  echo "已打包默认 embedding：$EMBEDDING_NAME"
+else
+  echo "警告：未找到 $EMBEDDING_SRC，App 内不含默认 embedding 模型" >&2
+fi
+
 # 动态框架：llama（GGUF 进程内推理）。onnxruntime 在本项目中静态链接，
 # 不需要单独拷贝。
 if [[ -e "$PRODUCTS/llama.framework" ]]; then
