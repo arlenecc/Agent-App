@@ -21,6 +21,14 @@ public final class OpenAILLMClient: LLMService, ClosableLLMService {
     /// HTTP 请求彼此无共享会话状态，可并发提交。
     public var supportsConcurrentIsolatedRequests: Bool { true }
 
+    /// 官方 OpenAI（含 Azure）会拒绝未声明的请求字段，且没有通用的「关闭思考」
+    /// 参数；vLLM / llama.cpp / DashScope 等兼容端点支持 Qwen 模板的
+    /// `enable_thinking`，此时才允许携带请求级 thinking 开关。
+    var supportsTemplateThinkingControl: Bool {
+        guard let host = URL(string: baseURL)?.host?.lowercased() else { return false }
+        return !(host == "api.openai.com" || host.hasSuffix(".openai.azure.com"))
+    }
+
     private let http: URLSession
 
     public init(baseURL: String,
@@ -113,6 +121,14 @@ public final class OpenAILLMClient: LLMService, ClosableLLMService {
     public func chatStream(messages: [ChatMessage],
                            tools: [JSONValue],
                            temperature: Double) -> AsyncThrowingStream<LLMStreamEvent, Error> {
+        chatStream(messages: messages, tools: tools, temperature: temperature,
+                   options: .default)
+    }
+
+    public func chatStream(messages: [ChatMessage],
+                           tools: [JSONValue],
+                           temperature: Double,
+                           options: LLMRequestOptions) -> AsyncThrowingStream<LLMStreamEvent, Error> {
         AsyncThrowingStream { continuation in
             let task = Task { [weak self] in
                 guard let self else {
@@ -122,6 +138,7 @@ public final class OpenAILLMClient: LLMService, ClosableLLMService {
                 do {
                     try await self.streamChat(messages: messages, tools: tools,
                                               temperature: temperature,
+                                              options: options,
                                               continuation: continuation)
                     continuation.finish()
                 } catch {
@@ -135,6 +152,7 @@ public final class OpenAILLMClient: LLMService, ClosableLLMService {
     private func streamChat(messages: [ChatMessage],
                             tools: [JSONValue],
                             temperature: Double,
+                            options: LLMRequestOptions,
                             continuation: AsyncThrowingStream<LLMStreamEvent, Error>.Continuation) async throws {
         let url = try makeURL("/chat/completions")
 
@@ -171,6 +189,17 @@ public final class OpenAILLMClient: LLMService, ClosableLLMService {
         }
         if !tools.isEmpty {
             payload["tools"] = .array(tools)
+        }
+        if let enableThinking = options.enableThinking,
+           supportsTemplateThinkingControl {
+            // 不同兼容服务把 Qwen 模板开关放在不同位置：DashScope 等用顶层
+            // `enable_thinking`，vLLM / llama.cpp 用 `chat_template_kwargs`；
+            // 同时发送覆盖两类端点，服务端通常忽略不认识的字段。官方 OpenAI
+            // 不接受这些字段，已在 supportsTemplateThinkingControl 中排除。
+            payload["enable_thinking"] = .bool(enableThinking)
+            payload["chat_template_kwargs"] = .object([
+                "enable_thinking": .bool(enableThinking),
+            ])
         }
 
         let body = try JSONEncoder().encode(JSONValue.object(payload))
