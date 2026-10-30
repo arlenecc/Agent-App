@@ -43,7 +43,7 @@ struct MarkdownConvertView: View {
                 .frame(minWidth: 240)
                 Button("选择…") { state.pickSource() }
                     .help("可选择一个文件，或选择整个目录递归转换\n"
-                        + "Office 仅支持现代格式 .docx / .xlsx / .pptx\n支持："
+                        + "Office 支持 .docx / .xlsx / .pptx 与旧版 .doc / .xls / .ppt\n支持："
                         + MarkdownConverterState.supportedExtensionHint)
 
                 Text("保存目录").font(.caption)
