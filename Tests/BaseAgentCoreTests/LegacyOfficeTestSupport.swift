@@ -800,3 +800,212 @@ struct BIFF8TestBuilder {
         [UInt8(truncatingIfNeeded: value), UInt8(truncatingIfNeeded: value >> 8)]
     }
 }
+
+// MARK: - PowerPoint 97–2003
+
+/// 仅测试使用：构造带 `PowerPoint Document` 流的最小 `.ppt`。
+///
+/// 覆盖 `Document` / `SlideListWithText` / `SlidePersistAtom` / `Slide` /
+/// `SlideAtom` / `Notes` / `NotesAtom` / 文本 atom。文本记录同时写入
+/// SlideListWithText 与 Slide 容器，用于验证顺序优先取文本列表；
+/// `includeSlideList` 为 false 时验证回退到文件顺序。
+struct PowerPointTestBuilder {
+
+    struct TextBlock {
+        let headerType: UInt32
+        let text: String
+        let useBytesAtom: Bool
+
+        init(headerType: UInt32, text: String, useBytesAtom: Bool = false) {
+            self.headerType = headerType
+            self.text = text
+            self.useBytesAtom = useBytesAtom
+        }
+    }
+
+    struct Slide {
+        let slideId: UInt32
+        let blocks: [TextBlock]
+        let inSlideList: Bool
+
+        init(slideId: UInt32, blocks: [TextBlock], inSlideList: Bool = true) {
+            self.slideId = slideId
+            self.blocks = blocks
+            self.inSlideList = inSlideList
+        }
+    }
+
+    struct Notes {
+        let slideIdRef: UInt32
+        let blocks: [TextBlock]
+
+        init(slideIdRef: UInt32, blocks: [TextBlock]) {
+            self.slideIdRef = slideIdRef
+            self.blocks = blocks
+        }
+    }
+
+    var slides: [Slide]
+    var notes: [Notes]
+    var includeDocument: Bool
+    var includeSlideList: Bool
+    /// 非空时只写该类型的一条顶层记录，用于模拟 PowerPoint 95 / 损坏文件。
+    var firstRecordType: UInt16?
+    var firstRecordVersion: UInt8
+    var encrypted: Bool
+    var streamName: String
+    /// 在 Document 内部再包 N 层容器，用于测试记录深度上限。
+    var extraNesting: Int
+    /// 末尾追加 N 条零长度记录，用于测试记录总数上限。
+    var trailingRecords: Int
+    /// OLE2 扇区大小；大量记录时用 4096 以避免 FAT 扇区超过头部 DIFAT 容量。
+    var sectorSize: Int
+
+    init(slides: [Slide] = [],
+         notes: [Notes] = [],
+         includeDocument: Bool = true,
+         includeSlideList: Bool = true,
+         firstRecordType: UInt16? = nil,
+         firstRecordVersion: UInt8 = 0,
+         encrypted: Bool = false,
+         streamName: String = "PowerPoint Document",
+         extraNesting: Int = 0,
+         trailingRecords: Int = 0,
+         sectorSize: Int = 512) {
+        self.slides = slides
+        self.notes = notes
+        self.includeDocument = includeDocument
+        self.includeSlideList = includeSlideList
+        self.firstRecordType = firstRecordType
+        self.firstRecordVersion = firstRecordVersion
+        self.encrypted = encrypted
+        self.streamName = streamName
+        self.extraNesting = extraNesting
+        self.trailingRecords = trailingRecords
+        self.sectorSize = sectorSize
+    }
+
+    func build() throws -> OLE2TestFile {
+        var content = Data()
+        if let firstRecordType {
+            content.append(Self.record(type: firstRecordType,
+                                       version: firstRecordVersion))
+        } else {
+            if includeDocument { content.append(documentRecord()) }
+            for slide in slides { content.append(slideRecord(slide)) }
+            for note in notes { content.append(notesRecord(note)) }
+        }
+        for _ in 0..<trailingRecords {
+            content.append(Self.record(type: 0x0000, payload: Data()))
+        }
+
+        var streams: [OLE2TestBuilder.StreamSpec] = [
+            .init(streamName, content),
+        ]
+        if encrypted {
+            streams.append(.init("EncryptionInfo", Data(repeating: 0, count: 64)))
+        }
+        return try OLE2TestBuilder(sectorSize: sectorSize, streams: streams).build()
+    }
+
+    // MARK: 文档结构
+
+    private func documentRecord() -> Data {
+        var payload = Data()
+        payload.append(Self.record(type: 0x03E9, payload: Data(repeating: 0, count: 8)))
+
+        if includeSlideList {
+            let listed = slides.filter(\.inSlideList)
+            if !listed.isEmpty {
+                var list = Data()
+                for slide in listed {
+                    list.append(Self.slidePersistAtom(slideId: slide.slideId,
+                                                      textCount: UInt32(slide.blocks.count)))
+                    for block in slide.blocks { list.append(textRecords(block)) }
+                }
+                payload.append(Self.container(type: 0x0FF0, instance: 0, payload: list))
+            }
+        }
+
+        for _ in 0..<extraNesting {
+            payload = Self.container(type: 0x0FFF, payload: payload)
+        }
+        return Self.container(type: 0x03E8, payload: payload)
+    }
+
+    private func slideRecord(_ slide: Slide) -> Data {
+        var payload = Data()
+        var atom = Data(repeating: 0, count: 16)
+        Self.writeUInt32(slide.slideId, into: &atom, at: 8)
+        payload.append(Self.record(type: 0x03EF, payload: atom))
+        for block in slide.blocks {
+            payload.append(Self.container(type: 0xF004, payload: textRecords(block)))
+        }
+        return Self.container(type: 0x03EE, payload: payload)
+    }
+
+    private func notesRecord(_ note: Notes) -> Data {
+        var atom = Data(repeating: 0, count: 8)
+        Self.writeUInt32(note.slideIdRef, into: &atom, at: 0)
+        var payload = Self.record(type: 0x03F1, payload: atom)
+        for block in note.blocks { payload.append(textRecords(block)) }
+        return Self.container(type: 0x03F0, payload: payload)
+    }
+
+    private func textRecords(_ block: TextBlock) -> Data {
+        var data = Data()
+        data.append(Self.record(type: 0x0F9F,
+                                payload: Data(Self.u32(block.headerType))))
+        if block.useBytesAtom {
+            let bytes = block.text.data(using: .windowsCP1252) ?? Data(block.text.utf8)
+            data.append(Self.record(type: 0x0FA8, payload: bytes))
+        } else {
+            var payload = Data()
+            for unit in block.text.utf16 {
+                payload.append(contentsOf: Self.u16(unit))
+            }
+            data.append(Self.record(type: 0x0FA0, payload: payload))
+        }
+        return data
+    }
+
+    // MARK: 记录编码
+
+    private static func record(type: UInt16, version: UInt8 = 0,
+                               instance: UInt16 = 0, payload: Data = Data()) -> Data {
+        var data = Data(u16((instance << 4) | UInt16(version & 0x0F)))
+        data.append(contentsOf: u16(type))
+        data.append(contentsOf: u32(UInt32(payload.count)))
+        data.append(payload)
+        return data
+    }
+
+    private static func container(type: UInt16, instance: UInt16 = 0,
+                                  payload: Data) -> Data {
+        record(type: type, version: 0x0F, instance: instance, payload: payload)
+    }
+
+    private static func slidePersistAtom(slideId: UInt32, textCount: UInt32) -> Data {
+        var payload = Data(repeating: 0, count: 20)
+        writeUInt32(slideId, into: &payload, at: 0)
+        writeUInt32(textCount, into: &payload, at: 8)
+        writeUInt32(slideId, into: &payload, at: 12)
+        return record(type: 0x03F3, payload: payload)
+    }
+
+    private static func writeUInt32(_ value: UInt32, into data: inout Data, at offset: Int) {
+        let bytes = u32(value)
+        data.replaceSubrange(offset..<(offset + 4), with: bytes)
+    }
+
+    private static func u16(_ value: UInt16) -> [UInt8] {
+        [UInt8(truncatingIfNeeded: value), UInt8(truncatingIfNeeded: value >> 8)]
+    }
+
+    private static func u32(_ value: UInt32) -> [UInt8] {
+        [UInt8(truncatingIfNeeded: value),
+         UInt8(truncatingIfNeeded: value >> 8),
+         UInt8(truncatingIfNeeded: value >> 16),
+         UInt8(truncatingIfNeeded: value >> 24)]
+    }
+}
