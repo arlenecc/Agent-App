@@ -16,6 +16,7 @@ public final class ONNXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCount
     private let batchSize: Int
     let prefixStrategy: EmbeddingPrefixStrategy
     private let isJinaV3: Bool
+    private let isJinaV5: Bool
     private let state: EmbeddingLoadState
 
     /// ONNXRuntime session.run 线程安全：同实例（共享权重）可并发调用。
@@ -60,13 +61,18 @@ public final class ONNXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCount
             LocalModelRegistry.resolveMaxSequenceLength(directory: directory, defaultValue: 8192))
         self.batchSize = max(1, batchSize)
         let isJina = JinaV3Profile.isJinaV3(directory: directory)
+        let isV5 = JinaV5Profile.isJinaV5(directory: directory)
         self.isJinaV3 = isJina
-        // config 已认出 jina-v3 时固定用 passage: / query: 前缀，
-        // 避免权重目录被改名后前缀族退化成 generic。
-        self.prefixStrategy = isJina
-            ? EmbeddingPrefixStrategy(family: .jina)
-            : EmbeddingPrefixStrategy(
+        self.isJinaV5 = isV5
+        // config 已认出 jina 时固定用模型族前缀，避免权重目录被改名后前缀退化。
+        if isV5 {
+            self.prefixStrategy = EmbeddingPrefixStrategy(family: .jinaV5)
+        } else if isJina {
+            self.prefixStrategy = EmbeddingPrefixStrategy(family: .jina)
+        } else {
+            self.prefixStrategy = EmbeddingPrefixStrategy(
                 modelName: modelName, modelPath: directory.lastPathComponent)
+        }
 
         var resolved: URL?
         var loadError: Error?
@@ -79,11 +85,23 @@ public final class ONNXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCount
         self.preflightError = loadError
 
         // 从 config.json 预读真实维度，避免非 768 模型建库时维度错配。
-        // Jina v3 的 ONNX config 没有 hidden_size，按模型族固定 1024。
-        if isJinaV3 {
+        // Jina v3 的 ONNX config 没有 hidden_size，按模型族固定 1024；
+        // Jina v5 原生 768 维但检索固定截断到 128，不能被 hidden_size 覆盖。
+        if isV5 {
+            self.storedDimension = JinaV5Profile.retrievalDimension
+        } else if isJina {
             self.storedDimension = JinaV3Profile.nativeDimension
-        }
-        if let data = FileManager.default.contents(atPath: directory.appendingPathComponent("config.json").path),
+            if let data = FileManager.default.contents(
+                atPath: directory.appendingPathComponent("config.json").path),
+               let config = JSONValue.parse(String(decoding: data, as: UTF8.self))?.objectValue {
+                let hidden = config["hidden_size"]?.intValue
+                    ?? config["text_config"]?.objectValue?["hidden_size"]?.intValue
+                if let hidden, hidden > 0 {
+                    self.storedDimension = hidden
+                }
+            }
+        } else if let data = FileManager.default.contents(
+            atPath: directory.appendingPathComponent("config.json").path),
            let config = JSONValue.parse(String(decoding: data, as: UTF8.self))?.objectValue {
             let hidden = config["hidden_size"]?.intValue
                 ?? config["text_config"]?.objectValue?["hidden_size"]?.intValue
@@ -186,7 +204,7 @@ public final class ONNXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCount
         return inputs
     }
 
-    /// mean pooling + L2 归一化；输出维度以运行时张量最后一维为准。
+    /// 池化 + L2 归一化：Jina v5 用图内 last-token 输出，其余模型做 mean pooling。
     private func pool(_ tensor: OrtTensor, mask: TokenizedBatch) throws -> [[Float]] {
         let shape = tensor.shape
         if shape.count == 2 {
@@ -194,6 +212,14 @@ public final class ONNXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCount
             let hidden = shape[1]
             guard batch == mask.batchSize else {
                 throw ONNXRuntimeError.shape("输出 batch=\(batch) 与输入 batch=\(mask.batchSize) 不一致")
+            }
+            if isJinaV5 {
+                // V5 图内已做 last-token pooling + L2；这里只截前 128 维并重新归一化。
+                updateDimension(JinaV5Profile.retrievalDimension)
+                return (0..<batch).map { row in
+                    JinaV5Profile.truncateAndNormalize(
+                        Array(tensor.values[(row * hidden)..<((row + 1) * hidden)]))
+                }
             }
             updateDimension(hidden)
             return (0..<batch).map { row in
@@ -214,11 +240,22 @@ public final class ONNXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCount
                 "输出 shape=\(shape) 与输入 batch/token=\(mask.batchSize)/\(mask.sequenceLength) 不一致"
             )
         }
-        updateDimension(hidden)
+        updateDimension(isJinaV5 ? JinaV5Profile.retrievalDimension : hidden)
 
         var result: [[Float]] = []
         result.reserveCapacity(batch)
         for row in 0..<batch {
+            if isJinaV5 {
+                // [B,T,H] 输出时按 V5 约定做 last-token pooling，再截断重归一化。
+                var lastToken = 0
+                for token in 0..<length where mask.attentionMask[row][token] != 0 {
+                    lastToken = token
+                }
+                let offset = (row * length + lastToken) * hidden
+                result.append(JinaV5Profile.truncateAndNormalize(
+                    Array(tensor.values[offset..<(offset + hidden)])))
+                continue
+            }
             var vector = [Float](repeating: 0, count: hidden)
             var count = 0
             for token in 0..<length where mask.attentionMask[row][token] != 0 {
@@ -241,7 +278,10 @@ public final class ONNXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCount
     }
 
     private func preferredOutputName(in session: OrtSession) -> String {
-        let preferred = ["last_hidden_state", "token_embeddings", "sentence_embedding", "embeddings"]
+        let preferred = [
+            "last_hidden_state", "token_embeddings", "sentence_embedding",
+            "embedding", "embeddings",
+        ]
         for name in preferred where session.outputNames.contains(name) {
             return name
         }
@@ -301,10 +341,12 @@ public final class ONNXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCount
         let window = EmbeddingInputLimits.cappedWindow(
             LocalModelRegistry.resolveMaxSequenceLength(
                 directory: directory, defaultValue: 8_192))
-        let reserve = EmbeddingPrefixStrategy(
-            modelName: modelName,
-            modelPath: directory.lastPathComponent).documentPrefixTokenReserve
-        return max(16, window - 2 - reserve)
+        // V5 即使目录被改名也保持 document 前缀预留，切片口径不漂移。
+        let strategy: EmbeddingPrefixStrategy = JinaV5Profile.isJinaV5(directory: directory)
+            ? EmbeddingPrefixStrategy(family: .jinaV5)
+            : EmbeddingPrefixStrategy(
+                modelName: modelName, modelPath: directory.lastPathComponent)
+        return max(16, window - 2 - strategy.documentPrefixTokenReserve)
     }
 
     /// 切片用的精确 token 计数（不含特殊 token）：只加载 tokenizer，不牵动模型权重。
