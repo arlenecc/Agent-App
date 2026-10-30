@@ -133,10 +133,10 @@ public struct AgentConfig: Sendable {
     /// 每个候选句嵌入一遍，显著慢于纯结构切片）；关闭时按标题结构 +
     /// 字符边界递归切片，速度快一个数量级，检索质量损失有限。
     public var ragSemanticChunking: Bool = true
-    /// 默认 jina-embeddings-v3（MLX int4 混合量化）：1024 原生维，
-    /// 支持 Matryoshka 截断（默认取前 256 维并重新归一化）与 8192 上下文。
-    /// 中英文检索均衡，查询 / 切片分别使用 retrieval.query / retrieval.passage。
-    public var ragEmbeddingModel: String = "jina-embeddings-v3-mlx-int4"
+    /// 默认 jina-embeddings-v5-text-nano（MLX int4）：768 原生维，
+    /// 业务固定取前 128 维并重新归一化；查询 / 切片分别使用
+    /// `Query: ` / `Document: ` 前缀，8192 上下文。
+    public var ragEmbeddingModel: String = "jina-embeddings-v5-text-nano-mlx-int4"
     /// 默认 ONNX int8 版 jina reranker：CPU 推理吞吐约为 MLX mxfp8 的 2 倍，
     /// 1024 token 上下文。实测中文重排分数整体偏低（目标块 0.25-0.68），
     /// 需配合 ragRerankThreshold=0.45 使用（原 0.7 阈值会滤掉全部结果）。
@@ -248,14 +248,16 @@ public struct AgentConfig: Sendable {
     public var ragFTSOverfetch: Int = 4
 
     // 向量落盘编码
-    /// 向量元素类型：int8（默认；默认模型截断到 256 维，每行 256B）/ fp32 / bin。
+    /// 向量元素类型：int8（默认；默认模型固定 128 维，每行 128B）/ fp32 / bin。
     /// fp16 仅为配置对齐保留——sqlite-vec 0.1.9 不支持，选择后会报错。
     /// 改变类型会让已有向量失效，需要重建向量库。
     public var ragVectorElementType: VectorElementType = .defaultValue
-    /// Matryoshka 截断策略（auto = 仅 nomic / jina-v3 等已知模型启用）。
+    /// Matryoshka 截断策略（auto = 仅 nomic / jina-v3 等已知模型启用；
+    /// jina-v5 固定 128 维，不参与该设置）。
     public var ragMatryoshka: MatryoshkaMode = .auto
-    /// Matryoshka 截断维：128 / 256 / 512，默认 256。
-    public var ragMatryoshkaDim: Int = 256
+    /// Matryoshka 截断维：128 / 256 / 512，默认 128。
+    /// jina-v5 provider 自身固定 128 维；该值只对 nomic / jina-v3 生效。
+    public var ragMatryoshkaDim: Int = 128
 
     // ANN 向量索引（分块 IVF，见 VectorStoreANN.swift）
     /// 检索是否走 ANN 索引。索引不可用（未构建/维度不符/尾块超预算）时
@@ -306,10 +308,10 @@ public struct AgentConfig: Sendable {
     public var auxLocalLLMEnableThinking: Bool = false
 
     public var embeddingProvider: String = "local"
-    public var localEmbeddingModel: String = "jina-embeddings-v3-mlx-int4"
+    public var localEmbeddingModel: String = "jina-embeddings-v5-text-nano-mlx-int4"
     /// 显式本地目录；非空时优先于模型名。
     /// 使用相对模型根目录的路径，由 LocalModelRegistry 统一解析。
-    public var localEmbeddingModelPath: String = "models/jina-embeddings-v3-mlx-int4"
+    public var localEmbeddingModelPath: String = "models/jina-embeddings-v5-text-nano-mlx-int4"
     /// onnx / fastembed / mlx / gguf
     /// Embedding 后端：mlx（Metal GPU，默认，使用本地 int4/int8 混合量化权重）
     /// / onnx（CPU int8）/ fastembed / gguf。
@@ -629,10 +631,12 @@ public struct AgentConfig: Sendable {
     /// 旧版本配置迁移（docling/marker → ovis、旧 embedding/reranker 名）。
     public mutating func migrate() {
         // docling/marker 已移除：旧配置值统一由 PDFEngine(stored:) 归一化为 ovis。
-        // 默认 embedding 迁移到 jina-embeddings-v3（MLX int4 混合量化）：
-        // 上一版默认是 nomic MLX int8，更早是 bge / nomic 8bit。
-        // 只迁移恰好等于旧默认名/路径的配置，用户显式选择的其他模型保持不变。
-        let defaultEmbeddingName = "jina-embeddings-v3-mlx-int4"
+        // 默认 embedding 迁移到 jina-embeddings-v5-text-nano（MLX int4）：
+        // 上一版默认是 jina-v3，更早是 nomic MLX int8 / bge。
+        // 只迁移恰好等于旧默认的 model + path 组合，用户显式选择的其他
+        // 模型/目录保持不变。
+        let defaultEmbeddingName = "jina-embeddings-v5-text-nano-mlx-int4"
+        let defaultEmbeddingPath = "models/\(defaultEmbeddingName)"
         let legacyEmbeddingNames: Set<String> = [
             "all-MiniLM-L6-v2",
             "sentence-transformers/all-MiniLM-L6-v2",
@@ -646,6 +650,7 @@ public struct AgentConfig: Sendable {
             "nomic-ai/nomic-embed-text-v1.5-mlx-8bit",
             "nomic-embed-text-v1.5-mlx-8bit",
             "nomic-embed-text-v1.5-mlx-int8",
+            "jina-embeddings-v3-mlx-int4",
         ]
         let legacyEmbeddingPaths: Set<String> = [
             "bge-small-zh-v1.5-mlx",
@@ -656,22 +661,37 @@ public struct AgentConfig: Sendable {
             "models/nomic-embed-text-v1.5-mlx-8bit",
             "nomic-embed-text-v1.5-mlx-int8",
             "models/nomic-embed-text-v1.5-mlx-int8",
+            "jina-embeddings-v3-mlx-int4",
+            "models/jina-embeddings-v3-mlx-int4",
         ]
+        let legacyPathSuffixes = [
+            "/bge-small-zh-v1.5-mlx",
+            "/nomic-embed-text-v1.5-mlx",
+            "/nomic-embed-text-v1.5-mlx-8bit",
+            "/nomic-embed-text-v1.5-mlx-int8",
+            "/jina-embeddings-v3-mlx-int4",
+        ]
+        let pathIsLegacy = legacyEmbeddingPaths.contains(localEmbeddingModelPath)
+            || legacyPathSuffixes.contains { localEmbeddingModelPath.hasSuffix($0) }
         // 旧默认都是 MLX 目录；非 MLX 后端不参与这次默认模型切换。
         if Self.normalizeEmbeddingBackend(localEmbeddingBackend) == "mlx" {
             let ragIsLegacy = legacyEmbeddingNames.contains(ragEmbeddingModel)
-            let localIsLegacy = legacyEmbeddingNames.contains(localEmbeddingModel)
-            let pathIsLegacy = legacyEmbeddingPaths.contains(localEmbeddingModelPath)
-                || localEmbeddingModelPath.hasSuffix("/bge-small-zh-v1.5-mlx")
-                || localEmbeddingModelPath.hasSuffix("/nomic-embed-text-v1.5-mlx")
-                || localEmbeddingModelPath.hasSuffix("/nomic-embed-text-v1.5-mlx-8bit")
-                || localEmbeddingModelPath.hasSuffix("/nomic-embed-text-v1.5-mlx-int8")
+            let localModelIsLegacy = legacyEmbeddingNames.contains(localEmbeddingModel)
+            // 完整旧默认：model 与 path 同时等于旧默认才一起迁移。
+            // 旧版只写 rag_embedding_model_path 的配置（model 已是当前默认）
+            // 只修路径，避免 model 指向 V5、path 仍指向 v3。
+            let migrateLocalConfig = (localModelIsLegacy && pathIsLegacy)
+                || (localEmbeddingModel == defaultEmbeddingName && pathIsLegacy)
             if ragIsLegacy { ragEmbeddingModel = defaultEmbeddingName }
-            if localIsLegacy { localEmbeddingModel = defaultEmbeddingName }
-            if pathIsLegacy { localEmbeddingModelPath = "models/\(defaultEmbeddingName)" }
-            // 旧默认 Matryoshka 512 维随默认模型一起收口到 256；显式其它维度不动。
-            if (ragIsLegacy || localIsLegacy || pathIsLegacy), ragMatryoshkaDim == 512 {
-                ragMatryoshkaDim = 256
+            if migrateLocalConfig {
+                localEmbeddingModel = defaultEmbeddingName
+                localEmbeddingModelPath = defaultEmbeddingPath
+            }
+            // 旧默认 512 / 256 维随默认模型一起收口到 V5 固定的 128；
+            // 用户显式配置的其他模型/维度不动。
+            if ragIsLegacy || migrateLocalConfig,
+               ragMatryoshkaDim == 512 || ragMatryoshkaDim == 256 {
+                ragMatryoshkaDim = 128
             }
         }
         // 旧 reranker 默认（HF 名）迁移到本地 MLX mxfp8 目录名。

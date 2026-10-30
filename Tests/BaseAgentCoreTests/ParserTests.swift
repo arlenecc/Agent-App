@@ -951,7 +951,7 @@ final class ParserTests: XCTestCase {
         let config = AgentConfig.load(path.path)
         // docling 已移除：未识别的旧值统一回退到 Apple Vision，避免默默走 Ovis。
         XCTAssertEqual(config.ragPDFEngine, .vision)
-        XCTAssertEqual(config.ragEmbeddingModel, "jina-embeddings-v3-mlx-int4")
+        XCTAssertEqual(config.ragEmbeddingModel, "jina-embeddings-v5-text-nano-mlx-int4")
         // overlap 越界时按默认比例（chunk_size 的 10%）重置：500 / 10 = 50。
         XCTAssertEqual(config.ragChunkOverlap, 50)
     }
@@ -966,15 +966,16 @@ final class ParserTests: XCTestCase {
         XCTAssertEqual(config.ragChunkOverlap, 80)
     }
 
-    /// 新默认值：jina-v3 MLX int4 + Matryoshka 256 + int8、800/80 切片等。
+    /// 新默认值：jina-v5 MLX int4 + 固定 128 维 + int8、800/80 切片等。
     func testConfigNewRAGDefaults() throws {
         let config = AgentConfig()
-        XCTAssertEqual(config.ragEmbeddingModel, "jina-embeddings-v3-mlx-int4")
-        XCTAssertEqual(config.localEmbeddingModel, "jina-embeddings-v3-mlx-int4")
-        XCTAssertEqual(config.localEmbeddingModelPath, "models/jina-embeddings-v3-mlx-int4")
+        XCTAssertEqual(config.ragEmbeddingModel, "jina-embeddings-v5-text-nano-mlx-int4")
+        XCTAssertEqual(config.localEmbeddingModel, "jina-embeddings-v5-text-nano-mlx-int4")
+        XCTAssertEqual(config.localEmbeddingModelPath,
+                       "models/jina-embeddings-v5-text-nano-mlx-int4")
         XCTAssertEqual(config.localEmbeddingBackend, "mlx")
         XCTAssertEqual(config.ragMatryoshka, .auto)
-        XCTAssertEqual(config.ragMatryoshkaDim, 256)
+        XCTAssertEqual(config.ragMatryoshkaDim, 128)
         XCTAssertEqual(config.ragVectorElementType, .int8)
         XCTAssertEqual(config.ragChunkSize, 800)
         XCTAssertEqual(config.ragChunkOverlap, 80)
@@ -1028,8 +1029,9 @@ final class ParserTests: XCTestCase {
         XCTAssertEqual(loaded.export()["rag_embedding_token_budget_min"] as? Int, 8_192)
     }
 
-    /// 旧默认 nomic MLX int8 应迁移到 jina-v3 MLX int4，并把旧默认 512 维收口到 256。
-    func testConfigMigratesNomicEmbeddingDefaultToJinaV3() throws {
+    /// 旧默认 nomic MLX int8 / jina-v3 MLX int4 应迁移到 jina-v5 MLX int4，
+    /// 并把旧默认 512 / 256 维收口到 128。
+    func testConfigMigratesLegacyEmbeddingDefaultsToJinaV5() throws {
         let path = directory.appendingPathComponent("config-embedding-migration.json")
         let json = """
         {"local_embedding_backend":"mlx",
@@ -1041,11 +1043,48 @@ final class ParserTests: XCTestCase {
         try json.write(to: path, atomically: true, encoding: .utf8)
         let config = AgentConfig.load(path.path)
 
-        XCTAssertEqual(config.ragEmbeddingModel, "jina-embeddings-v3-mlx-int4")
-        XCTAssertEqual(config.localEmbeddingModel, "jina-embeddings-v3-mlx-int4")
-        XCTAssertEqual(config.localEmbeddingModelPath, "models/jina-embeddings-v3-mlx-int4")
-        XCTAssertEqual(config.ragMatryoshkaDim, 256)
+        XCTAssertEqual(config.ragEmbeddingModel, "jina-embeddings-v5-text-nano-mlx-int4")
+        XCTAssertEqual(config.localEmbeddingModel, "jina-embeddings-v5-text-nano-mlx-int4")
+        XCTAssertEqual(config.localEmbeddingModelPath,
+                       "models/jina-embeddings-v5-text-nano-mlx-int4")
+        XCTAssertEqual(config.ragMatryoshkaDim, 128)
         XCTAssertEqual(config.ragVectorElementType, .int8)
+    }
+
+    /// 上一版默认 jina-v3 也要迁移到 V5；用户自定义模型保持不变。
+    func testConfigMigratesJinaV3DefaultButKeepsCustomModel() throws {
+        let path = directory.appendingPathComponent("config-embedding-v3-migration.json")
+        let json = """
+        {"local_embedding_backend":"mlx",
+         "local_embedding_model":"jina-embeddings-v3-mlx-int4",
+         "local_embedding_model_path":"models/jina-embeddings-v3-mlx-int4",
+         "rag_embedding_model":"jina-embeddings-v3-mlx-int4",
+         "rag_matryoshka_dim":256}
+        """
+        try json.write(to: path, atomically: true, encoding: .utf8)
+        let migrated = AgentConfig.load(path.path)
+        XCTAssertEqual(migrated.ragEmbeddingModel, "jina-embeddings-v5-text-nano-mlx-int4")
+        XCTAssertEqual(migrated.localEmbeddingModel,
+                       "jina-embeddings-v5-text-nano-mlx-int4")
+        XCTAssertEqual(migrated.localEmbeddingModelPath,
+                       "models/jina-embeddings-v5-text-nano-mlx-int4")
+        XCTAssertEqual(migrated.ragMatryoshkaDim, 128)
+
+        let customPath = directory.appendingPathComponent("config-embedding-custom.json")
+        let custom = """
+        {"local_embedding_backend":"mlx",
+         "local_embedding_model":"jina-embeddings-v3-mlx-int4",
+         "local_embedding_model_path":"models/my-embedding",
+         "rag_embedding_model":"my-embedding",
+         "rag_matryoshka_dim":512}
+        """
+        try custom.write(to: customPath, atomically: true, encoding: .utf8)
+        let kept = AgentConfig.load(customPath.path)
+        XCTAssertEqual(kept.ragEmbeddingModel, "my-embedding")
+        XCTAssertEqual(kept.localEmbeddingModel, "jina-embeddings-v3-mlx-int4")
+        XCTAssertEqual(kept.localEmbeddingModelPath, "models/my-embedding")
+        XCTAssertEqual(kept.ragMatryoshkaDim, 512,
+                       "用户显式配置的 Matryoshka 维不变")
     }
 
     /// 跨轮 KV/前缀复用开关：默认开启、可关闭，且写入导出字典。
@@ -1274,9 +1313,9 @@ final class ParserTests: XCTestCase {
         XCTAssertEqual(config.auxLocalLLMBackend, "mlx-lm")
         XCTAssertEqual(config.auxLocalLLMModel, "models/Qwen3.5-2B-MLX-4bit")
         XCTAssertEqual(config.localEmbeddingBackend, "mlx")
-        // 旧 fp16 MLX 路径统一迁移到新的默认 jina-v3 int4 模型。
+        // 旧 fp16 MLX 路径统一迁移到新的默认 jina-v5 int4 模型。
         XCTAssertEqual(config.localEmbeddingModelPath,
-                       "models/jina-embeddings-v3-mlx-int4")
+                       "models/jina-embeddings-v5-text-nano-mlx-int4")
         XCTAssertEqual(config.localRerankerBackend, "mlx")
         XCTAssertEqual(config.localRerankerModelPath,
                        "models/bge-reranker-v2-m3-mlx-mxfp8")

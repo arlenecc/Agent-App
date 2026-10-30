@@ -5,6 +5,7 @@ import Foundation
 /// - `auto`：对已知支持该特性的模型启用（nomic、jina-embeddings-v3），
 ///   截断维跟随设置中的下拉框（128 / 256 / 512）；
 /// - `on`：任何 embedding 都按配置维截断（超过原生维时按原生维处理）；
+///   jina-v5 provider 自身固定 128 维，wrap 时会跳过他，避免二次截断；
 /// - `off`：不截断。
 public enum MatryoshkaMode: String, CaseIterable, Sendable {
     case auto
@@ -13,7 +14,7 @@ public enum MatryoshkaMode: String, CaseIterable, Sendable {
 
     public var displayName: String {
         switch self {
-        case .auto: return "自动（nomic / jina-v3 启用）"
+        case .auto: return "自动（nomic / jina-v3 启用；jina-v5 固定 128 维）"
         case .on: return "始终启用"
         case .off: return "关闭"
         }
@@ -61,6 +62,9 @@ public final class MatryoshkaEmbedding: EmbeddingProvider, EmbeddingTokenCountin
     public static func wrap(_ base: EmbeddingProvider,
                             mode: MatryoshkaMode,
                             dimension: Int) -> EmbeddingProvider {
+        // jina-v5 provider 自身已固定 128 维并在截断后重新归一化；
+        // 再套一层会二次截断（甚至截到 64/32 维），必须直接放行。
+        if JinaV5Profile.matches(base.identifier) { return base }
         guard mode.enabled(for: base.identifier) else { return base }
         let target = max(1, mode.effectiveDimension(
             for: base.identifier, configured: dimension))

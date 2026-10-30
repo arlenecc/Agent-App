@@ -61,6 +61,20 @@ final class MatryoshkaEmbeddingTests: XCTestCase {
                       "截断维不小于原生维时无需包装")
     }
 
+    func testJinaV5ProviderIsNeverWrappedByMatryoshka() {
+        let base = MatryoshkaStubEmbedding(
+            identifier: "local:mlx-embedding:jina-embeddings-v5-text-nano-mlx-int4",
+            dimension: 128, source: [1, 0, 0, 0])
+
+        // V5 provider 已在内部固定 128 维并重新归一化，任何 Matryoshka
+        // 模式（包括强制 on）都不能再二次截断。
+        XCTAssertTrue(MatryoshkaEmbedding.wrap(base, mode: .on, dimension: 64) === base)
+        XCTAssertTrue(MatryoshkaEmbedding.wrap(base, mode: .auto, dimension: 64) === base)
+        let wrapped = MatryoshkaEmbedding(base: base, truncateDimension: 64)
+        XCTAssertEqual(wrapped.dimension, 64,
+                       "显式装饰器仍按传入维截断（绕过 wrap 的兜底行为）")
+    }
+
     func testDocumentsAndQueryUseIdenticalTransform() async throws {
         let base = MatryoshkaStubEmbedding(
             identifier: "nomic-test", dimension: 4, source: [3, 4, 0, 0])

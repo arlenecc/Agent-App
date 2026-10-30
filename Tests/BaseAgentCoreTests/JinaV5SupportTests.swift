@@ -86,6 +86,14 @@ final class JinaV5SupportTests: XCTestCase {
         XCTAssertFalse(JinaV5Profile.isJinaV5(directory: directory))
     }
 
+    // MARK: - 默认模型
+
+    func testRegistryDefaultsEmbeddingToJinaV5MLX() {
+        XCTAssertEqual(LocalModelRegistry.defaultName(for: .embedding),
+                       "jina-embeddings-v5-text-nano-mlx-int4")
+        XCTAssertEqual(JinaV5Profile.retrievalDimension, 128)
+    }
+
     // MARK: - 128 维截断与重归一化
 
     func testTruncatesAndRenormalizes() {
