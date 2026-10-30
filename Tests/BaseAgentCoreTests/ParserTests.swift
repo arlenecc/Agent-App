@@ -161,6 +161,50 @@ final class ParserTests: XCTestCase {
         XCTAssertEqual(parsed.metadata["engine"], "vision")
     }
 
+    /// 扫描书的文本层常只有「每页相同的水印 + 网址」：原始字数可能过
+    /// 文本层阈值，但清洗时会被当作跨页页眉页脚整段删除。必须识别为
+    /// 不可用文本层并改走 OCR，否则整份文档清洗为空、转换失败。
+    func testWatermarkOnlyTextLayerFallsBackToOCR() throws {
+        let url = directory.appendingPathComponent("watermark-scan.pdf")
+        let watermark = "www.example.com scanned book watermark"
+        try makeWatermarkedImagePDF(at: url, pageCount: 3, watermark: watermark)
+
+        let pages = Array(repeating: watermark + "\n" + watermark, count: 3)
+        let marginKeys = DocumentCleaner.repeatedMarginKeys(in: pages)
+        XCTAssertFalse(marginKeys.isEmpty, "跨页重复水印应被识别为页眉页脚")
+        XCTAssertLessThan(
+            DocumentCleaner.effectiveOCRTextCharacterCount(
+                pages[0], excludingMarginKeys: marginKeys),
+            PDFPageRenderer.textLayerMinCharacters)
+
+        let parser = VisionPDFParser()
+        let parsed = try awaitSync {
+            try await parser.parse(url: url,
+                                   options: ParserOptions(pdfEngine: .vision),
+                                   progress: nil)
+        }
+        XCTAssertEqual(parsed.metadata["ocr_pages"], "3", "只有水印的文本层必须全部走 OCR")
+        XCTAssertTrue(parsed.text.uppercased().contains("SCANNED"), parsed.text)
+    }
+
+    /// 同一水印问题在 Ovis 路径也要回退到视觉模型。
+    func testWatermarkOnlyTextLayerFallsBackToVLMInOvis() throws {
+        let url = directory.appendingPathComponent("watermark-ovis.pdf")
+        let watermark = "www.example.com scanned book watermark"
+        try makeWatermarkedImagePDF(at: url, pageCount: 3, watermark: watermark)
+
+        let fake = FakeVLM()
+        let parser = OvisPDFParser(vlm: fake)
+        let parsed = try awaitSync {
+            try await parser.parse(url: url,
+                                   options: ParserOptions(pdfEngine: .ovis),
+                                   progress: nil)
+        }
+        XCTAssertEqual(fake.calls, 3, "只有水印的文本页应交给 OvisOCR3")
+        XCTAssertEqual(parsed.metadata["text_pages"], "0")
+        XCTAssertEqual(parsed.metadata["ocr_pages"], "3")
+    }
+
     // MARK: Ovis 路径
 
     func testOvisParserUsesVLM() throws {
@@ -1328,6 +1372,52 @@ final class ParserTests: XCTestCase {
         CTFrameDraw(frame, context)
         context.endPDFPage()
         context.closePDF()
+    }
+
+    /// 构造「每页一张扫描图 + 只有水印文本层」的 PDF：文本层每页重复
+    /// 同一句网址水印，正文只存在于图片里。每页图片文字带页码，避免
+    /// 清洗器把跨页相同的 OCR 结果当作页眉页脚删除。
+    private func makeWatermarkedImagePDF(at url: URL,
+                                         pageCount: Int,
+                                         watermark: String) throws {
+        var mediaBox = CGRect(x: 0, y: 0, width: 612, height: 792)
+        guard let consumer = CGDataConsumer(url: url as CFURL),
+              let context = CGContext(consumer: consumer, mediaBox: &mediaBox, nil) else {
+            throw AgentError.parse("无法创建 PDF context")
+        }
+        let attributes: [NSAttributedString.Key: Any] = [
+            .font: NSFont.systemFont(ofSize: 10),
+            .foregroundColor: NSColor.black,
+        ]
+        let line = CTLineCreateWithAttributedString(
+            NSAttributedString(string: watermark, attributes: attributes))
+        for page in 0..<pageCount {
+            let image = try makeScannedPageImage(
+                text: "SCANNED PAGE \(page + 1)")
+            context.beginPDFPage(nil)
+            context.draw(image, in: mediaBox)
+            // 页首、页尾各画一次水印，模拟扫描书常见的双向水印。
+            context.textPosition = CGPoint(x: 40, y: 760)
+            CTLineDraw(line, context)
+            context.textPosition = CGPoint(x: 40, y: 20)
+            CTLineDraw(line, context)
+            context.endPDFPage()
+        }
+        context.closePDF()
+    }
+
+    private func makeScannedPageImage(text: String) throws -> CGImage {
+        let size = NSSize(width: 612, height: 792)
+        let image = NSImage(size: size)
+        image.lockFocus()
+        NSColor.white.setFill()
+        NSRect(origin: .zero, size: size).fill()
+        text.draw(at: NSPoint(x: 60, y: 500),
+                  withAttributes: [.font: NSFont.systemFont(ofSize: 36),
+                                   .foregroundColor: NSColor.black])
+        image.unlockFocus()
+        var rect = CGRect(origin: .zero, size: size)
+        return try XCTUnwrap(image.cgImage(forProposedRect: &rect, context: nil, hints: nil))
     }
 
     private func makeImagePDF(at url: URL, text: String) throws {

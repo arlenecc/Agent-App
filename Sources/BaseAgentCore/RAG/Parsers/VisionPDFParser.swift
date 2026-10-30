@@ -6,7 +6,7 @@ import Vision
 /// 文本层并行提取的单 worker 结果，按页序合并回主流程。
 private struct VisionTextLayerOutcome: Sendable {
     var texts: [(index: Int, text: String)] = []
-    var ocrPages: [Int] = []
+    var failedIndices: [Int] = []
     var scannerPages = 0
     var failedPages = 0
     var textSeconds = 0.0
@@ -46,7 +46,6 @@ public final class VisionPDFParser: DocumentParser {
         let pageLimit = options.maxPages > 0 ? min(totalPages, options.maxPages) : totalPages
 
         var pageTexts = [String?](repeating: nil, count: pageLimit)
-        var pagesNeedingOCR: [Int] = []
         var scannerPages = 0
         var failedPages = 0
         var textSeconds = 0.0
@@ -82,6 +81,7 @@ public final class VisionPDFParser: DocumentParser {
                             for: workerDocument, pageIndex: index)
                         guard let extraction else {
                             outcome.texts.append((index, ""))
+                            outcome.failedIndices.append(index)
                             outcome.failedPages += 1
                             continue
                         }
@@ -89,12 +89,9 @@ public final class VisionPDFParser: DocumentParser {
                         let text = extraction.text
                             .trimmingCharacters(in: .whitespacesAndNewlines)
                         outcome.textSeconds += Date().timeIntervalSince(textStarted)
-                        if DocumentCleaner.effectiveCharacterCount(text)
-                            >= Self.textLayerMinCharacters {
-                            outcome.texts.append((index, text))
-                        } else {
-                            outcome.ocrPages.append(index)
-                        }
+                        // 文本层是否够用要在所有页提取完后再判断：只有水印/
+                        // 页眉页脚的文本层原始字数可能过阈值，清洗后却为空。
+                        outcome.texts.append((index, text))
                     }
                     return outcome
                 }
@@ -106,12 +103,31 @@ public final class VisionPDFParser: DocumentParser {
             return all
         }
 
+        var failedPageIndices: Set<Int> = []
         for outcome in textOutcomes {
             textSeconds += outcome.textSeconds
             scannerPages += outcome.scannerPages
             failedPages += outcome.failedPages
+            failedPageIndices.formUnion(outcome.failedIndices)
             for (index, text) in outcome.texts { pageTexts[index] = text }
-            pagesNeedingOCR.append(contentsOf: outcome.ocrPages)
+        }
+
+        // 跨页重复的水印/页眉页脚在清洗阶段会被整段删除。把它们从
+        // 「文本层可用」的判定中排除，否则每页只有水印的扫描书会被
+        // 误判为文字版，跳过 OCR 后整份清洗为空。
+        let marginKeys = DocumentCleaner.repeatedMarginKeys(
+            in: pageTexts.map { $0 ?? "" })
+        var pagesNeedingOCR: [Int] = []
+        for index in 0..<pageLimit {
+            // 文本层提取本身失败的页保持旧行为（跳过并由 manifest 重试）。
+            guard !failedPageIndices.contains(index) else { continue }
+            let text = (pageTexts[index] ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let count = DocumentCleaner.effectiveOCRTextCharacterCount(
+                text, excludingMarginKeys: marginKeys)
+            if count < Self.textLayerMinCharacters {
+                pagesNeedingOCR.append(index)
+            }
         }
         pagesNeedingOCR.sort()
         if scannerPages > 0 {
@@ -239,13 +255,20 @@ public final class VisionPDFParser: DocumentParser {
             let source = preprocess
                 ? (OCRImagePreprocessor.normalize(image, binarize: binarize) ?? image)
                 : image
-            return try await Self.visionGate.withPermit {
-                let started = Date()
-                let text = try autoreleasepool {
-                    try Self.recognizeText(image: source, languages: languages)
+            let primary = try await Self.runVision(image: source, languages: languages)
+            // 二值化会把「深底浅字」的页面（深色封面/版权页）洗成整片黑，
+            // Vision 返回空。此时用未预处理的原图再识别一次，避免整页内容
+            // 丢失；只有空结果才重试，正常页面的 OCR 次数不变。
+            if preprocess,
+               DocumentCleaner.effectiveCharacterCount(primary.text) == 0 {
+                let fallback = try await Self.runVision(image: image,
+                                                        languages: languages)
+                if DocumentCleaner.effectiveCharacterCount(fallback.text) > 0 {
+                    return (fallback.text,
+                            primary.busySeconds + fallback.busySeconds)
                 }
-                return (text, Date().timeIntervalSince(started))
             }
+            return primary
         } catch {
             // 用户停止同步时必须向上传播取消，不能把剩余页当成失败页。
             if Task.isCancelled { throw AgentError.cancelled }
@@ -253,6 +276,18 @@ public final class VisionPDFParser: DocumentParser {
             // 否则整份文件会被标记 complete，失败的页再也不会重试。
             AgentLog.warning("Vision OCR 失败，已跳过该页: \(error.localizedDescription)")
             return (text: nil, busySeconds: 0)
+        }
+    }
+
+    /// 在全局 Vision 闸门内执行一次识别，返回文本与实际耗时。
+    private static func runVision(image: CGImage,
+                                  languages: [String]) async throws -> (text: String, busySeconds: Double) {
+        try await Self.visionGate.withPermit {
+            let started = Date()
+            let text = try autoreleasepool {
+                try Self.recognizeText(image: image, languages: languages)
+            }
+            return (text, Date().timeIntervalSince(started))
         }
     }
 
@@ -403,6 +438,44 @@ enum OCRImagePreprocessor {
         let height = max(1, Int((Double(sourceHeight) * factor).rounded()))
 
         var pixels = [UInt8](repeating: 255, count: width * height)
+        // CGContext 只负责把源图绘制进 pixels；绘制结束立刻释放它，
+        // 避免后续像素处理触发数组写时复制后，context 还指向旧缓冲区。
+        guard drawGrayscale(image, into: &pixels,
+                            width: width, height: height) else {
+            return nil
+        }
+
+        contrastStretch(&pixels)
+        sharpen(&pixels, width: width, height: height)
+        if binarize {
+            otsuBinarize(&pixels)
+        }
+        // 不能用 `context.makeImage()`：context 的位图缓冲区就是上面传入的
+        // Swift 数组内存。`contrastStretch`/`sharpen` 内部的局部拷贝会让数组
+        // 触发写时复制，context 仍指向旧缓冲区，旧缓冲区随后被释放；并发时
+        // makeImage 会读到已被复用的内存，整页变黑（isNearlyBlank 检测的是
+        // 原始图，拦不住），Vision 于是返回空结果。
+        // 直接用处理后的像素构造 CGImage，由 CGDataProvider 持有数据，
+        // 图像生命周期内数据不会被释放。
+        let data = Data(pixels)
+        guard let provider = CGDataProvider(data: data as CFData) else { return nil }
+        return CGImage(width: width,
+                       height: height,
+                       bitsPerComponent: 8,
+                       bitsPerPixel: 8,
+                       bytesPerRow: width,
+                       space: CGColorSpaceCreateDeviceGray(),
+                       bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.none.rawValue),
+                       provider: provider,
+                       decode: nil,
+                       shouldInterpolate: true,
+                       intent: .defaultIntent)
+    }
+
+    /// 把源图绘制成 8bpc 灰度像素，写入调用方提供的缓冲区。
+    private static func drawGrayscale(_ image: CGImage,
+                                      into pixels: inout [UInt8],
+                                      width: Int, height: Int) -> Bool {
         guard let context = CGContext(data: &pixels,
                                       width: width,
                                       height: height,
@@ -410,19 +483,13 @@ enum OCRImagePreprocessor {
                                       bytesPerRow: width,
                                       space: CGColorSpaceCreateDeviceGray(),
                                       bitmapInfo: CGImageAlphaInfo.none.rawValue) else {
-            return nil
+            return false
         }
         context.interpolationQuality = .high
         context.setFillColor(gray: 1, alpha: 1)
         context.fill(CGRect(x: 0, y: 0, width: width, height: height))
         context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
-
-        contrastStretch(&pixels)
-        sharpen(&pixels, width: width, height: height)
-        if binarize {
-            otsuBinarize(&pixels)
-        }
-        return context.makeImage()
+        return true
     }
 
     /// 1% / 99% 分位线性拉伸，提升低对比度扫描件的可读性。

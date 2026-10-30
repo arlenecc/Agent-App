@@ -4,8 +4,12 @@ import CoreGraphics
 
 /// 文本层并行提取的单 worker 结果，按页序合并回主流程。
 private struct TextLayerOutcome: Sendable {
+    /// 文本页最终内容（可能已做表格替换）。
     var texts: [(index: Int, text: String)] = []
+    /// 所有成功提取页的原始文本层，用于跨页重复水印判定。
+    var rawTexts: [(index: Int, text: String)] = []
     var scanPages: [Int] = []
+    var failedIndices: [Int] = []
     var textPages = 0
     var tableRegions = 0
     var scannerPages = 0
@@ -127,6 +131,8 @@ public final class OvisPDFParser: DocumentParser, VLMBackedParser {
                             for: workerDocument, pageIndex: index)
                         guard let extraction else {
                             outcome.texts.append((index, ""))
+                            outcome.rawTexts.append((index, ""))
+                            outcome.failedIndices.append(index)
                             outcome.failedPages += 1
                             continue
                         }
@@ -134,6 +140,9 @@ public final class OvisPDFParser: DocumentParser, VLMBackedParser {
                         if extraction.usedScanner { outcome.scannerPages += 1 }
                         let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
                         outcome.textSeconds += Date().timeIntervalSince(textStarted)
+                        // 原始文本留给合并阶段做跨页判定：只有水印/页眉页脚
+                        // 的文本层原始字数可能过阈值，清洗后却为空。
+                        outcome.rawTexts.append((index, text))
                         if DocumentCleaner.effectiveCharacterCount(text)
                             >= PDFPageRenderer.textLayerMinCharacters {
                             // 文字版页面仍先直接提取；如果检测到表格区域，只把表格裁剪
@@ -168,6 +177,9 @@ public final class OvisPDFParser: DocumentParser, VLMBackedParser {
             return all
         }
 
+        var failedPageIndices: Set<Int> = []
+        var rawTexts = [String?](repeating: nil, count: pageLimit)
+        var provisionalTexts: [(index: Int, text: String)] = []
         for outcome in textOutcomes {
             textSeconds += outcome.textSeconds
             ocrSeconds += outcome.ocrSeconds
@@ -175,8 +187,30 @@ public final class OvisPDFParser: DocumentParser, VLMBackedParser {
             tableRegions += outcome.tableRegions
             scannerPages += outcome.scannerPages
             failedPages += outcome.failedPages
-            for (index, text) in outcome.texts { pageTexts[index] = text }
+            failedPageIndices.formUnion(outcome.failedIndices)
+            for (index, text) in outcome.rawTexts { rawTexts[index] = text }
+            provisionalTexts.append(contentsOf: outcome.texts)
             scanPages.append(contentsOf: outcome.scanPages)
+        }
+
+        // 文本页若只有跨页重复的水印/页眉页脚，清洗后会被整段删除。
+        // 这类页面必须改走 OCR，否则整份文档会被误判为文字版并清洗为空。
+        let marginKeys = DocumentCleaner.repeatedMarginKeys(
+            in: rawTexts.map { $0 ?? "" })
+        for (index, pageText) in provisionalTexts {
+            guard !failedPageIndices.contains(index) else {
+                pageTexts[index] = ""
+                continue
+            }
+            let raw = rawTexts[index] ?? ""
+            if DocumentCleaner.effectiveOCRTextCharacterCount(
+                raw, excludingMarginKeys: marginKeys)
+                >= PDFPageRenderer.textLayerMinCharacters {
+                pageTexts[index] = pageText
+            } else {
+                textPages -= 1
+                scanPages.append(index)
+            }
         }
         scanPages.sort()
         if scannerPages > 0 {

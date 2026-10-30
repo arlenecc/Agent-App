@@ -136,9 +136,10 @@ final class PDFMemorySafetyTests: XCTestCase {
         XCTAssertTrue(extraction.text.contains("image-heavy layout"), extraction.text)
     }
 
-    /// 单张全页扫描图（常见扫描书每页只有 1 张大图）也必须走有界扫描器：
-    /// PDFKit 文本行布局只要遇到大图就可能病态膨胀，不能只按图片数量判断。
-    func testSingleLargeImagePageUsesBoundedTextScanner() throws {
+    /// 常见整页扫描图（每页 1 张 4000×3000）必须继续走 PDFKit：
+    /// 实测这类页面 PDFKit 提取 30 页仅 0.06s，改走 CGPDFScanner 会慢
+    /// 30～50 倍。只有极端大图才需要扫描器兜底。
+    func testNormalFullPageImageKeepsPDFKitExtraction() throws {
         let url = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("pdf-single-large-image-\(UUID().uuidString).pdf")
         defer { try? FileManager.default.removeItem(at: url) }
@@ -154,18 +155,27 @@ final class PDFMemorySafetyTests: XCTestCase {
 
         let profile = PDFTextExtractor.imageProfile(for: cgPage)
         XCTAssertEqual(profile.count, 1)
-        XCTAssertGreaterThanOrEqual(profile.pixelCount,
-                                    PDFTextExtractor.riskySingleImagePixels,
-                                    "4000×3000 的全页图应触发有界扫描器")
+        XCTAssertLessThan(profile.largestPixelCount,
+                          PDFTextExtractor.riskySingleImagePixels,
+                          "1200 万像素仍属于常见扫描图，不应触发扫描器")
 
         let extraction = PDFTextExtractor.text(for: page)
-        XCTAssertTrue(extraction.usedScanner,
-                      "大图页不能交给 PDFKit 做文本行布局")
+        XCTAssertFalse(extraction.usedScanner,
+                       "常见整页图必须走更快的 PDFKit 文本层")
         XCTAssertTrue(extraction.text.contains("image-heavy layout"), extraction.text)
     }
 
-    /// 大量中等图片的总像素同样危险：单张不大、总量很大时也必须走扫描器。
-    func testManyMediumImagesUseBoundedTextScanner() throws {
+    /// 单张极端大图仍要兜底走扫描器。
+    func testExtremeSingleImageProfileUsesBoundedScanner() {
+        let profile = PDFTextExtractor.ImageProfile(
+            count: 1,
+            pixelCount: PDFTextExtractor.riskySingleImagePixels,
+            largestPixelCount: PDFTextExtractor.riskySingleImagePixels)
+        XCTAssertTrue(profile.isMemoryRisky)
+    }
+
+    /// 中等图片总量不大时继续走 PDFKit；只有总像素到极端值才改走扫描器。
+    func testMediumImageGalleryKeepsPDFKitExtraction() throws {
         let url = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("pdf-many-medium-images-\(UUID().uuidString).pdf")
         defer { try? FileManager.default.removeItem(at: url) }
@@ -181,13 +191,21 @@ final class PDFMemorySafetyTests: XCTestCase {
 
         let profile = PDFTextExtractor.imageProfile(for: cgPage)
         XCTAssertEqual(profile.count, 10)
-        XCTAssertGreaterThanOrEqual(profile.pixelCount,
-                                    PDFTextExtractor.riskyTotalImagePixels,
-                                    "10 张 1.08MP 图片合计已超过安全阈值")
+        XCTAssertLessThan(profile.pixelCount,
+                          PDFTextExtractor.riskyTotalImagePixels,
+                          "10 张 1.08MP 图片的提取成本远低于扫描器，不应改道")
 
         let extraction = PDFTextExtractor.text(for: page)
-        XCTAssertTrue(extraction.usedScanner,
-                      "总像素过大的页面不能交给 PDFKit")
+        XCTAssertFalse(extraction.usedScanner,
+                       "总像素未到极端值的页面应走 PDFKit")
+    }
+
+    func testExtremeTotalImageProfileUsesBoundedScanner() {
+        let profile = PDFTextExtractor.ImageProfile(
+            count: 10,
+            pixelCount: PDFTextExtractor.riskyTotalImagePixels,
+            largestPixelCount: 8_000_000)
+        XCTAssertTrue(profile.isMemoryRisky)
     }
 
     /// 小图标/小装饰图不影响阅读顺序，继续走 PDFKit，避免无谓降低文本质量。

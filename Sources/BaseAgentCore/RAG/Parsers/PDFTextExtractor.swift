@@ -19,28 +19,34 @@ struct PDFPageTextExtraction {
 /// 实测 383 页 319MB 的 PDF 中，第 18 页（392 张图）单页物理内存涨到 42GB
 /// 且长时间不返回。
 ///
-/// 因此不能只按图片数量判断：扫描书常见「每页只有 1 张 2000×3000 的全页图」，
-/// 图片少但像素极大，同样可能触发 PDFKit 布局爆炸。这里的策略：
+/// 因此不能只按图片数量判断：图片数量达到阈值时必须走扫描器，避免
+/// 392 张图这类页面触发 PDFKit 布局爆炸。这里还需要区分「正常整页扫描图」
+/// 与「极端大图」：实测每页 1 张 400 万～560 万像素的扫描书，PDFKit
+/// 文本层提取 30 页仅需 0.06s 且内存稳定，不应改走慢 30～50 倍的扫描器；
+/// 只有单图 ≥3200 万像素（如 8000×4000）或页面总像素 ≥6400 万时才兜底。
+/// 策略：
 /// - 图片数量 ≥ `imageHeavyThreshold`、单图 ≥ `riskySingleImagePixels`、
 ///   或页面图片总像素 ≥ `riskyTotalImagePixels` 的页面不再调用 PDFKit，
 ///   改用 `CGPDFScanner` 逐操作符读取文本（字体 + ToUnicode + 文本状态），
 ///   不触发布局与障碍物分析，页级内存与图片数量/像素数无关；
-/// - 低图片页继续走 `PDFPage.string`，保持原有成熟的阅读顺序与分段行为；
+/// - 其余页面继续走 `PDFPage.string`，保持原有成熟的阅读顺序与分段行为；
 /// - 扫描器输出为空时由解析器自然进入 OCR 路径，绝不回退到 PDFKit 文本层。
 enum PDFTextExtractor {
 
     /// 图片 XObject 达到该数量后不再调用 PDFKit 文本层。
     static let imageHeavyThreshold = 16
-    /// 单张图片像素数达到该值时不再调用 PDFKit（覆盖每页一张全页扫描图）。
-    static let riskySingleImagePixels: Int64 = 2_000_000
+    /// 单张图片像素数达到该值时不再调用 PDFKit。只兜底极端大图；
+    /// 常见整页扫描图（400 万～600 万像素）仍走更快的 PDFKit。
+    static let riskySingleImagePixels: Int64 = 32_000_000
     /// 页面图片总像素达到该值时不再调用 PDFKit（覆盖多张中等图片叠加）。
-    static let riskyTotalImagePixels: Int64 = 6_000_000
-    /// 跨文件同时进行的文本层提取上限。多文件并发时每个文件仍有 2-4 个
-    /// worker，若不设全局闸门，6 个文件会同时有 20 多页进入 PDFKit 布局；
-    /// 一旦某页触发病态分析，内存会成倍叠加。文本提取远快于 OCR，
-    /// 固定 3 路足以维持吞吐，又能把峰值乘数压住。
+    static let riskyTotalImagePixels: Int64 = 64_000_000
+    /// 跨文件同时进行的文本层提取上限。PDFKit 正常页面提取只有毫秒级、
+    /// 内存增量接近 0，闸门主要用于兜住极端页面，不再限制整体吞吐；
+    /// 默认取 CPU 核数并封顶 8，让多个文件并发时能跑满机器。
     static var requestedConcurrency: Int?
-    static var maxConcurrentExtractions: Int { requestedConcurrency ?? 3 }
+    static var maxConcurrentExtractions: Int {
+        requestedConcurrency ?? max(4, min(8, ProcessInfo.processInfo.activeProcessorCount))
+    }
     private static let extractionGate = AsyncSemaphore(value: maxConcurrentExtractions)
 
     struct ImageProfile: Equatable {

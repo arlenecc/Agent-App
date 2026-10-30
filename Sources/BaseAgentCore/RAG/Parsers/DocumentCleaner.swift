@@ -222,6 +222,50 @@ public enum DocumentCleaner {
         }
     }
 
+    /// 跨页重复的页眉/页脚行键（与 `clean` 内部判定规则一致）。
+    ///
+    /// PDF 文本层可用性判断需要它：扫描书常把「每页相同的水印 + 网址」
+    /// 写进文本层，原始字数够，但清洗时整行会被当作页眉页脚删除。
+    static func repeatedMarginKeys(in pages: [String]) -> Set<String> {
+        guard pages.count >= 2 else { return [] }
+        let pageLines = pages.map { $0.components(separatedBy: "\n") }
+        let (headers, footers) = detectRepeatedMargins(pageLines)
+        return headers.union(footers)
+    }
+
+    /// 文本层用于 OCR 路由的有效字符数。
+    ///
+    /// 与 `effectiveCharacterCount` 的区别：排除跨页重复页眉/页脚、
+    /// 同页完全重复的行，以及 URL/邮箱。这样「每页只有水印」的文字层
+    /// 会被判为不可用，交给 OCR；正常正文页（即使带页眉页脚）不受影响。
+    static func effectiveOCRTextCharacterCount(_ text: String,
+                                               excludingMarginKeys marginKeys: Set<String>) -> Int {
+        guard !text.isEmpty else { return 0 }
+        let lines = text.components(separatedBy: "\n")
+        let nonEmptyIndices = lines.indices.filter {
+            !lines[$0].trimmingCharacters(in: .whitespaces).isEmpty
+        }
+        let headerZone = Set(nonEmptyIndices.prefix(3))
+        let footerZone = Set(nonEmptyIndices.suffix(3))
+
+        var seen: Set<String> = []
+        var count = 0
+        for (index, rawLine) in lines.enumerated() {
+            let line = rawLine.trimmingCharacters(in: .whitespaces)
+            guard !line.isEmpty else { continue }
+            if headerZone.contains(index) || footerZone.contains(index),
+               marginKeys.contains(marginKey(line)) { continue }
+            // 同一句水印常同时出现在页首和页尾，重复行只计一次。
+            guard seen.insert(line).inserted else { continue }
+
+            var content = replace(urlRegex, in: line, with: "")
+            content = replace(emailRegex, in: content, with: "")
+            content = replace(bareWebAddressRegex, in: content, with: "")
+            count += effectiveCharacterCount(content)
+        }
+        return count
+    }
+
     /// 合并 PDF/OCR 产生的硬换行。以句末标点或 Markdown 结构行作为断点。
     public static func joinHardWrappedLines(_ text: String, preserveMarkdown: Bool = true) -> String {
         let lines = text.components(separatedBy: "\n")
@@ -1251,6 +1295,9 @@ public enum DocumentCleaner {
         options: [.caseInsensitive])
     private static let urlRegex = try! NSRegularExpression(
         pattern: #"https?://[^\s]+"#, options: [.caseInsensitive])
+    /// 没有协议头的网址（水印里常见 `www.guminxuexiao.com`）。
+    private static let bareWebAddressRegex = try! NSRegularExpression(
+        pattern: #"\bwww\.[^\s]+"#, options: [.caseInsensitive])
     private static let emailRegex = try! NSRegularExpression(
         pattern: #"\S+@\S+\.\S+"#)
     private static let horizontalSpaceRegex = try! NSRegularExpression(

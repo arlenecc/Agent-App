@@ -25,8 +25,13 @@ public final class ImageParser: DocumentParser {
         let normalized = OCRImagePreprocessor.normalize(
             cgImage, binarize: options.ocrBinarize) ?? cgImage
         // Vision 单次识别；语言与 PDF 页识别保持一致（中文优先、英文兜底）。
-        let raw = try VisionPDFParser.recognizeText(
+        var raw = try VisionPDFParser.recognizeText(
             image: normalized, languages: ["zh-Hans", "en-US"])
+        // 二值化可能把「深底浅字」的图片洗成整片黑，返回空；用原图兜底识别一次。
+        if DocumentCleaner.effectiveCharacterCount(raw) == 0 {
+            raw = try VisionPDFParser.recognizeText(
+                image: cgImage, languages: ["zh-Hans", "en-US"])
+        }
 
         guard !raw.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw AgentError.parse("图片中未识别出文本: \(url.lastPathComponent)")
