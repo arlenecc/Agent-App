@@ -5,16 +5,27 @@ import CryptoKit
 ///
 /// - 章节结构由 `OutlineResolver` 从 Markdown 与已存目录择优生成；
 /// - 章节正文按辅助模型上下文预算分段，段结果持久化后增量复用；
-/// - reduce 生成 50–100 字章节摘要，全部章节完成后生成 300–500 字全书摘要；
+/// - map 阶段按 `batchConcurrency` 并行处理分片（后端支持的独立会话数），
+///   reduce 生成 50–100 字章节摘要，全部章节完成后生成 300–500 字全书摘要；
+/// - 摘要请求一律关闭 thinking 并使用独立会话，避免分片共享 KV；
 /// - 任何模型调用前后都检查取消标记，中断时只保留已完成分段。
 public final class BookSummaryEngine: @unchecked Sendable {
 
     private let store: VectorStore
+    /// 同时执行的摘要分片数（默认 5，上限 5）。MLX/ONNX 后端能为每个
+    /// `isolated` 请求提供独立 KV/past，可真正并行；GGUF/VLM 单 context
+    /// 后端会按能力标记退化为逐条执行。
+    private let batchConcurrency: Int
     /// 预留 system/指令与输出 token 后的分段预算上限。
     private static let maxSegmentBudget = 8_000
+    /// 章节正文超过该字符数时强制 map-reduce，避免一次 map 吞掉整章细节。
+    private static let mapReduceThreshold = 4_000
+    /// 长章节每个 map 分片的最大字符数。
+    private static let mapSegmentCharacters = 3_000
 
-    public init(store: VectorStore) {
+    public init(store: VectorStore, batchConcurrency: Int = 5) {
         self.store = store
+        self.batchConcurrency = max(1, min(5, batchConcurrency))
     }
 
     // MARK: - Token 估算与分段
@@ -28,34 +39,42 @@ public final class BookSummaryEngine: @unchecked Sendable {
         return Int(ceil(tokens))
     }
 
-    /// 按空行分段；累计超出预算时切段，超长段落再按句末标点/字符硬切。
-    public static func splitSegments(_ body: String, tokenBudget: Int) -> [String] {
+    /// 按空行分段；累计超出 token/字符预算时切段，超长段落再按句末标点/字符硬切。
+    public static func splitSegments(_ body: String, tokenBudget: Int,
+                                     characterBudget: Int? = nil) -> [String] {
         let text = body.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !text.isEmpty else { return [] }
         let budget = max(64, tokenBudget)
+        let charBudget = characterBudget.map { max(64, $0) }
         let paragraphs = text.components(separatedBy: "\n\n").compactMap { raw -> String? in
             let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
             return trimmed.isEmpty ? nil : trimmed
+        }
+        func fits(_ value: String) -> Bool {
+            guard estimateTokens(value) <= budget else { return false }
+            if let charBudget, value.count > charBudget { return false }
+            return true
         }
 
         var segments: [String] = []
         var current = ""
         for paragraph in paragraphs {
-            if estimateTokens(paragraph) > budget {
+            if !fits(paragraph) {
                 if !current.isEmpty {
                     segments.append(current)
                     current = ""
                 }
                 var remainder = paragraph
                 while !remainder.isEmpty {
-                    let piece = takePrefix(remainder, tokenBudget: budget)
+                    let piece = takePrefix(remainder, tokenBudget: budget,
+                                           characterBudget: charBudget)
                     if !piece.text.isEmpty { segments.append(piece.text) }
                     remainder = piece.rest
                 }
                 continue
             }
             let candidate = current.isEmpty ? paragraph : current + "\n\n" + paragraph
-            if estimateTokens(candidate) <= budget {
+            if fits(candidate) {
                 current = candidate
             } else {
                 if !current.isEmpty { segments.append(current) }
@@ -66,14 +85,17 @@ public final class BookSummaryEngine: @unchecked Sendable {
         return segments
     }
 
-    private static func takePrefix(_ text: String, tokenBudget: Int) -> (text: String, rest: String) {
+    private static func takePrefix(_ text: String, tokenBudget: Int,
+                                   characterBudget: Int?) -> (text: String, rest: String) {
         let characters = Array(text)
         var tokens = 0.0
         var lastBreak = -1
         var index = 0
         while index < characters.count {
             let cost = tokenCost(characters[index])
-            if tokens + cost > Double(tokenBudget), index > 0 {
+            let exceedsTokens = tokens + cost > Double(tokenBudget)
+            let exceedsCharacters = characterBudget.map { index + 1 > $0 } ?? false
+            if (exceedsTokens || exceedsCharacters), index > 0 {
                 let cut: Int
                 if lastBreak >= 0, lastBreak >= index / 2 {
                     cut = lastBreak + 1
@@ -219,7 +241,8 @@ public final class BookSummaryEngine: @unchecked Sendable {
                                    markdown: String,
                                    llm: LLMService,
                                    now: Date,
-                                   isCancelled: () -> Bool) async throws -> ChapterProcessResult {
+                                   isCancelled: @escaping () -> Bool) async throws -> ChapterProcessResult {
+        let cancellation = SummaryCancellation(isCancelled)
         let resolved = resolve(document, markdown: markdown)
         let total = resolved.sections.count
         if resolved.digest != document.digest || resolved.chaptersJSON != document.chapters {
@@ -275,11 +298,11 @@ public final class BookSummaryEngine: @unchecked Sendable {
                 index += 1
                 continue
             }
-            try Self.ensureNotCancelled(isCancelled)
+            try cancellation.check()
             do {
                 let summary = try await summarizeSection(
                     document: document, section: section, llm: llm,
-                    now: now, isCancelled: isCancelled)
+                    now: now, cancellation: cancellation)
                 try store.upsertChapterSummary(ChapterSummaryRecord(
                     docID: document.docID, sectionIndex: index,
                     heading: section.heading, title: section.title,
@@ -298,7 +321,7 @@ public final class BookSummaryEngine: @unchecked Sendable {
                     chapterCompleted: chapterCompleted, bookCompleted: false,
                     titleRepaired: resolved.hadRepairs, summary: summary)
             } catch {
-                if !Self.isCancellation(error, isCancelled: isCancelled) {
+                if !cancellation.isCancellation(error) {
                     try? store.upsertSummaryJob(SummaryJobRecord(
                         docID: document.docID, status: .failed, nextSection: index,
                         totalSections: total,
@@ -323,27 +346,34 @@ public final class BookSummaryEngine: @unchecked Sendable {
                                   section: BookSection,
                                   llm: LLMService,
                                   now: Date,
-                                  isCancelled: () -> Bool) async throws -> String {
+                                  cancellation: SummaryCancellation) async throws -> String {
         let body = section.body.trimmingCharacters(in: .whitespacesAndNewlines)
         if body.count < 40 {
             return Self.fallbackSummary(for: section)
         }
         let budget = Self.segmentBudget(contextWindow: llm.contextWindow)
-        let segments = Self.splitSegments(body, tokenBudget: budget)
+        // 超过 4000 字的章节即使整体塞得进上下文，也强制按 3000 字一段做
+        // map-reduce，避免一次 map 吞掉整章、丢掉中后段细节。
+        let characterBudget = body.count > Self.mapReduceThreshold
+            ? Self.mapSegmentCharacters : nil
+        let segments = Self.splitSegments(body, tokenBudget: budget,
+                                          characterBudget: characterBudget)
         guard !segments.isEmpty else { return Self.fallbackSummary(for: section) }
 
         let persisted = try store.chapterSegments(
             docID: document.docID, sectionIndex: section.index)
-        var segmentSummaries: [String] = []
+        let persistedByIndex = Dictionary(
+            persisted.map { ($0.segmentIndex, $0) },
+            uniquingKeysWith: { first, _ in first })
+        var segmentSummaries = [String?](repeating: nil, count: segments.count)
+        var requests: [SummaryRequest] = []
         for (segmentIndex, segment) in segments.enumerated() {
-            try Self.ensureNotCancelled(isCancelled)
+            try cancellation.check()
             let hash = Self.shortHash(segment)
-            if let reused = persisted.first(where: {
-                $0.segmentIndex == segmentIndex
-                    && $0.segmentHash == hash
-                    && !$0.summary.isEmpty
-            }) {
-                segmentSummaries.append(reused.summary)
+            if let reused = persistedByIndex[segmentIndex],
+               reused.segmentHash == hash,
+               !reused.summary.isEmpty {
+                segmentSummaries[segmentIndex] = reused.summary
                 continue
             }
             let prompt = """
@@ -353,39 +383,47 @@ public final class BookSummaryEngine: @unchecked Sendable {
             片段：
             \(segment)
             """
-            let raw = try await complete(
+            requests.append(SummaryRequest(
+                index: segmentIndex,
                 system: "你是专业的书籍摘要助手，只输出摘要正文。",
                 prompt: prompt,
-                llm: llm, temperature: 0.2,
-                isCancelled: isCancelled)
-            let summary = Self.normalizeSummary(raw, maxLength: 80, preferredCut: 20)
-            guard !summary.isEmpty else {
-                throw AgentError.llm("辅助模型未返回有效的分段摘要")
-            }
+                maxLength: 80, preferredCut: 20,
+                emptyMessage: "辅助模型未返回有效的分段摘要"))
+        }
+
+        let outcome = await runSummaryBatch(requests, llm: llm, cancellation: cancellation)
+        for (segmentIndex, summary) in outcome.summaries.sorted(by: { $0.key < $1.key }) {
             try store.upsertChapterSegment(ChapterSegmentRecord(
                 docID: document.docID, sectionIndex: section.index,
-                segmentIndex: segmentIndex, segmentHash: hash,
+                segmentIndex: segmentIndex,
+                segmentHash: Self.shortHash(segments[segmentIndex]),
                 summary: summary, updatedAt: now.timeIntervalSince1970))
-            segmentSummaries.append(summary)
+            segmentSummaries[segmentIndex] = summary
+        }
+        if let failure = outcome.failure {
+            throw failure.asError()
+        }
+        guard let summaries = Self.collectedSummaries(segmentSummaries) else {
+            throw AgentError.llm("辅助模型未返回有效的分段摘要")
         }
 
         var reduced = try await reduceChapter(
-            section: section, segmentSummaries: segmentSummaries,
-            llm: llm, isCancelled: isCancelled)
+            section: section, segmentSummaries: summaries,
+            llm: llm, cancellation: cancellation)
         if reduced.count < 30 {
             let retryPrompt = """
             上一次摘要过短。请严格输出 50-100 字的中文摘要，只输出摘要正文。
 
             章节：\(section.heading)
             各片段摘要：
-            \(segmentSummaries.joined(separator: "\n"))
+            \(summaries.joined(separator: "\n"))
 
             上一次结果：\(reduced)
             """
             let retryRaw = try await complete(
                 system: "你是专业的书籍摘要助手，只输出摘要正文。",
                 prompt: retryPrompt, llm: llm, temperature: 0.2,
-                isCancelled: isCancelled)
+                cancellation: cancellation)
             let retry = Self.normalizeChapterSummary(retryRaw)
             if retry.count > reduced.count { reduced = retry }
         }
@@ -394,7 +432,7 @@ public final class BookSummaryEngine: @unchecked Sendable {
 
     private func reduceChapter(section: BookSection, segmentSummaries: [String],
                                llm: LLMService,
-                               isCancelled: () -> Bool) async throws -> String {
+                               cancellation: SummaryCancellation) async throws -> String {
         let prompt = """
         以下是章节《\(section.heading)》各片段的内容概括。请综合成 50-100 字的中文摘要，只输出摘要正文，不要标题或解释。
 
@@ -404,7 +442,7 @@ public final class BookSummaryEngine: @unchecked Sendable {
         let raw = try await complete(
             system: "你是专业的书籍摘要助手，只输出摘要正文。",
             prompt: prompt, llm: llm, temperature: 0.2,
-            isCancelled: isCancelled)
+            cancellation: cancellation)
         return Self.normalizeChapterSummary(raw)
     }
 
@@ -424,7 +462,8 @@ public final class BookSummaryEngine: @unchecked Sendable {
                                    markdown: String,
                                    llm: LLMService,
                                    now: Date,
-                                   isCancelled: () -> Bool) async throws -> BookSummaryRecord {
+                                   isCancelled: @escaping () -> Bool) async throws -> BookSummaryRecord {
+        let cancellation = SummaryCancellation(isCancelled)
         let resolved = resolve(document, markdown: markdown)
         if resolved.digest != document.digest || resolved.chaptersJSON != document.chapters {
             try? store.updateDocumentOutline(docID: document.docID,
@@ -480,16 +519,18 @@ public final class BookSummaryEngine: @unchecked Sendable {
         }
 
         let persisted = try store.bookSummarySegments(docID: document.docID)
-        var groupSummaries: [String] = []
+        let persistedByIndex = Dictionary(
+            persisted.map { ($0.groupIndex, $0) },
+            uniquingKeysWith: { first, _ in first })
+        var groupSummaries = [String?](repeating: nil, count: groups.count)
+        var requests: [SummaryRequest] = []
         for (groupIndex, group) in groups.enumerated() {
-            try Self.ensureNotCancelled(isCancelled)
+            try cancellation.check()
             let hash = Self.shortHash(group)
-            if let reused = persisted.first(where: {
-                $0.groupIndex == groupIndex
-                    && $0.groupHash == hash
-                    && !$0.summary.isEmpty
-            }) {
-                groupSummaries.append(reused.summary)
+            if let reused = persistedByIndex[groupIndex],
+               reused.groupHash == hash,
+               !reused.summary.isEmpty {
+                groupSummaries[groupIndex] = reused.summary
                 continue
             }
             let prompt = """
@@ -497,36 +538,45 @@ public final class BookSummaryEngine: @unchecked Sendable {
 
             \(group)
             """
-            let raw = try await complete(
+            requests.append(SummaryRequest(
+                index: groupIndex,
                 system: "你是专业的书籍摘要助手，只输出正文。",
-                prompt: prompt, llm: llm, temperature: 0.2,
-                isCancelled: isCancelled)
-            let summary = Self.normalizeSummary(raw, maxLength: 300, preferredCut: 100)
-            guard !summary.isEmpty else {
-                throw AgentError.llm("辅助模型未返回有效的分段摘要")
-            }
-            try store.upsertBookSummarySegment(BookSummarySegmentRecord(
-                docID: document.docID, groupIndex: groupIndex, groupHash: hash,
-                summary: summary, updatedAt: now.timeIntervalSince1970))
-            groupSummaries.append(summary)
+                prompt: prompt,
+                maxLength: 300, preferredCut: 100,
+                emptyMessage: "辅助模型未返回有效的分段摘要"))
         }
 
-        try Self.ensureNotCancelled(isCancelled)
+        let outcome = await runSummaryBatch(requests, llm: llm, cancellation: cancellation)
+        for (groupIndex, summary) in outcome.summaries.sorted(by: { $0.key < $1.key }) {
+            try store.upsertBookSummarySegment(BookSummarySegmentRecord(
+                docID: document.docID, groupIndex: groupIndex,
+                groupHash: Self.shortHash(groups[groupIndex]),
+                summary: summary, updatedAt: now.timeIntervalSince1970))
+            groupSummaries[groupIndex] = summary
+        }
+        if let failure = outcome.failure {
+            throw failure.asError()
+        }
+        guard let summaries = Self.collectedSummaries(groupSummaries) else {
+            throw AgentError.llm("辅助模型未返回有效的分段摘要")
+        }
+
+        try cancellation.check()
         let reducePrompt = """
         以下是全书各部分的梗概。请生成 300-500 字的中文全书摘要，覆盖主题、结构、核心观点与结论，只输出正文。
 
-        \(groupSummaries.enumerated().map { "\($0.offset + 1). \($0.element)" }
+        \(summaries.enumerated().map { "\($0.offset + 1). \($0.element)" }
             .joined(separator: "\n\n"))
         """
         let raw = try await complete(
             system: "你是专业的书籍摘要助手，只输出正文。",
             prompt: reducePrompt, llm: llm, temperature: 0.2,
-            isCancelled: isCancelled)
+            cancellation: cancellation)
         var summary = Self.normalizeBookSummary(raw)
         if summary.count < 100 {
             // 模型偶尔只回一行标题或极短概览；再给一次明确的长摘要机会，
             // 但只接受更长的结果，避免重试反而更差。
-            try Self.ensureNotCancelled(isCancelled)
+            try cancellation.check()
             let retryPrompt = """
             上一次全书摘要过短。请输出 300-500 字的中文全书摘要，覆盖主题、结构、核心观点与结论，只输出正文。
 
@@ -535,7 +585,7 @@ public final class BookSummaryEngine: @unchecked Sendable {
             let retryRaw = try await complete(
                 system: "你是专业的书籍摘要助手，只输出正文。",
                 prompt: retryPrompt, llm: llm, temperature: 0.2,
-                isCancelled: isCancelled)
+                cancellation: cancellation)
             let retry = Self.normalizeBookSummary(retryRaw)
             if retry.count > summary.count { summary = retry }
         }
@@ -562,18 +612,91 @@ public final class BookSummaryEngine: @unchecked Sendable {
 
     // MARK: - 辅助模型调用
 
+    /// 并发执行一批 map 请求。每个请求都是关闭 thinking 的独立会话，
+    /// 因此不会互相复用或污染 KV；`batchConcurrency` 限制同时占用的槽位。
+    private func runSummaryBatch(_ requests: [SummaryRequest],
+                                 llm: LLMService,
+                                 cancellation: SummaryCancellation) async -> SummaryBatchResult {
+        guard !requests.isEmpty else { return SummaryBatchResult() }
+        let llmBox = SummaryLLMBox(llm)
+        // 串行后端（GGUF/VLM）不支持多请求并行，退化为逐条执行，
+        // 避免并发任务堆在内部互斥锁前空等。
+        let limit = min(
+            llm.supportsConcurrentIsolatedRequests ? batchConcurrency : 1,
+            requests.count)
+        var result = SummaryBatchResult()
+
+        await withTaskGroup(of: SummaryBatchOutcome.self) { group in
+            var next = 0
+            for _ in 0..<limit {
+                let request = requests[next]
+                next += 1
+                group.addTask { [self] in
+                    await executeSummaryRequest(
+                        request, llm: llmBox.value, cancellation: cancellation)
+                }
+            }
+            while let outcome = await group.next() {
+                switch outcome {
+                case .success(let index, let summary):
+                    result.summaries[index] = summary
+                case .failure(let failure):
+                    // 只保留首个失败原因，并取消仍在跑的其它分片。
+                    if result.failure == nil { result.failure = failure }
+                    group.cancelAll()
+                }
+                if result.failure == nil, next < requests.count, !cancellation.cancelled {
+                    let request = requests[next]
+                    next += 1
+                    group.addTask { [self] in
+                        await executeSummaryRequest(
+                            request, llm: llmBox.value, cancellation: cancellation)
+                    }
+                }
+            }
+        }
+        return result
+    }
+
+    private func executeSummaryRequest(_ request: SummaryRequest,
+                                       llm: LLMService,
+                                       cancellation: SummaryCancellation) async -> SummaryBatchOutcome {
+        do {
+            try cancellation.check()
+            let raw = try await complete(
+                system: request.system, prompt: request.prompt,
+                llm: llm, temperature: 0.2, cancellation: cancellation)
+            let summary = Self.normalizeSummary(
+                raw, maxLength: request.maxLength,
+                preferredCut: request.preferredCut)
+            guard !summary.isEmpty else {
+                throw AgentError.llm(request.emptyMessage)
+            }
+            return .success(index: request.index, summary: summary)
+        } catch {
+            return .failure(SummaryBatchFailure(
+                isCancelled: cancellation.isCancellation(error),
+                message: error.localizedDescription))
+        }
+    }
+
+    /// 摘要专用调用：显式关闭 thinking，并使用不共享 KV 的独立会话。
     private func complete(system: String, prompt: String, llm: LLMService,
                           temperature: Double,
-                          isCancelled: () -> Bool) async throws -> String {
-        try Self.ensureNotCancelled(isCancelled)
+                          cancellation: SummaryCancellation) async throws -> String {
+        try cancellation.check()
         let messages = [
             ChatMessage(role: .system, content: system),
             ChatMessage(role: .user, content: prompt),
         ]
+        // 不依赖 `auxLocalLLMEnableThinking` 的全局默认值：用户可能为前台对话
+        // 打开思考模式，但摘要走 thinking 只会更慢且不一定更好。
+        let options = LLMRequestOptions(enableThinking: false, isolated: true)
         var output = ""
         for try await event in llm.chatStream(messages: messages, tools: [],
-                                              temperature: temperature) {
-            try Self.ensureNotCancelled(isCancelled)
+                                              temperature: temperature,
+                                              options: options) {
+            try cancellation.check()
             if event.kind == .content { output += event.content }
         }
         let trimmed = output.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -600,17 +723,15 @@ public final class BookSummaryEngine: @unchecked Sendable {
         min(maxSegmentBudget, max(1024, contextWindow - 1400))
     }
 
-    private static func ensureNotCancelled(_ isCancelled: () -> Bool) throws {
-        if Task.isCancelled || isCancelled() {
-            throw AgentError.cancelled
+    /// 按顺序收集分片摘要；任何缺口返回 nil，避免用缺段的结果生成摘要。
+    private static func collectedSummaries(_ values: [String?]) -> [String]? {
+        var result: [String] = []
+        result.reserveCapacity(values.count)
+        for value in values {
+            guard let value else { return nil }
+            result.append(value)
         }
-    }
-
-    private static func isCancellation(_ error: Error,
-                                       isCancelled: () -> Bool) -> Bool {
-        if isCancelled() || Task.isCancelled { return true }
-        if case AgentError.cancelled = error { return true }
-        return false
+        return result
     }
 
     private static func shortHash(_ text: String) -> String {
@@ -638,5 +759,68 @@ public final class BookSummaryEngine: @unchecked Sendable {
         default:
             return false
         }
+    }
+}
+
+// MARK: - 摘要批次
+
+/// 统一 `Task.isCancelled` 与协调器传入的取消闭包。
+private final class SummaryCancellation: @unchecked Sendable {
+    private let isCancelled: () -> Bool
+
+    init(_ isCancelled: @escaping () -> Bool) {
+        self.isCancelled = isCancelled
+    }
+
+    var cancelled: Bool {
+        Task.isCancelled || isCancelled()
+    }
+
+    func check() throws {
+        if cancelled { throw AgentError.cancelled }
+    }
+
+    func isCancellation(_ error: Error) -> Bool {
+        if cancelled { return true }
+        if case AgentError.cancelled = error { return true }
+        return false
+    }
+}
+
+/// 一次 map 分片的全部输入；由父任务预构建，避免并发任务读取可变状态。
+private struct SummaryRequest: Sendable {
+    let index: Int
+    let system: String
+    let prompt: String
+    let maxLength: Int
+    let preferredCut: Int
+    let emptyMessage: String
+}
+
+private struct SummaryBatchFailure: Sendable {
+    let isCancelled: Bool
+    let message: String
+
+    func asError() -> Error {
+        isCancelled ? AgentError.cancelled : AgentError.llm(message)
+    }
+}
+
+private enum SummaryBatchOutcome: Sendable {
+    case success(index: Int, summary: String)
+    case failure(SummaryBatchFailure)
+}
+
+private struct SummaryBatchResult {
+    var summaries: [Int: String] = [:]
+    var failure: SummaryBatchFailure?
+}
+
+/// 把 LLMService 引用交给并发任务；服务实例自身仍需线程安全。
+private final class SummaryLLMBox: @unchecked Sendable {
+    let value: LLMService
+
+    init(_ value: LLMService) {
+        self.value = value
     }
 }

@@ -12,6 +12,7 @@ private final class CoordinatorStubLLM: LLMService, PreloadableLLMService,
     @unchecked Sendable {
     let identifier = "coordinator-stub"
     let contextWindow = 32768
+    let supportsConcurrentIsolatedRequests = true
     private let lock = NSLock()
     private let delay: TimeInterval
     private let failFirstCalls: Int

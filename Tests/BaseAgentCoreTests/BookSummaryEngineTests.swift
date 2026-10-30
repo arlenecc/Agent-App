@@ -1,25 +1,35 @@
 import XCTest
 @testable import BaseAgentCore
 
-/// 记录每次调用并可按调用序号失败的辅助模型桩。
+/// 记录每次调用、请求选项与并发峰值的辅助模型桩。
 private final class SummaryStubLLM: LLMService, @unchecked Sendable {
     let identifier = "summary-stub"
     let contextWindow: Int
+    private let concurrent: Bool
     private let lock = NSLock()
     private var prompts: [String] = []
+    private var optionsStorage: [LLMRequestOptions] = []
     private var callCountStorage = 0
+    private var activeStorage = 0
+    private var peakStorage = 0
     private let failOnCall: Int?
     private let response: String
     private let responseForCall: ((Int) -> String)?
+    private let delay: TimeInterval
 
     init(contextWindow: Int = 32768, failOnCall: Int? = nil,
          response: String = String(repeating: "章节内容概括。", count: 8),
-         responseForCall: ((Int) -> String)? = nil) {
+         responseForCall: ((Int) -> String)? = nil,
+         delay: TimeInterval = 0, concurrent: Bool = true) {
         self.contextWindow = contextWindow
         self.failOnCall = failOnCall
         self.response = response
         self.responseForCall = responseForCall
+        self.delay = delay
+        self.concurrent = concurrent
     }
+
+    var supportsConcurrentIsolatedRequests: Bool { concurrent }
 
     var calls: Int {
         lock.lock()
@@ -33,24 +43,71 @@ private final class SummaryStubLLM: LLMService, @unchecked Sendable {
         return prompts
     }
 
+    var recordedOptions: [LLMRequestOptions] {
+        lock.lock()
+        defer { lock.unlock() }
+        return optionsStorage
+    }
+
+    var peakConcurrency: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return peakStorage
+    }
+
+    private func enterActive() {
+        lock.lock()
+        activeStorage += 1
+        peakStorage = max(peakStorage, activeStorage)
+        lock.unlock()
+    }
+
+    private func leaveActive() {
+        lock.lock()
+        activeStorage -= 1
+        lock.unlock()
+    }
+
     func chatStream(messages: [ChatMessage], tools: [JSONValue],
                     temperature: Double) -> AsyncThrowingStream<LLMStreamEvent, Error> {
+        chatStream(messages: messages, tools: tools,
+                   temperature: temperature, options: .default)
+    }
+
+    func chatStream(messages: [ChatMessage], tools: [JSONValue],
+                    temperature: Double,
+                    options: LLMRequestOptions) -> AsyncThrowingStream<LLMStreamEvent, Error> {
         lock.lock()
         callCountStorage += 1
         let current = callCountStorage
         prompts.append(messages.last?.content ?? "")
+        optionsStorage.append(options)
         let shouldFail = failOnCall == current
         let text = responseForCall?(current) ?? response
         lock.unlock()
+        enterActive()
 
         return AsyncThrowingStream { continuation in
             if shouldFail {
+                leaveActive()
                 continuation.finish(throwing: AgentError.cancelled)
                 return
             }
-            continuation.yield(LLMStreamEvent(kind: .content, content: text))
-            continuation.yield(LLMStreamEvent(kind: .done))
-            continuation.finish()
+            if delay <= 0 {
+                leaveActive()
+                continuation.yield(LLMStreamEvent(kind: .content, content: text))
+                continuation.yield(LLMStreamEvent(kind: .done))
+                continuation.finish()
+                return
+            }
+            let task = Task {
+                try? await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                leaveActive()
+                continuation.yield(LLMStreamEvent(kind: .content, content: text))
+                continuation.yield(LLMStreamEvent(kind: .done))
+                continuation.finish()
+            }
+            continuation.onTermination = { _ in task.cancel() }
         }
     }
 }
@@ -109,6 +166,55 @@ final class BookSummaryEngineTests: XCTestCase {
         XCTAssertEqual(pieces.joined(), longParagraph)
     }
 
+    func testLongChapterSegmentsRespectCharacterBudget() throws {
+        let body = String(repeating: "甲", count: 3_500)
+        let segments = BookSummaryEngine.splitSegments(
+            body, tokenBudget: 8_000, characterBudget: 3_000)
+        XCTAssertEqual(segments.map(\.count), [3_000, 500])
+        XCTAssertEqual(segments.joined(), body)
+    }
+
+    func testChapterUnderFourThousandCharactersStaysSingleMap() async throws {
+        let store = try makeStore()
+        let document = try insertDocument(store)
+        let engine = BookSummaryEngine(store: store)
+        let markdown = "# 第一章 概述\n\n" + String(repeating: "正文内容。", count: 780)
+
+        let stub = SummaryStubLLM()
+        let result = try await engine.processNextChapter(
+            document: document, markdown: markdown, llm: stub,
+            now: Date(), isCancelled: { false })
+
+        XCTAssertTrue(result.chapterCompleted)
+        // 单段 map + 一次 reduce，不额外切分。
+        XCTAssertEqual(stub.calls, 2)
+        XCTAssertEqual(try store.chapterSegments(
+            docID: document.docID, sectionIndex: 0).count, 1)
+    }
+
+    func testChapterOverFourThousandCharactersMapsAndCapsAtFive() async throws {
+        let store = try makeStore()
+        let document = try insertDocument(store)
+        let engine = BookSummaryEngine(store: store)
+        let paragraphs = ["甲", "乙", "丙", "丁", "戊", "己", "庚"].map {
+            String(repeating: $0, count: 3_500)
+        }
+        let markdown = "# 第一章 概述\n\n" + paragraphs.joined(separator: "\n\n")
+
+        let stub = SummaryStubLLM(delay: 0.05)
+        let result = try await engine.processNextChapter(
+            document: document, markdown: markdown, llm: stub,
+            now: Date(), isCancelled: { false })
+
+        XCTAssertTrue(result.chapterCompleted)
+        // 7 个 3500 字段落，每个按 3000 + 500 切分。
+        XCTAssertEqual(try store.chapterSegments(
+            docID: document.docID, sectionIndex: 0).count, 14)
+        XCTAssertGreaterThanOrEqual(stub.peakConcurrency, 4)
+        XCTAssertLessThanOrEqual(stub.peakConcurrency, 5,
+                                 "并发 map 不应超过 5 个")
+    }
+
     func testChapterSummaryReusesPersistedSegmentsAfterInterruption() async throws {
         let store = try makeStore()
         let document = try insertDocument(store)
@@ -127,21 +233,73 @@ final class BookSummaryEngineTests: XCTestCase {
             _ = try await engine.processNextChapter(
                 document: document, markdown: markdown, llm: interrupted,
                 now: Date(), isCancelled: { false })
-            XCTFail("第二次分段调用应被中断")
+            XCTFail("第二个分段调用应被中断")
         } catch {
-            XCTAssertEqual(interrupted.calls, 2)
+            // 并发 map 下失败发生在第 2 次调用后，仍在跑的其它分片可能已成功。
+            XCTAssertGreaterThanOrEqual(interrupted.calls, 2)
+            XCTAssertLessThanOrEqual(interrupted.calls, 3)
         }
-        XCTAssertEqual(try store.chapterSegments(docID: document.docID, sectionIndex: 0).count, 1)
+        let persistedCount = try store.chapterSegments(
+            docID: document.docID, sectionIndex: 0).count
+        XCTAssertGreaterThanOrEqual(persistedCount, 1)
+        XCTAssertLessThanOrEqual(persistedCount, 2)
 
         let resumed = SummaryStubLLM(contextWindow: 1600)
         let result = try await engine.processNextChapter(
             document: document, markdown: markdown, llm: resumed,
             now: Date(), isCancelled: { false })
-        // 已完成的第 1 段不再调用；补 2 段 map + 1 次 reduce。
-        XCTAssertEqual(resumed.calls, 3)
+        // 已落库的分段不再调用；剩余 map 加一次 reduce。
+        XCTAssertEqual(resumed.calls, 4 - persistedCount)
         XCTAssertTrue(result.chapterCompleted)
         XCTAssertEqual(try store.chapterSegments(docID: document.docID, sectionIndex: 0).count, 3)
         XCTAssertFalse(result.summary.isEmpty)
+        for options in interrupted.recordedOptions + resumed.recordedOptions {
+            XCTAssertEqual(options.enableThinking, false)
+            XCTAssertTrue(options.isolated)
+        }
+    }
+
+    func testChapterSegmentMapRunsConcurrently() async throws {
+        let store = try makeStore()
+        let document = try insertDocument(store)
+        let engine = BookSummaryEngine(store: store)
+        let paragraphs = ["甲", "乙", "丙", "丁", "戊"].map {
+            String(repeating: $0, count: 600)
+        }
+        let markdown = "# 第一章 概述\n\n" + paragraphs.joined(separator: "\n\n")
+
+        let stub = SummaryStubLLM(contextWindow: 1600, delay: 0.1)
+        let result = try await engine.processNextChapter(
+            document: document, markdown: markdown, llm: stub,
+            now: Date(), isCancelled: { false })
+
+        XCTAssertTrue(result.chapterCompleted)
+        XCTAssertGreaterThanOrEqual(stub.peakConcurrency, 4,
+                                    "默认 5 个分片应并行执行而不是逐段串行")
+        XCTAssertLessThanOrEqual(stub.peakConcurrency, 5,
+                                 "并发分片数应受 batchConcurrency 限制")
+        XCTAssertEqual(try store.chapterSegments(docID: document.docID, sectionIndex: 0).count, 5)
+    }
+
+    func testSerialBackendFallsBackToSequentialMap() async throws {
+        let store = try makeStore()
+        let document = try insertDocument(store)
+        let engine = BookSummaryEngine(store: store)
+        let paragraphs = ["甲", "乙", "丙"].map {
+            String(repeating: $0, count: 600)
+        }
+        let markdown = "# 第一章 概述\n\n" + paragraphs.joined(separator: "\n\n")
+
+        let stub = SummaryStubLLM(contextWindow: 1600, delay: 0.05,
+                                   concurrent: false)
+        let result = try await engine.processNextChapter(
+            document: document, markdown: markdown, llm: stub,
+            now: Date(), isCancelled: { false })
+
+        XCTAssertTrue(result.chapterCompleted)
+        XCTAssertEqual(stub.peakConcurrency, 1,
+                       "单 context 后端不应并发提交分片")
+        XCTAssertEqual(try store.chapterSegments(docID: document.docID, sectionIndex: 0).count, 3)
     }
 
     func testChapterSummaryNormalizesToFiftyToOneHundredCharacters() throws {
@@ -210,6 +368,12 @@ final class BookSummaryEngineTests: XCTestCase {
         XCTAssertEqual(record.chapterCount, sections)
         XCTAssertEqual(try store.summaryJob(docID: document.docID)?.status, .completed)
         XCTAssertGreaterThanOrEqual(stub.calls, groups.count + 1)
+        XCTAssertGreaterThan(groups.count, 1)
+        for options in stub.recordedOptions {
+            XCTAssertEqual(options.enableThinking, false,
+                           "全书 map-reduce 也必须强制关闭 thinking")
+            XCTAssertTrue(options.isolated)
+        }
     }
 
     func testBookSummaryReturnsToChapterPhaseWhenChapterContentChanged() async throws {
