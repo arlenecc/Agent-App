@@ -365,3 +365,438 @@ private func testWriteUInt64(_ value: UInt64, to data: inout Data, at offset: In
     ]
     data.replaceSubrange(offset..<(offset + 8), with: bytes)
 }
+
+// MARK: - BIFF8 工作簿
+
+/// 仅测试使用：构造带 BIFF8 记录的最小 `.xls` 工作簿。
+///
+/// 覆盖产品解析器需要的全局子流（BOUNDSHEET/SST+CONTINUE/FORMAT/XF/
+/// DATEMODE/FILEPASS）与常见单元格记录。所有记录按 BIFF8 小端格式写入，
+/// 表格偏移按最终流长度计算。
+struct BIFF8TestBuilder {
+
+    struct Sheet {
+        let name: String
+        let cells: [Cell]
+    }
+
+    struct Cell {
+        enum Value {
+            case labelSST(Int)
+            case label(String)
+            case number(Double, xf: UInt16)
+            case rk(UInt32, xf: UInt16)
+            case mulrk(values: [UInt32], xf: UInt16)
+            case formula(tokens: [UInt8], result: Data, string: String?, xf: UInt16)
+            case boolean(Bool, xf: UInt16)
+            case error(UInt8, xf: UInt16)
+            case blank(xf: UInt16)
+        }
+
+        let row: Int
+        let column: Int
+        let value: Value
+    }
+
+    var sheets: [Sheet]
+    var sharedStrings: [String]
+    var formats: [(id: UInt16, value: String)]
+    var xfFormatIDs: [UInt16]
+    var date1904: Bool
+    var filePass: Bool
+    var streamName: String
+    /// 在指定字符串数量后拆出 CONTINUE（不额外写字符编码标志字节）。
+    var sstContinueAfterString: Int?
+    /// 在共享字符串内部指定字符数处拆出 CONTINUE，并在续段首写编码标志字节。
+    var sstSplitInsideString: (index: Int, characters: Int)?
+
+    init(sheets: [Sheet],
+         sharedStrings: [String] = [],
+         formats: [(id: UInt16, value: String)] = [],
+         xfFormatIDs: [UInt16] = [0],
+         date1904: Bool = false,
+         filePass: Bool = false,
+         streamName: String = "Workbook",
+         sstContinueAfterString: Int? = nil,
+         sstSplitInsideString: (index: Int, characters: Int)? = nil) {
+        self.sheets = sheets
+        self.sharedStrings = sharedStrings
+        self.formats = formats
+        self.xfFormatIDs = xfFormatIDs
+        self.date1904 = date1904
+        self.filePass = filePass
+        self.streamName = streamName
+        self.sstContinueAfterString = sstContinueAfterString
+        self.sstSplitInsideString = sstSplitInsideString
+    }
+
+    func build() throws -> OLE2TestFile {
+        let sheetPayloads = sheets.map(sheetData)
+        let placeholder = globalData(sheetOffsets: Array(repeating: 0, count: sheets.count))
+
+        var offsets: [UInt32] = []
+        var next = UInt32(placeholder.count)
+        for payload in sheetPayloads {
+            offsets.append(next)
+            next += UInt32(payload.count)
+        }
+
+        var stream = globalData(sheetOffsets: offsets)
+        for payload in sheetPayloads { stream.append(payload) }
+
+        return try OLE2TestBuilder(streams: [.init(streamName, stream)]).build()
+    }
+
+    // MARK: 全局子流
+
+    private func globalData(sheetOffsets: [UInt32]) -> Data {
+        var data = Data()
+        data.append(record(type: 0x0809, payload: bofPayload(type: 0x0005)))
+        if filePass {
+            data.append(record(type: 0x002F, payload: Data([0x00, 0x00, 0x00, 0x00])))
+        }
+        data.append(record(type: 0x0022,
+                           payload: Data(biffBytes(date1904 ? UInt16(1) : UInt16(0)))))
+        for format in formats {
+            var payload = Data(biffBytes(format.id))
+            payload.append(xlUnicodeString(format.value))
+            data.append(record(type: 0x041E, payload: payload))
+        }
+        for formatID in xfFormatIDs {
+            data.append(record(type: 0x00E0, payload: xfPayload(formatID: formatID)))
+        }
+        for (index, sheet) in sheets.enumerated() {
+            let offset = index < sheetOffsets.count ? sheetOffsets[index] : 0
+            data.append(record(type: 0x0085,
+                               payload: boundsheetPayload(name: sheet.name, offset: offset)))
+        }
+        for sstRecord in sstRecords() { data.append(sstRecord) }
+        data.append(record(type: 0x000A, payload: Data()))
+        return data
+    }
+
+    private func bofPayload(type: UInt16) -> Data {
+        var bytes: [UInt8] = []
+        bytes += biffBytes(UInt16(0x0600))
+        bytes += biffBytes(type)
+        bytes += biffBytes(UInt16(0x0DBB))
+        bytes += biffBytes(UInt16(0x07CC))
+        bytes += biffBytes(UInt32(0x00000041))
+        bytes += biffBytes(UInt16(0x0600))
+        bytes += [0x00, 0x00]
+        return Data(bytes)
+    }
+
+    private func xfPayload(formatID: UInt16) -> Data {
+        var payload = [UInt8](repeating: 0, count: 20)
+        let format = biffBytes(formatID)
+        payload[2] = format[0]
+        payload[3] = format[1]
+        return Data(payload)
+    }
+
+    private func boundsheetPayload(name: String, offset: UInt32) -> Data {
+        var bytes = biffBytes(offset)
+        bytes += [0x00, 0x00]
+        let units = Array(name.utf16)
+        bytes += [UInt8(min(units.count, 255)), 0x01]
+        for unit in units.prefix(255) { bytes += biffBytes(unit) }
+        return Data(bytes)
+    }
+
+    // MARK: SST / CONTINUE
+
+    private struct SSTParts {
+        let units: [UInt16]
+        let flags: UInt8
+        let compressed: Bool
+    }
+
+    private func sstRecords() -> [Data] {
+        guard !sharedStrings.isEmpty else { return [] }
+        var header = Data(biffBytes(UInt32(sharedStrings.count)))
+        header.append(contentsOf: biffBytes(UInt32(sharedStrings.count)))
+
+        let parts = sharedStrings.map(sstParts)
+        if let split = sstSplitInsideString,
+           split.index >= 0, split.index < parts.count {
+            let target = parts[split.index]
+            let splitCount = min(max(0, split.characters), target.units.count)
+            if splitCount > 0, splitCount < target.units.count {
+                var first = header
+                for index in 0..<split.index { first.append(sstPayload(parts[index])) }
+                first.append(sstHeader(target))
+                first.append(sstChars(target, start: 0, end: splitCount))
+
+                var continuation = Data([target.flags])
+                continuation.append(sstChars(target, start: splitCount,
+                                             end: target.units.count))
+                for index in (split.index + 1)..<parts.count {
+                    continuation.append(sstPayload(parts[index]))
+                }
+                return [record(type: 0x00FC, payload: first),
+                        record(type: 0x003C, payload: continuation)]
+            }
+        }
+
+        if let split = sstContinueAfterString,
+           split > 0, split < parts.count {
+            var first = header
+            for index in 0..<split { first.append(sstPayload(parts[index])) }
+            var continuation = Data()
+            for index in split..<parts.count {
+                continuation.append(sstPayload(parts[index]))
+            }
+            return [record(type: 0x00FC, payload: first),
+                    record(type: 0x003C, payload: continuation)]
+        }
+
+        var all = header
+        for part in parts { all.append(sstPayload(part)) }
+        return [record(type: 0x00FC, payload: all)]
+    }
+
+    private func sstParts(_ value: String) -> SSTParts {
+        let units = Array(value.utf16)
+        let compressed = units.allSatisfy { $0 < 0x100 }
+        return SSTParts(units: units, flags: compressed ? 0x00 : 0x01,
+                        compressed: compressed)
+    }
+
+    private func sstHeader(_ parts: SSTParts) -> Data {
+        var data = Data(biffBytes(UInt16(parts.units.count)))
+        data.append(parts.flags)
+        return data
+    }
+
+    private func sstPayload(_ parts: SSTParts) -> Data {
+        var data = sstHeader(parts)
+        data.append(sstChars(parts, start: 0, end: parts.units.count))
+        return data
+    }
+
+    private func sstChars(_ parts: SSTParts, start: Int, end: Int) -> Data {
+        var data = Data()
+        if parts.compressed {
+            for unit in parts.units[start..<end] { data.append(UInt8(unit)) }
+        } else {
+            for unit in parts.units[start..<end] {
+                data.append(contentsOf: biffBytes(unit))
+            }
+        }
+        return data
+    }
+
+    // MARK: 工作表
+
+    private func sheetData(_ sheet: Sheet) -> Data {
+        var data = Data()
+        data.append(record(type: 0x0809, payload: bofPayload(type: 0x0010)))
+        for cell in sheet.cells { data.append(cellRecords(cell)) }
+        data.append(record(type: 0x000A, payload: Data()))
+        return data
+    }
+
+    private func cellRecords(_ cell: Cell) -> Data {
+        let row = UInt16(min(max(cell.row, 0), 65_535))
+        let column = UInt16(min(max(cell.column, 0), 65_535))
+
+        switch cell.value {
+        case .labelSST(let index):
+            var payload = Data()
+            payload.append(contentsOf: biffBytes(row))
+            payload.append(contentsOf: biffBytes(column))
+            payload.append(contentsOf: biffBytes(UInt16(0)))
+            payload.append(contentsOf: biffBytes(UInt32(index)))
+            return record(type: 0x00FD, payload: payload)
+
+        case .label(let text):
+            var payload = Data()
+            payload.append(contentsOf: biffBytes(row))
+            payload.append(contentsOf: biffBytes(column))
+            payload.append(contentsOf: biffBytes(UInt16(0)))
+            payload.append(xlUnicodeString(text))
+            return record(type: 0x0204, payload: payload)
+
+        case .number(let value, let xf):
+            var payload = Data()
+            payload.append(contentsOf: biffBytes(row))
+            payload.append(contentsOf: biffBytes(column))
+            payload.append(contentsOf: biffBytes(xf))
+            payload.append(contentsOf: biffBytes(value))
+            return record(type: 0x0203, payload: payload)
+
+        case .rk(let rk, let xf):
+            var payload = Data()
+            payload.append(contentsOf: biffBytes(row))
+            payload.append(contentsOf: biffBytes(column))
+            payload.append(contentsOf: biffBytes(xf))
+            payload.append(contentsOf: biffBytes(rk))
+            return record(type: 0x027E, payload: payload)
+
+        case .mulrk(let values, let xf):
+            guard !values.isEmpty else { return Data() }
+            var payload = Data()
+            payload.append(contentsOf: biffBytes(row))
+            payload.append(contentsOf: biffBytes(column))
+            for value in values {
+                payload.append(contentsOf: biffBytes(xf))
+                payload.append(contentsOf: biffBytes(value))
+            }
+            payload.append(contentsOf: biffBytes(
+                UInt16(min(Int(column) + values.count - 1, 65_535))))
+            return record(type: 0x00BD, payload: payload)
+
+        case .formula(let tokens, let result, let string, let xf):
+            var payload = Data()
+            payload.append(contentsOf: biffBytes(row))
+            payload.append(contentsOf: biffBytes(column))
+            payload.append(contentsOf: biffBytes(xf))
+            var cached = result
+            if cached.count < 8 { cached.append(Data(count: 8 - cached.count)) }
+            if cached.count > 8 { cached = Data(cached.prefix(8)) }
+            payload.append(cached)
+            payload.append(contentsOf: biffBytes(UInt16(0)))
+            payload.append(contentsOf: biffBytes(UInt32(0)))
+            payload.append(contentsOf: biffBytes(UInt16(tokens.count)))
+            payload.append(contentsOf: tokens)
+            var records = record(type: 0x0006, payload: payload)
+            if let string {
+                records.append(record(type: 0x0207, payload: xlUnicodeString(string)))
+            }
+            return records
+
+        case .boolean(let value, let xf):
+            var payload = Data()
+            payload.append(contentsOf: biffBytes(row))
+            payload.append(contentsOf: biffBytes(column))
+            payload.append(contentsOf: biffBytes(xf))
+            payload.append(value ? 1 : 0)
+            payload.append(0)
+            return record(type: 0x0205, payload: payload)
+
+        case .error(let code, let xf):
+            var payload = Data()
+            payload.append(contentsOf: biffBytes(row))
+            payload.append(contentsOf: biffBytes(column))
+            payload.append(contentsOf: biffBytes(xf))
+            payload.append(code)
+            payload.append(1)
+            return record(type: 0x0205, payload: payload)
+
+        case .blank(let xf):
+            var payload = Data()
+            payload.append(contentsOf: biffBytes(row))
+            payload.append(contentsOf: biffBytes(column))
+            payload.append(contentsOf: biffBytes(xf))
+            return record(type: 0x0201, payload: payload)
+        }
+    }
+
+    // MARK: 记录 / 字符串编码
+
+    private func record(type: UInt16, payload: Data) -> Data {
+        var data = Data(biffBytes(type))
+        data.append(contentsOf: biffBytes(UInt16(payload.count)))
+        data.append(payload)
+        return data
+    }
+
+    private func xlUnicodeString(_ value: String) -> Data {
+        let units = Array(value.utf16)
+        let compressed = units.allSatisfy { $0 < 0x100 }
+        var data = Data(biffBytes(UInt16(units.count)))
+        data.append(compressed ? 0x00 : 0x01)
+        if compressed {
+            for unit in units { data.append(UInt8(unit)) }
+        } else {
+            for unit in units { data.append(contentsOf: biffBytes(unit)) }
+        }
+        return data
+    }
+
+    private func biffBytes(_ value: UInt16) -> [UInt8] {
+        [UInt8(truncatingIfNeeded: value), UInt8(truncatingIfNeeded: value >> 8)]
+    }
+
+    private func biffBytes(_ value: UInt32) -> [UInt8] {
+        [UInt8(truncatingIfNeeded: value),
+         UInt8(truncatingIfNeeded: value >> 8),
+         UInt8(truncatingIfNeeded: value >> 16),
+         UInt8(truncatingIfNeeded: value >> 24)]
+    }
+
+    private func biffBytes(_ value: Double) -> [UInt8] {
+        let bits = UInt64(value.bitPattern)
+        return [UInt8(truncatingIfNeeded: bits),
+                UInt8(truncatingIfNeeded: bits >> 8),
+                UInt8(truncatingIfNeeded: bits >> 16),
+                UInt8(truncatingIfNeeded: bits >> 24),
+                UInt8(truncatingIfNeeded: bits >> 32),
+                UInt8(truncatingIfNeeded: bits >> 40),
+                UInt8(truncatingIfNeeded: bits >> 48),
+                UInt8(truncatingIfNeeded: bits >> 56)]
+    }
+
+    // MARK: 测试辅助
+
+    /// RK 编码：bit1 = 整数标志，低 2 位之外存放 30 位有符号整数。
+    static func rkInteger(_ value: Int32) -> UInt32 {
+        (UInt32(bitPattern: value) << 2) | 0x02
+    }
+
+    static func numberResult(_ value: Double) -> Data {
+        let bits = UInt64(value.bitPattern)
+        var bytes: [UInt8] = []
+        for shift in stride(from: 0, through: 56, by: 8) {
+            bytes.append(UInt8(truncatingIfNeeded: bits >> UInt64(shift)))
+        }
+        return Data(bytes)
+    }
+
+    /// 公式缓存结果为字符串：0xFFFF + 类型 0（真实文本在后随 STRING 记录）。
+    static func stringResult() -> Data {
+        Data([0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00])
+    }
+
+    static func areaToken(firstRow: Int, lastRow: Int,
+                          firstColumn: Int, lastColumn: Int) -> [UInt8] {
+        var bytes: [UInt8] = [0x25]
+        bytes += littleEndian(UInt16(firstRow))
+        bytes += littleEndian(UInt16(lastRow))
+        bytes += littleEndian(UInt16(firstColumn))
+        bytes += littleEndian(UInt16(lastColumn))
+        return bytes
+    }
+
+    static func refToken(row: Int, column: Int) -> [UInt8] {
+        var bytes: [UInt8] = [0x24]
+        bytes += littleEndian(UInt16(row))
+        bytes += littleEndian(UInt16(column))
+        return bytes
+    }
+
+    static func intToken(_ value: UInt16) -> [UInt8] {
+        [0x1E] + littleEndian(value)
+    }
+
+    static func funcVarToken(function: UInt16, arguments: UInt8) -> [UInt8] {
+        [0x42, arguments] + littleEndian(function)
+    }
+
+    static func stringToken(_ value: String) -> [UInt8] {
+        let units = Array(value.utf16)
+        let compressed = units.allSatisfy { $0 < 0x100 }
+        var bytes: [UInt8] = [0x17, UInt8(min(units.count, 255)), compressed ? 0 : 1]
+        if compressed {
+            bytes += units.prefix(255).map { UInt8($0) }
+        } else {
+            for unit in units.prefix(255) { bytes += littleEndian(unit) }
+        }
+        return bytes
+    }
+
+    private static func littleEndian(_ value: UInt16) -> [UInt8] {
+        [UInt8(truncatingIfNeeded: value), UInt8(truncatingIfNeeded: value >> 8)]
+    }
+}
