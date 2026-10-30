@@ -584,6 +584,13 @@ public final class RAGEngine {
         (embedding as? MatryoshkaEmbedding)?.truncateDimension ?? 0
     }
 
+    /// 当前生效的落盘元素类型：embedding provider 的硬性约束优先
+    /// （jina-v5 固定 int8），否则使用用户配置。
+    public var effectiveVectorElementType: VectorElementType {
+        (embedding as? EmbeddingVectorElementConstraining)?
+            .requiredVectorElementType ?? config.ragVectorElementType
+    }
+
     /// 索引指纹：向量语义 + 落盘布局（`embedding.identifier | dimension |
     /// matryoshkaDim | elementType`）。任一字段变化都必须显式重建。
     ///
@@ -595,7 +602,7 @@ public final class RAGEngine {
             embedding.identifier,
             "dimension=\(embedding.dimension)",
             "matryoshka=\(effectiveMatryoshkaDimension)",
-            "element=\(config.ragVectorElementType.rawValue)",
+            "element=\(effectiveVectorElementType.rawValue)",
         ].joined(separator: "|")
     }
 
@@ -608,7 +615,7 @@ public final class RAGEngine {
         let newStore = try VectorStore(dbPath: self.indexDBPath,
                                        dimension: embedding.dimension,
                                        enableSQLiteVec: config.ragSQLiteVecEnabled,
-                                       elementType: config.ragVectorElementType,
+                                       elementType: effectiveVectorElementType,
                                        indexFingerprint: vectorIndexFingerprint)
         if newStore.didResetForDimensionChange {
             // 空库按新维度/类型采纳配置后，缓存的 manifest 若不同步失效，
@@ -1143,7 +1150,7 @@ public final class RAGEngine {
             ("embedding_model", embeddingModel),
             // 落盘元素类型与 Matryoshka 截断维都会改变向量本身（量化/截断），
             // 旧切片必须按新配置重算；未实际截断时记 0，避免无谓重建。
-            ("vector_element_type", config.ragVectorElementType.rawValue),
+            ("vector_element_type", effectiveVectorElementType.rawValue),
             ("matryoshka_dim", String(effectiveMatryoshkaDimension)),
         ]
         return fields.map { "\($0.0)=\($0.1)" }.joined(separator: "\n")
@@ -2275,7 +2282,7 @@ public final class RAGEngine {
                        timeout: Double? = nil) -> [String: JSONValue] {
         // fp16 等 sqlite-vec 不支持的类型：打开库会直接失败，优先给出配置原因，
         // 否则调用方只能看到笼统的「向量库不可用」。
-        if let unsupported = config.ragVectorElementType.unsupportedReason {
+        if let unsupported = effectiveVectorElementType.unsupportedReason {
             return unsupportedVectorTypeSnapshot(unsupported)
         }
         if let cached = cachedStatus(maxAge: maxAge) {
@@ -2390,7 +2397,7 @@ public final class RAGEngine {
             "source_count": .int(0),
             "sources": .array([]),
         ]
-        snapshot["vector_element_type"] = .string(config.ragVectorElementType.rawValue)
+        snapshot["vector_element_type"] = .string(effectiveVectorElementType.rawValue)
         snapshot["matryoshka_dim"] = .int(effectiveMatryoshkaDimension)
         snapshot["vector_rebuild_required"] = .bool(true)
         snapshot["rebuild_reason"] = .string(reason)
@@ -2411,7 +2418,7 @@ public final class RAGEngine {
             "chunks_stored": .int(0),
             "source_count": .int(0),
             "sources": .array([]),
-            "vector_element_type": .string(config.ragVectorElementType.rawValue),
+            "vector_element_type": .string(effectiveVectorElementType.rawValue),
             "matryoshka_dim": .int(effectiveMatryoshkaDimension),
             "vector_rebuild_required": .bool(false),
         ]

@@ -45,12 +45,18 @@ public enum MatryoshkaMode: String, CaseIterable, Sendable {
 ///
 /// 入库与查询共用同一个装饰器实例，保证两侧变换完全一致。
 public final class MatryoshkaEmbedding: EmbeddingProvider, EmbeddingTokenCounting,
+                                        EmbeddingVectorElementConstraining,
                                         @unchecked Sendable {
     private let base: EmbeddingProvider
     private let tokenSource: EmbeddingTokenCounting?
 
     /// 目标截断维（模型原生维更小时按原生维）。
     public let truncateDimension: Int
+
+    /// 透传底层模型的落盘类型约束（例如 jina-v5 必须 int8）。
+    public var requiredVectorElementType: VectorElementType? {
+        (base as? EmbeddingVectorElementConstraining)?.requiredVectorElementType
+    }
 
     public init(base: EmbeddingProvider, truncateDimension: Int) {
         self.base = base

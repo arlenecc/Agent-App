@@ -902,8 +902,12 @@ struct SettingsView: View {
     // MARK: - 向量存储 / Matryoshka
 
     /// 当前 Embedding 路径是否指向 jina-v5（provider 自身固定 128 维）。
+    /// 空路径 + MLX 会用内置默认 jina-v5，因此同样按 V5 处理。
     private var isJinaV5Embedding: Bool {
         let lower = embeddingPath.lowercased()
+        if lower.isEmpty {
+            return normalizedEmbeddingType(embeddingBackend) == "mlx"
+        }
         return lower.contains("jina-embeddings-v5")
             || lower.contains("jina_v5")
             || lower.contains("jina-v5")
@@ -920,8 +924,11 @@ struct SettingsView: View {
         }
         .labelsHidden()
         .frame(width: 120)
-        .help("向量落盘元素类型：int8 体积是 fp32 的 1/4（默认）；bin 体积最小但只有汉明排序。"
-            + "fp16 在 sqlite-vec 0.1.9 中不可用，选择后应用配置会直接报错。")
+        .disabled(isJinaV5Embedding)
+        .help(isJinaV5Embedding
+            ? "jina-embeddings-v5 固定 128 维并强制 int8 落盘/检索，元素类型不可更改。"
+            : "向量落盘元素类型：int8 体积是 fp32 的 1/4（默认）；bin 体积最小但只有汉明排序。"
+                + "fp16 在 sqlite-vec 0.1.9 中不可用，选择后应用配置会直接报错。")
         Text("Matryoshka").font(.caption)
         Picker("", selection: $matryoshkaMode) {
             ForEach(MatryoshkaMode.allCases, id: \.rawValue) { mode in
@@ -933,11 +940,11 @@ struct SettingsView: View {
         .help("截断向量后强制重新归一化，入库与查询使用同一套变换。"
             + "自动模式只对 nomic / jina-v3 等已知支持该特性的模型启用。")
         if isJinaV5Embedding {
-            Text("固定 128 维（Matryoshka 不生效）")
+            Text("固定 128 维 + int8（Matryoshka 不生效）")
                 .font(.caption)
                 .foregroundStyle(.secondary)
                 .help("jina-embeddings-v5 的 provider 已固定输出 128 维并重新归一化，"
-                    + "Matryoshka 截断不会再次生效。")
+                    + "落盘与检索统一 int8，Matryoshka 截断不会再次生效。")
         } else {
             Picker("", selection: $matryoshkaDim) {
                 Text("128 维").tag(128)
@@ -1177,7 +1184,7 @@ struct SettingsView: View {
         ocrBinarize = config.ragOCRBinarize
         chunkSize = config.ragChunkSize
         chunkOverlap = config.ragChunkOverlap
-        vectorElementType = config.ragVectorElementType
+        vectorElementType = isJinaV5Embedding ? .int8 : config.ragVectorElementType
         matryoshkaMode = config.ragMatryoshka
         matryoshkaDim = config.ragMatryoshkaDim
         rerankEnabled = config.ragRerankEnabled
@@ -1393,7 +1400,9 @@ struct SettingsView: View {
             return nil
         }
         // fp16：sqlite-vec 0.1.9 没有该元素类型，直接拒绝应用并给出明确提示。
-        if let reason = vectorElementType.unsupportedReason {
+        // jina-v5 固定 int8，不受用户选择影响。
+        let effectiveElementType = isJinaV5Embedding ? .int8 : vectorElementType
+        if let reason = effectiveElementType.unsupportedReason {
             statusMessage = reason
             return nil
         }
@@ -1497,7 +1506,7 @@ struct SettingsView: View {
         config.ragAutoIngest = autoIngest
         config.ragIngestConcurrency = min(max(1, ingestConcurrency), 10)
         config.ragVisionConcurrency = min(max(1, visionConcurrency), 8)
-        config.ragVectorElementType = vectorElementType
+        config.ragVectorElementType = effectiveElementType
         config.ragMatryoshka = matryoshkaMode
         config.ragMatryoshkaDim = isJinaV5Embedding
             ? 128

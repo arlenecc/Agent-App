@@ -5,7 +5,9 @@ import Foundation
 /// - 输入前缀按模型族统一处理（`EmbeddingPrefixStrategy`）；
 /// - 输出做 attention-mask 加权 mean pooling，再 L2 归一化；
 /// - 按子批执行，避免长文本批量推理一次性占用过多内存。
-public final class ONNXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCounting, @unchecked Sendable {
+public final class ONNXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCounting,
+                                          EmbeddingVectorElementConstraining,
+                                          @unchecked Sendable {
     public let identifier: String
     public let modelName: String
     public let directory: URL
@@ -35,6 +37,12 @@ public final class ONNXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCount
         dimensionLock.lock()
         defer { dimensionLock.unlock() }
         return storedDimension
+    }
+
+    /// jina-v5 的 ONNX 输出同样固定 128 维并要求 int8 落盘；
+    /// 其它 ONNX embedding 仍尊重用户配置。
+    public var requiredVectorElementType: VectorElementType? {
+        isJinaV5 ? .int8 : nil
     }
 
     /// - Parameters:

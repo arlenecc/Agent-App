@@ -6,11 +6,16 @@ import Foundation
 /// 返回 128 维单位向量：内部已完成 Matryoshka 截断与重新 L2 归一化，
 /// 外层 `MatryoshkaEmbedding` 不会再包装它。
 final class JinaV5MLXEmbeddingProvider: EmbeddingProvider,
-                                       EmbeddingTokenCounting, @unchecked Sendable {
+                                       EmbeddingTokenCounting,
+                                       EmbeddingVectorElementConstraining,
+                                       @unchecked Sendable {
     let identifier: String
     let modelName: String
     let directory: URL
     let prefixStrategy: EmbeddingPrefixStrategy
+
+    /// V5 固定 128 维后必须量化成 int8 入库/检索。
+    var requiredVectorElementType: VectorElementType? { .int8 }
 
     private let maxLength: Int
     private let state = JinaV5MLXLoadState()

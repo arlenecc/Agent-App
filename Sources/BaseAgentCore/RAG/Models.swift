@@ -119,6 +119,14 @@ public protocol EmbeddingTokenCounting: Sendable {
     func makeTokenCounter() async -> (@Sendable (String) -> Int)?
 }
 
+/// embedding 模型对落盘元素类型的硬性要求。
+///
+/// 返回非 nil 时覆盖 `rag_vector_element_type`：例如 jina-v5 的检索语义
+/// 依赖 128 维截断后的 int8 量化，不能落成 fp32/bin。
+public protocol EmbeddingVectorElementConstraining: Sendable {
+    var requiredVectorElementType: VectorElementType? { get }
+}
+
 public extension EmbeddingProvider {
     func unload() async {}
     var maxConcurrentRuns: Int { 1 }
