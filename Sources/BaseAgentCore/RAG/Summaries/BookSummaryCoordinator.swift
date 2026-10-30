@@ -216,7 +216,10 @@ public final class BookSummaryCoordinator: @unchecked Sendable {
         }
 
         let job = try? store.summaryJob(docID: document.docID)
-        let isBookSlot = job?.status == .summarizingBook || job?.status == .completed
+        // 旧版无标题纯正文可能停在 completed / total_sections=0：先回逐章阶段
+        // 合成「全文」章节摘要，否则会调用注定失败的全书汇总。
+        let isBookSlot = job?.status == .summarizingBook
+            || (job?.status == .completed && (job?.totalSections ?? 0) > 0)
         lock.lock()
         currentDocName = document.docName
         currentSection = max(0, job?.nextSection ?? 0)

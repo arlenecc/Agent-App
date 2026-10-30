@@ -27,8 +27,16 @@ public enum OutlineResolver {
         }
     }
 
+    /// - Parameters:
+    ///   - preferParser: 结构化文档（Office/HTML/EPUB 等）的解析器标题更可信，
+    ///     即使正则把列表项等伪标题识别得“更多”也应优先解析器；要求解析器条目
+    ///     至少多数能锚定到正文，避免残缺目录覆盖正则结果。
+    ///   - includeSections: 入库只需要 digest/chapters 时传 false，避免为整份
+    ///     文档复制所有章节正文。
     public static func resolve(markdown: String, parsedOutline: String,
-                               docName: String) -> ResolvedBookOutline {
+                               docName: String,
+                               preferParser: Bool = false,
+                               includeSections: Bool = true) -> ResolvedBookOutline {
         let regexNodes = DocumentOutline.extract(markdown, source: docName)
         let regexCandidate = makeCandidate(nodes: regexNodes,
                                            totalEntries: regexNodes.count,
@@ -36,9 +44,14 @@ public enum OutlineResolver {
                                            source: "regex", markdown: markdown)
         let parserCandidate = makeParserCandidate(parsedOutline, markdown: markdown)
 
+        let parserIsMajority = parserCandidate.anchoredEntries > 0
+            && parserCandidate.anchoredEntries * 2 > parserCandidate.totalEntries
+        let useParser = parserCandidate.anchoredEntries > 0
+            && ((preferParser && parserIsMajority)
+                || parserCandidate.score >= regexCandidate.score)
+
         let chosen: Candidate
-        if parserCandidate.anchoredEntries > 0,
-           parserCandidate.score >= regexCandidate.score {
+        if useParser {
             chosen = parserCandidate
         } else if !regexCandidate.nodes.isEmpty {
             chosen = regexCandidate
@@ -50,7 +63,9 @@ public enum OutlineResolver {
         }
 
         let repaired = repairTitles(chosen.nodes, markdown: markdown)
-        let sections = makeSections(repaired.nodes, markdown: markdown)
+        let sections = includeSections
+            ? makeSections(repaired.nodes, markdown: markdown)
+            : []
         let lastPath = (docName as NSString).lastPathComponent
         let digest = repaired.nodes.isEmpty
             ? "# 目录\n\n\(lastPath)"
@@ -61,6 +76,33 @@ public enum OutlineResolver {
             source: chosen.nodes.isEmpty ? "none" : chosen.source,
             digest: digest, chaptersJSON: chaptersJSON,
             hadRepairs: repaired.repaired)
+    }
+
+    /// 结构化格式的解析器大纲通常来自真实标题样式/目录结构，优先于正则。
+    public static func prefersParserOutline(for docName: String) -> Bool {
+        guard !docName.isEmpty else { return false }
+        return DocumentProfile.defaultProfile(for: URL(fileURLWithPath: docName)) == .structured
+    }
+
+    /// 把持久化的 `chapters` JSON 还原成解析器大纲文本。
+    ///
+    /// `digest` 会为提示长度截断，`chapters` 保留完整章节树；摘要阶段应优先用它。
+    public static func outlineText(fromChaptersJSON json: String) -> String? {
+        guard let data = json.data(using: .utf8),
+              let array = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]],
+              !array.isEmpty else { return nil }
+        var lines: [String] = []
+        lines.reserveCapacity(array.count)
+        for item in array {
+            guard let title = item["title"] as? String,
+                  !title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+                continue
+            }
+            let level = (item["level"] as? NSNumber)?.intValue ?? 1
+            let indent = String(repeating: "  ", count: max(0, min(5, level - 1)))
+            lines.append(indent + title)
+        }
+        return lines.isEmpty ? nil : lines.joined(separator: "\n")
     }
 
     // MARK: - 质量评分
@@ -214,11 +256,25 @@ public enum OutlineResolver {
         text = text
             .replacingOccurrences(of: "\u{200B}", with: "")
             .replacingOccurrences(of: "\u{FEFF}", with: "")
-        return text
+        let collapsed = text
             .split(whereSeparator: { $0.isWhitespace })
             .joined(separator: " ")
             .lowercased()
+        // 入库清洗会删除汉字之间的空格（OCR 常见的「新 中 新」），
+        // 解析器大纲却保留原写法；比较标题时同步忽略，避免
+        // 「第一章 概述」与「第一章概述」被误判为不同标题导致回退正则。
+        return replace(cjkSpaceRegex, in: collapsed, with: "")
     }
+
+    private static func replace(_ regex: NSRegularExpression, in text: String,
+                                with template: String) -> String {
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        return regex.stringByReplacingMatches(in: text, options: [], range: range,
+                                              withTemplate: template)
+    }
+
+    private static let cjkSpaceRegex = try! NSRegularExpression(
+        pattern: #"(?<=[\u2E80-\u303F\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uAC00-\uD7AF\uF900-\uFAFF\uFF00-\uFFEF])[ ]+(?=[\u2E80-\u303F\u3040-\u30FF\u3400-\u4DBF\u4E00-\u9FFF\uAC00-\uD7AF\uF900-\uFAFF\uFF00-\uFFEF])"#)
 
     // MARK: - 保守修复
 

@@ -1456,9 +1456,8 @@ public final class RAGEngine {
                                                 knowledgeBase: knowledgeBase)
             try AtomicFile.write(text, to: mdPath)
 
-            // 复用上面丢弃判定时已抽取的大纲，避免再跑一遍正则。
             let digestInfo = Self.buildDigest(parsed: parsed, docName: file.relativePath,
-                                              nodes: outlineNodes)
+                                              markdown: text)
             try store.upsertDocument(docName: file.relativePath,
                                      digest: digestInfo.digest,
                                      chapters: digestInfo.chapters,
@@ -1573,38 +1572,34 @@ public final class RAGEngine {
     /// 正文文字少于该值时整份丢弃（抽取失败遗留的书名/目录名/图片元数据）。
     static let minBodyCharacters = 100
 
+    /// 入库与摘要共用 `OutlineResolver` 的择优结果，避免 `digest` 用解析器大纲、
+    /// `chapters` 却用正则大纲的两套章节树。
     private static func buildDigest(parsed: ParsedDocument, docName: String,
-                                    nodes: [OutlineNode]) -> (digest: String, chapters: String) {
-        // 正则识别与解析器自带大纲（EPUB 目录、Office 标题等）取条目多的一方：
-        // 任一来源都可能严重缺失，只命中一两条时不应覆盖完整目录。
-        let parsedEntries = parsed.outline.split(separator: "\n")
-            .filter { !$0.trimmingCharacters(in: .whitespaces).isEmpty }
-        let outline = parsedEntries.count > nodes.count
-            ? parsed.outline
-            : DocumentOutline.render(nodes)
-        let digest = outline.isEmpty
-            ? "# 目录\n\n\((docName as NSString).lastPathComponent)"
-            : "# 目录\n\n\(outline)"
-        let chapters = nodes.map { ["level": $0.level, "title": $0.title] }
-        let data = (try? JSONSerialization.data(withJSONObject: chapters, options: [])) ?? Data("[]".utf8)
-        return (digest, String(data: data, encoding: .utf8) ?? "[]")
+                                    markdown: String) -> (digest: String, chapters: String) {
+        let resolved = OutlineResolver.resolve(
+            markdown: markdown,
+            parsedOutline: parsed.outline,
+            docName: docName,
+            preferParser: OutlineResolver.prefersParserOutline(for: docName),
+            includeSections: false)
+        return (resolved.digest, resolved.chaptersJSON)
     }
 
     public func buildAndStoreDigest(docName: String, markdown: String,
                                     mdPath: String = "") throws -> String {
-        let nodes = DocumentOutline.extract(markdown, source: docName)
-        let digest = nodes.isEmpty
-            ? "# 目录\n\n\((docName as NSString).lastPathComponent)"
-            : "# 目录\n\n\(DocumentOutline.render(nodes))"
-        let chapters = nodes.map { ["level": $0.level, "title": $0.title] }
-        let data = (try? JSONSerialization.data(withJSONObject: chapters, options: [])) ?? Data("[]".utf8)
+        let resolved = OutlineResolver.resolve(
+            markdown: markdown,
+            parsedOutline: "",
+            docName: docName,
+            preferParser: OutlineResolver.prefersParserOutline(for: docName),
+            includeSections: false)
         _ = try withStore { store in
-            try store.upsertDocument(docName: docName, digest: digest,
-                                     chapters: String(data: data, encoding: .utf8) ?? "[]",
+            try store.upsertDocument(docName: docName, digest: resolved.digest,
+                                     chapters: resolved.chaptersJSON,
                                      mdPath: mdPath,
                                      contentHash: Self.contentHash(markdown))
         }
-        return digest
+        return resolved.digest
     }
 
     // MARK: 向量去重

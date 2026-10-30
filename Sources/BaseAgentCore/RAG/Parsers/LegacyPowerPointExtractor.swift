@@ -390,31 +390,96 @@ struct LegacyPowerPointExtractor {
 
     // MARK: - 幻灯片与备注组装
 
-    /// 优先使用 SlideListWithText 的顺序；该列表缺失时按文件中的 Slide 容器顺序。
+    /// 优先使用 SlideListWithText 的顺序；该列表缺失或只覆盖部分幻灯片时，
+    /// 用 Slide 容器补齐。
     private func selectSlides(from state: ScanState) -> [SlideContainer] {
         guard !state.slideGroups.isEmpty else {
             return state.slides
         }
 
-        var containerByID: [UInt32: SlideContainer] = [:]
-        for slide in state.slides where slide.slideId != 0 {
-            if containerByID[slide.slideId] == nil {
-                containerByID[slide.slideId] = slide
+        var containerIndexByID: [UInt32: Int] = [:]
+        for (index, slide) in state.slides.enumerated() where slide.slideId != 0 {
+            if containerIndexByID[slide.slideId] == nil {
+                containerIndexByID[slide.slideId] = index
             }
         }
 
-        return state.slideGroups.enumerated().map { index, group in
-            if !group.blocks.isEmpty {
-                return SlideContainer(slideId: group.slideId, blocks: group.blocks)
+        var usedContainerIndices = Set<Int>()
+        var selected: [SlideContainer] = []
+        var selectedContainerIndex: [Int?] = []
+
+        for (index, group) in state.slideGroups.enumerated() {
+            var containerIndex: Int?
+            if group.slideId != 0, let matched = containerIndexByID[group.slideId],
+               !usedContainerIndices.contains(matched) {
+                containerIndex = matched
+            } else if index < state.slides.count,
+                      !usedContainerIndices.contains(index) {
+                // 真实文件里 SlideListWithText 的 ID 与 SlideAtom 字段不保证
+                // 一致，列表也可能只覆盖部分页；按位置回退保留容器文本。
+                containerIndex = index
             }
-            if let container = containerByID[group.slideId] {
-                return container
+
+            if let containerIndex {
+                usedContainerIndices.insert(containerIndex)
             }
-            if group.slideId == 0, index < state.slides.count {
-                return state.slides[index]
-            }
-            return SlideContainer(slideId: group.slideId, blocks: [])
+            let container = containerIndex.map { state.slides[$0] }
+            selected.append(SlideContainer(
+                slideId: group.slideId != 0 ? group.slideId : (container?.slideId ?? 0),
+                blocks: preferredBlocks(list: group.blocks, container: container?.blocks)))
+            selectedContainerIndex.append(containerIndex)
         }
+
+        let unmatchedIndices = state.slides.indices.filter {
+            !usedContainerIndices.contains($0)
+        }
+        guard !unmatchedIndices.isEmpty else { return selected }
+
+        // 仅在列表顺序与容器顺序一致时，才能按容器位置把缺失页插回原处；
+        // 否则按文件顺序追加，至少不丢页。
+        let mappedIndices = selectedContainerIndex.compactMap { $0 }
+        guard mappedIndices == mappedIndices.sorted() else {
+            return selected + unmatchedIndices.map { state.slides[$0] }
+        }
+
+        var insertions: [Int: [SlideContainer]] = [:]
+        var trailing: [SlideContainer] = []
+        for containerIndex in unmatchedIndices {
+            let target = selectedContainerIndex.indices.first { outputIndex in
+                guard let mapped = selectedContainerIndex[outputIndex] else {
+                    return false
+                }
+                return mapped > containerIndex
+            }
+            if let target {
+                insertions[target, default: []].append(state.slides[containerIndex])
+            } else {
+                trailing.append(state.slides[containerIndex])
+            }
+        }
+
+        var merged: [SlideContainer] = []
+        for index in selected.indices {
+            merged.append(contentsOf: insertions[index] ?? [])
+            merged.append(selected[index])
+        }
+        merged.append(contentsOf: trailing)
+        return merged
+    }
+
+    /// 列表与容器都有文本时取更完整的一份：列表可能只保存标题，容器则
+    /// 保留全部形状文本；两者相同时优先列表，避免改变既有顺序。
+    private func preferredBlocks(list: [TextBlock],
+                                 container: [TextBlock]?) -> [TextBlock] {
+        guard let container, !container.isEmpty else { return list }
+        guard !list.isEmpty else { return container }
+        let listLength = list.reduce(0) { $0 + textLength($1) }
+        let containerLength = container.reduce(0) { $0 + textLength($1) }
+        return containerLength > listLength ? container : list
+    }
+
+    private func textLength(_ block: TextBlock) -> Int {
+        block.paragraphs.reduce(0) { $0 + $1.count }
     }
 
     /// 备注按 NotesAtom 的 slideIdRef 挂到对应幻灯片；全部缺失关联时按顺序兜底。
@@ -550,14 +615,127 @@ struct LegacyPowerPointExtractor {
         return String(decoding: units, as: UTF16.self)
     }
 
+    /// PowerPoint 97 的 `TextBytesAtom` 按「ANSI」写入，实际文件可能是
+    /// Windows-1252、UTF-8 或 GBK/GB18030。CP1252 几乎能解码任意字节，
+    /// 因此必须先看解码结果的内容：GBK 字节可能恰好是合法 UTF-8（例如
+    /// 「中文」的 D6 D0 CE C4 会解成希伯来/希腊字母），不能只按编码顺序试。
     private static func decodeBytes(_ payload: Data) -> String {
-        if let text = String(data: payload, encoding: .windowsCP1252) {
-            return text
+        let utf8 = String(data: payload, encoding: .utf8)
+        let gb = String(data: payload, encoding: gb18030Encoding)
+
+        if let utf8 {
+            let utf8Stats = textStats(utf8)
+            if utf8Stats.hasCJK { return utf8 }
+            // 合法 UTF-8 的希腊/西里尔文也能被 GB18030 解成汉字，只有出现
+            // 多种文字混杂或 C1 控制字符时才判定为 GBK 乱码。
+            if utf8Stats.hasMojibakeSignals, let gb,
+               textStats(gb).looksLikeChinese {
+                return gb
+            }
+            return utf8
         }
-        if let text = String(data: payload, encoding: .utf8) {
-            return text
+
+        if let gb, textStats(gb).looksLikeChinese {
+            return gb
         }
-        return String(data: payload, encoding: .isoLatin1) ?? ""
+        return String(data: payload, encoding: .windowsCP1252)
+            ?? String(data: payload, encoding: .isoLatin1) ?? ""
+    }
+
+    private static let gb18030Encoding = String.Encoding(
+        rawValue: CFStringConvertEncodingToNSStringEncoding(
+            CFStringEncoding(CFStringEncodings.GB_18030_2000.rawValue)))
+
+    private struct TextStats {
+        let characterCount: Int
+        let cjkCount: Int
+        let longestCJKRun: Int
+        let suspiciousScriptGroups: UInt32
+        let hasControlCharacters: Bool
+
+        var hasCJK: Bool { cjkCount > 0 }
+
+        /// GBK 字节被误读成 UTF-8 的典型特征：希伯来/希腊/西里尔等多种
+        /// 文字混杂，或出现正常文本不会有的 C1 控制字符。单一文字的合法
+        /// UTF-8（例如整段西里尔文）不据此改判。
+        var hasMojibakeSignals: Bool {
+            suspiciousScriptGroups.nonzeroBitCount >= 2 || hasControlCharacters
+        }
+
+        /// GB18030 解出的文本要像中文而不是偶发的乱码：至少两个汉字、
+        /// 存在连续汉字，且汉字占非空白字符的四分之一以上。
+        var looksLikeChinese: Bool {
+            cjkCount >= 2 && longestCJKRun >= 2
+                && Double(cjkCount) >= Double(characterCount) * 0.25
+        }
+    }
+
+    private static func textStats(_ text: String) -> TextStats {
+        var characterCount = 0
+        var cjkCount = 0
+        var currentRun = 0
+        var longestRun = 0
+        var suspiciousScriptGroups: UInt32 = 0
+        var hasControlCharacters = false
+
+        for scalar in text.unicodeScalars {
+            let value = scalar.value
+            guard value > 0x20 else { continue }
+            characterCount += 1
+            if isCJK(value) {
+                cjkCount += 1
+                currentRun += 1
+                longestRun = max(longestRun, currentRun)
+            } else {
+                currentRun = 0
+                if value >= 0x7F && value <= 0x9F {
+                    hasControlCharacters = true
+                }
+                if let group = suspiciousScriptGroup(value) {
+                    suspiciousScriptGroups |= 1 << group
+                }
+            }
+        }
+
+        return TextStats(characterCount: characterCount,
+                         cjkCount: cjkCount,
+                         longestCJKRun: longestRun,
+                         suspiciousScriptGroups: suspiciousScriptGroups,
+                         hasControlCharacters: hasControlCharacters)
+    }
+
+    private static func isCJK(_ value: UInt32) -> Bool {
+        switch value {
+        case 0x3400...0x4DBF,   // CJK Extension A
+             0x4E00...0x9FFF,   // CJK Unified Ideographs
+             0xF900...0xFAFF,   // CJK Compatibility Ideographs
+             0x3000...0x303F,   // CJK 标点
+             0xFF00...0xFFEF:   // 全角字符
+            return true
+        default:
+            return false
+        }
+    }
+
+    /// GBK 双字节被误读成 UTF-8 时通常落在这些非拉丁字母区；真正的 UTF-8
+    /// 西文（含 Latin-1 / Latin Extended 重音字母）不会触发。返回文字分组，
+    /// 用于区分「多种文字混杂的乱码」和「单一文字的合法 UTF-8」。
+    private static func suspiciousScriptGroup(_ value: UInt32) -> UInt32? {
+        switch value {
+        case 0x0370...0x03FF: return 0   // Greek
+        case 0x0400...0x04FF: return 1   // Cyrillic
+        case 0x0530...0x058F: return 2   // Armenian
+        case 0x0590...0x05FF: return 3   // Hebrew
+        case 0x0600...0x06FF: return 4   // Arabic
+        case 0x0700...0x077F: return 5   // Syriac / Arabic Supplement
+        case 0x0780...0x07FF: return 6   // Thaana / NKo
+        case 0x0900...0x0DFF: return 7   // 印度系文字
+        case 0x0E00...0x0EFF: return 8   // Thai / Lao
+        case 0x10A0...0x10FF: return 9   // Georgian
+        case 0x1100...0x11FF: return 10  // Hangul Jamo
+        case 0x1200...0x137F: return 11  // Ethiopic
+        default: return nil
+        }
     }
 
     // MARK: - 无符号读取（相对 Data.startIndex）

@@ -90,6 +90,23 @@ public enum DocumentOutline {
         }),
     ]
 
+    /// 结构化文档只信任显式 Markdown 标题与语义章节标记（第X章 / Chapter）。
+    ///
+    /// 数字编号、中文序号、括号序号在 Word/PPT/HTML 正文里通常是列表或条款
+    /// （「1. 背景」「一、组织分工」「（1）步骤」），不是章节标题。
+    static let explicitHeadingPatterns = Array(headingPatterns.prefix(3))
+
+    /// 这些格式的解析器会把真实标题输出成 Markdown `#`，正文编号不应再当标题。
+    private static let explicitHeadingExtensions: Set<String> = [
+        "doc", "docx", "xls", "xlsx", "ppt", "pptx",
+        "html", "htm", "xhtml", "epub",
+    ]
+
+    static func usesExplicitHeadings(_ source: String) -> Bool {
+        let ext = (source as NSString).pathExtension.lowercased()
+        return explicitHeadingExtensions.contains(ext)
+    }
+
     /// 单行标题分类：命中返回（层级, 标题）。供纯文本结构还原器复用。
     static func classify(_ line: String) -> (level: Int, title: String)? {
         // 页码/页眉行（含 `# 2 / 164` 这类伪标题）不是文档结构。
@@ -113,7 +130,7 @@ public enum DocumentOutline {
         // 代码围栏内的 `#` / 编号不是标题，必须跳过。
         let fencedRanges = codeFenceRanges(text)
 
-        let patterns = headingPatterns
+        let patterns = usesExplicitHeadings(source) ? explicitHeadingPatterns : headingPatterns
         for (pattern, options, handler) in patterns {
             guard let regex = try? NSRegularExpression(pattern: pattern, options: options) else { continue }
             regex.enumerateMatches(in: text, options: [], range: NSRange(location: 0, length: length)) { match, _, _ in

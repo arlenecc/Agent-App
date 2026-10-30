@@ -664,6 +664,62 @@ final class RAGEngineTests: XCTestCase {
         resumed.close()
     }
 
+    /// Excel 部分工作表损坏时仍保留可解析内容，但 manifest 必须标记未完成，
+    /// 下次增量同步重新解析，而不是被 `complete=true` 永久跳过。
+    func testUnreadableExcelSheetMarksIncompleteAndRetries() async throws {
+        let root = URL(fileURLWithPath: NSTemporaryDirectory())
+            .appendingPathComponent("base-agent-rag-excel-partial-\(UUID().uuidString)")
+        let kb = root.appendingPathComponent("kb")
+        try FileManager.default.createDirectory(at: kb, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+
+        let builder = BIFF8TestBuilder(
+            sheets: [
+                .init(name: "有效数据", cells: [
+                    .init(row: 0, column: 0, value: .label("产品")),
+                    .init(row: 0, column: 1, value: .label("说明")),
+                    .init(row: 1, column: 0, value: .label("保险")),
+                    .init(row: 1, column: 1, value: .label("用于验证部分工作表损坏时仍能入库")),
+                    .init(row: 2, column: 0, value: .label("医疗")),
+                    .init(row: 2, column: 1, value: .label("继续补充正文确保超过入库长度阈值")),
+                    .init(row: 3, column: 0, value: .label("出行")),
+                    .init(row: 3, column: 1, value: .label("更多条目让表格内容足够被切片和向量化")),
+                    .init(row: 4, column: 0, value: .label("财产")),
+                    .init(row: 4, column: 1, value: .label("继续补充足够多的有效正文，避免被当成无效碎片丢弃")),
+                    .init(row: 5, column: 0, value: .label("责任")),
+                    .init(row: 5, column: 1, value: .label("这一行同样用于增加表格正文长度并保持可读性")),
+                    .init(row: 6, column: 0, value: .label("工程")),
+                    .init(row: 6, column: 1, value: .label("工程险条目继续扩展内容确保总量稳定超过阈值")),
+                    .init(row: 7, column: 0, value: .label("保证")),
+                    .init(row: 7, column: 1, value: .label("保证保险条目用于验证多行表格正文的完整处理")),
+                ]),
+                .init(name: "损坏表", cells: [], rawPayload: Data()),
+            ]
+        )
+        try builder.build().data.write(to: kb.appendingPathComponent("partial.xls"))
+
+        var config = AgentConfig()
+        config.workspace = root.path
+        config.knowledgeBase = kb.path
+        config.ragRerankEnabled = false
+        config.ragChunkSize = 40
+        config.ragChunkOverlap = 2
+
+        let first = RAGEngine(config: config, knowledgeBase: kb.path,
+                              embedding: RagFakeEmbedding(), reranker: nil)
+        let initial = await first.ingest()
+        XCTAssertEqual(initial.processed, 1)
+        XCTAssertTrue(initial.errors.isEmpty, initial.errors.joined(separator: "; "))
+        first.close()
+
+        let resumed = RAGEngine(config: config, knowledgeBase: kb.path,
+                                embedding: RagFakeEmbedding(), reranker: nil)
+        let stats = await resumed.ingest()
+        XCTAssertEqual(stats.processed, 1, "有损坏工作表的 Excel 必须重试")
+        XCTAssertEqual(stats.skipped, 0)
+        resumed.close()
+    }
+
     func testIncrementalReindexesLegacyManifestWithoutCompletionFields() async throws {
         let root = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("base-agent-rag-legacy-manifest-\(UUID().uuidString)")

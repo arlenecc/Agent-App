@@ -188,6 +188,53 @@ final class LegacyExcelExtractorTests: XCTestCase {
         XCTAssertFalse(output.markdown.contains("超出列"), output.markdown)
     }
 
+    /// 工作簿解析可能持续很久；任务取消后必须立即停止，而不是继续读完整个文件。
+    func testExtractionStopsWhenTaskIsCancelled() async throws {
+        let builder = BIFF8TestBuilder(
+            sheets: [
+                .init(name: "数据", cells: [
+                    .init(row: 0, column: 0, value: .label("项目")),
+                    .init(row: 1, column: 0, value: .label("内容")),
+                ]),
+            ]
+        )
+        let url = try write(builder.build())
+
+        let task = Task<Void, Error> {
+            withUnsafeCurrentTask { $0?.cancel() }
+            _ = try LegacyExcelExtractor().extract(url: url)
+        }
+        do {
+            try await task.value
+            XCTFail("取消后不应继续解析 Excel")
+        } catch AgentError.cancelled {
+            // 预期：取消信号被解析器观察到。
+        } catch {
+            XCTFail("应抛出 AgentError.cancelled，实际：\(error)")
+        }
+    }
+
+    /// 损坏的工作表仍可跳过并保留其他表，但必须上报失败，供入库层标记未完成。
+    func testUnreadableSheetIsReportedAsFailed() throws {
+        let builder = BIFF8TestBuilder(
+            sheets: [
+                .init(name: "有效数据", cells: [
+                    .init(row: 0, column: 0, value: .label("项目")),
+                    .init(row: 0, column: 1, value: .label("说明")),
+                    .init(row: 1, column: 0, value: .label("保险")),
+                    .init(row: 1, column: 1, value: .label("保留可解析的工作表内容")),
+                ]),
+                .init(name: "损坏表", cells: [], rawPayload: Data()),
+            ]
+        )
+
+        let output = try LegacyExcelExtractor().extract(url: try write(builder.build()))
+        XCTAssertTrue(output.markdown.contains("## Sheet: 有效数据"), output.markdown)
+        XCTAssertFalse(output.markdown.contains("损坏表"), output.markdown)
+        XCTAssertEqual(output.metadata["skipped_sheets"], "1")
+        XCTAssertEqual(output.metadata["failed_pages"], "1")
+    }
+
     func testEmptySheetIsSkipped() throws {
         let builder = BIFF8TestBuilder(
             sheets: [

@@ -286,8 +286,10 @@ LIMIT ?
   防止卸载权重与摘要的在途生成并发。
 - `AppModel.init` 末尾主动 `scheduleIdleUnload()`：API 模式或辅助模型未启用时
   `preloadModels` 会提前返回，仍需要空闲计时来启动摘要任务。
-- `summaryCandidates` 排除「已完成但没有章节」的文档（`total_sections = 0`），
-  避免无标题纯正文在每次空闲会话重复触发注定失败的 `processBookSummary`。
+- 无标题纯正文（旧版 Word 未识别到标题样式）不再被跳过：`BookSummaryEngine.resolve`
+  在解析不出章节但正文非空时合成唯一的「全文」章节；`summaryCandidates` 重新纳入
+  「已完成但缺少全书摘要」的文档（含旧的 `completed / total_sections=0`），协调器
+  先补章节摘要再生成全书摘要。真正没有正文的文档仍保持无章节，避免产生空摘要。
 - 复查加固：失败（Markdown 缺失、模型/存储错误、章节摘要与目录不一致）也会
   推进 `summary_job_state.updated_at`，并保留引擎写入的阶段与 `next_section`；
   否则队首 10 本持续失败的文档会在每个新会话反复占满候选窗口，后面的书永久饥饿。

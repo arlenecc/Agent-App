@@ -136,7 +136,9 @@ DocumentParserRegistry
 - `.doc`：标题用 `#`/`##`/`###`；列表用 `-` 或 `1.`；表格用标准 Markdown 表格；粗体/斜体用 `**`/`*`。
 - `.xls`：sheet 标题为二级标题 `## Sheet: 名称`；单元格内的 `|` 和换行做转义，避免破坏表格。
 - `.ppt`：每页一个二级标题 `## Slide N：标题`；正文段落空行分隔；备注用 `**演讲者备注**` 标记。
-- 三种格式都通过 `finish(profile: .structured)`，复用现有 `DocumentCleaner` 的 structured 清洗规则。
+- 三种格式都通过 `finish(profile: .structured)`，复用现有 `DocumentCleaner` 的 structured 清洗规则；
+  OCR 档的「汉字间空格合并」（`新 中 新` → `新中新`）不作用于 structured 档，
+  避免标题 `第一章 概述` 被粘连。
 - 大纲：`.doc` 从标题生成；`.xls` 从 sheet 名生成；`.ppt` 从幻灯片标题生成，缺失标题时用 `Slide N`。
 
 ## 引擎集成
@@ -204,11 +206,14 @@ DocumentParserRegistry
 - `RAGEngine.supportedExtensions` 包含三种扩展名；
 - `DocumentCleaner.defaultProfile` 返回 `.structured`；
 - `MarkdownConversionService` 的单文件与目录校验接受三种扩展名；
-- 解析结果能通过 `RAGEngine` 的入库前正文检查（构造 >100 字样本）。
+- 解析结果能通过 `RAGEngine` 的入库前正文检查（构造 >100 字样本）；
+- `LegacyOfficeIngestSummaryTests` 用真实 `.doc/.xls/.ppt` 二进制完成全链路：
+  `ingest` → Markdown/目录落库 → 逐章摘要 → 全书摘要 → `rag_outline` 输出，
+  并验证无标题 Word 合成「全文」章节后仍能生成全书摘要。
 
 ### 测试数据
 
-- `.doc`：用 `NSAttributedString` 的 `.docFormat` 在测试内生成基础样本；表格/列表用提交的小型 `.doc` fixture，fixture 由 `scripts/generate-legacy-office-fixtures` 说明生成方式。
+- `.doc`：用 `NSAttributedString` 的 `.docFormat` 在测试内生成基础样本（含多级标题与无标题样本）；表格/列表用提交的小型 `.doc` fixture，fixture 由 `scripts/generate-legacy-office-fixtures` 说明生成方式。
 - `.xls`：测试内用最小 OLE2 + BIFF8 构造器生成，不依赖 Python/LibreOffice；覆盖 SST 跨 CONTINUE、日期、百分比、公式。
 - `.ppt`：测试内用最小 OLE2 + PowerPoint 记录构造器生成，覆盖两页、标题/正文、备注。
 - 所有构造器只用于测试，不进入产品代码。

@@ -64,13 +64,8 @@ public final class BookSummaryEngine: @unchecked Sendable {
                     segments.append(current)
                     current = ""
                 }
-                var remainder = paragraph
-                while !remainder.isEmpty {
-                    let piece = takePrefix(remainder, tokenBudget: budget,
-                                           characterBudget: charBudget)
-                    if !piece.text.isEmpty { segments.append(piece.text) }
-                    remainder = piece.rest
-                }
+                segments.append(contentsOf: splitOversizedParagraph(
+                    paragraph, tokenBudget: budget, characterBudget: charBudget))
                 continue
             }
             let candidate = current.isEmpty ? paragraph : current + "\n\n" + paragraph
@@ -85,36 +80,57 @@ public final class BookSummaryEngine: @unchecked Sendable {
         return segments
     }
 
-    private static func takePrefix(_ text: String, tokenBudget: Int,
-                                   characterBudget: Int?) -> (text: String, rest: String) {
-        let characters = Array(text)
-        var tokens = 0.0
-        var lastBreak = -1
-        var index = 0
-        while index < characters.count {
-            let cost = tokenCost(characters[index])
-            let exceedsTokens = tokens + cost > Double(tokenBudget)
-            let exceedsCharacters = characterBudget.map { index + 1 > $0 } ?? false
-            if (exceedsTokens || exceedsCharacters), index > 0 {
-                let cut: Int
-                if lastBreak >= 0, lastBreak >= index / 2 {
-                    cut = lastBreak + 1
-                } else {
-                    cut = index
-                }
-                let prefix = String(characters[0..<cut])
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                let rest = String(characters[cut...])
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                if !prefix.isEmpty {
-                    return (prefix, rest)
-                }
+    /// 把一个超预算段落切成多个分片。
+    ///
+    /// 使用 `String.Index` 单调前进，每个字符只扫描一次；旧实现每轮把剩余文本
+    /// 转成 `[Character]` 并复制，遇到 Excel 这种整张表只有一个段落的长文本会
+    /// 退化成 O(n²)。
+    private static func splitOversizedParagraph(_ text: String, tokenBudget: Int,
+                                                characterBudget: Int?) -> [String] {
+        let end = text.endIndex
+        var start = text.startIndex
+        var pieces: [String] = []
+
+        while start < end {
+            while start < end, text[start].isWhitespace {
+                start = text.index(after: start)
             }
-            tokens += cost
-            if isSentenceEnd(characters[index]) { lastBreak = index }
-            index += 1
+            guard start < end else { break }
+
+            var index = start
+            var tokens = 0.0
+            var count = 0
+            var lastBreakOffset = -1
+            var cut: String.Index?
+
+            while index < end {
+                let character = text[index]
+                let cost = tokenCost(character)
+                let exceedsTokens = tokens + cost > Double(tokenBudget)
+                let exceedsCharacters = characterBudget.map { count + 1 > $0 } ?? false
+                if (exceedsTokens || exceedsCharacters), count > 0 {
+                    // 与旧逻辑一致：只有句末标点落在当前片段后半段时才回退断句，
+                    // 避免每遇到一个逗号/句号就切得过碎。
+                    if lastBreakOffset >= 0, lastBreakOffset >= count / 2 {
+                        cut = text.index(after: text.index(start, offsetBy: lastBreakOffset))
+                    } else {
+                        cut = index
+                    }
+                    break
+                }
+                tokens += cost
+                count += 1
+                if isSentenceEnd(character) { lastBreakOffset = count - 1 }
+                index = text.index(after: index)
+            }
+
+            let cutIndex = cut ?? end
+            let piece = String(text[start..<cutIndex])
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !piece.isEmpty { pieces.append(piece) }
+            start = cutIndex
         }
-        return (text, "")
+        return pieces
     }
 
     // MARK: - 摘要规范化
@@ -219,9 +235,27 @@ public final class BookSummaryEngine: @unchecked Sendable {
     // MARK: - 章节结构
 
     public func resolve(_ document: DocumentRecord, markdown: String) -> ResolvedBookOutline {
-        OutlineResolver.resolve(markdown: markdown,
-                                parsedOutline: Self.outlineFromDigest(document.digest),
-                                docName: document.docName)
+        let parsedOutline = OutlineResolver.outlineText(fromChaptersJSON: document.chapters)
+            ?? Self.outlineFromDigest(document.digest)
+        let resolved = OutlineResolver.resolve(
+            markdown: markdown,
+            parsedOutline: parsedOutline,
+            docName: document.docName,
+            preferParser: OutlineResolver.prefersParserOutline(for: document.docName))
+        // 无标题纯正文（旧版 Word 未识别到任何标题样式）本来没有章节可用，
+        // 但正文仍是完整可摘要的内容：合成一个「全文」章节，让逐章与全书
+        // 摘要流程都能继续，而不是直接标记完成并跳过全书摘要。
+        // 目录保持原样，避免把「全文」写回入库时的大纲。
+        let body = markdown.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard resolved.sections.isEmpty, !body.isEmpty else { return resolved }
+        let section = BookSection(
+            index: 0, level: 1, title: "全文", heading: "全文", body: body,
+            start: 0, end: (markdown as NSString).length,
+            contentHash: Self.shortHash("全文\n" + body))
+        return ResolvedBookOutline(
+            nodes: resolved.nodes, sections: [section], source: resolved.source,
+            digest: resolved.digest, chaptersJSON: resolved.chaptersJSON,
+            hadRepairs: resolved.hadRepairs)
     }
 
     /// `documents.digest` 首行固定为「# 目录」，其余是入库时择优的目录。

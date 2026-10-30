@@ -98,8 +98,8 @@ final class BookSummaryStoreTests: XCTestCase {
         let finished = doc("finished.md")
         let pending = doc("pending.md")
         let bookOnly = doc("book-only.md")
-        // 没有任何可识别章节的文档：完成后不应反复进入候选，避免每个
-        // 空闲会话都尝试一次注定失败的全书摘要。
+        // 没有可识别章节、曾被直接标记完成的文档（旧版无标题纯正文）
+        // 仍需进入候选，由摘要引擎合成「全文」章节后补出全书摘要。
         let empty = doc("empty.md")
         for item in [finished, pending, bookOnly, empty] {
             try store.upsertDocument(docName: item.docName, digest: item.digest,
@@ -116,7 +116,8 @@ final class BookSummaryStoreTests: XCTestCase {
             docID: empty.docID, status: .completed, nextSection: 0, totalSections: 0))
 
         let candidates = try store.summaryCandidates(limit: 10)
-        XCTAssertEqual(Set(candidates.map(\.docID)), Set([pending.docID, bookOnly.docID]))
+        XCTAssertEqual(Set(candidates.map(\.docID)),
+                       Set([pending.docID, bookOnly.docID, empty.docID]))
     }
 
     func testLookupDocumentsPrefersExactPathThenBasenameThenUniqueFuzzy() throws {

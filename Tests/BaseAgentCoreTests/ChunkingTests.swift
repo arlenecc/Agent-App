@@ -35,6 +35,34 @@ final class ChunkingTests: XCTestCase {
                       "chunk 含 overlap 不应突破 token 上限")
     }
 
+    /// Word/PPT 正文里的编号条目是列表内容，不能作为切片章节标题。
+    func testStructuredChunksIgnoreNumberedBodyAsHeadings() async {
+        let text = """
+        ## Slide 1：年度计划
+
+        1. 背景与目标
+
+        2. 范围与限制
+
+        ## Slide 2：执行方案
+
+        一、组织分工
+
+        二、交付计划
+        """
+        let options = ChunkingOptions(chunkSizeTokens: 12, overlapTokens: 2,
+                                      minChunkTokens: 4,
+                                      enableSemantic: false,
+                                      tokenCounter: { $0.count })
+        let document = ParsedDocument(text: text, source: "deck.ppt")
+        let chunks = await TextChunker(options: options).chunk(document: document)
+
+        XCTAssertFalse(chunks.isEmpty)
+        XCTAssertFalse(chunks.contains { $0.heading.contains("1. 背景") })
+        XCTAssertFalse(chunks.contains { $0.heading.contains("一、组织分工") })
+        XCTAssertTrue(chunks.contains { $0.heading.contains("Slide 1") })
+    }
+
     /// 分页标记与页码不进入切片，溯源只保留文件名（source）。
     func testChunksStripPageMarkersWithoutPagesMetadata() async {
         let text = """

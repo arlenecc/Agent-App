@@ -160,7 +160,8 @@ public struct DocumentSummaryProgress: Sendable, Equatable {
 
 // MARK: - 章节结构
 
-/// 用于摘要的章节：`index` 与 `ResolvedBookOutline.nodes` 一一对应。
+/// 用于摘要的章节：正常情况下 `index` 与 `ResolvedBookOutline.nodes` 一一对应；
+/// 无标题纯正文会合成一个不写入目录的「全文」章节。
 public struct BookSection: Sendable, Equatable {
     public var index: Int
     public var level: Int

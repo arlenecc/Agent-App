@@ -272,6 +272,18 @@ final class OfficeAndHTMLTests: XCTestCase {
         XCTAssertTrue(structured.contains("交接文档\n\n运维负责人：张三"), structured)
     }
 
+    /// 汉字之间的空格在结构化文档里是作者排版（标题「第一章 概述」），
+    /// 只有 OCR 档才按识别噪声合并，否则标题和正文会被粘连。
+    func testStructuredProfileKeepsCJKSpacing() throws {
+        let text = "第一章 旧版 Word 概述\n\n正文介绍兼容策略。"
+
+        let structured = DocumentCleaner.clean(text, markdown: false, profile: .structured)
+        XCTAssertTrue(structured.contains("第一章 旧版 Word 概述"), structured)
+
+        let ocr = DocumentCleaner.clean(text, markdown: false)
+        XCTAssertTrue(ocr.contains("第一章旧版 Word 概述"), ocr)
+    }
+
     /// 手写/导出的 HTML 常把正文直接放在 `<body>` 或 `<div>` 下，
     /// 没有 `<p>` 包裹；只遍历元素会把这些裸文本整段丢掉。
     func testHTMLBareTextNodesAreKept() throws {

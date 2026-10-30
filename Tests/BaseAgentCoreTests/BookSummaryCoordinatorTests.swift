@@ -290,6 +290,30 @@ final class BookSummaryCoordinatorTests: XCTestCase {
         XCTAssertEqual(try store.bookSummary(docID: document.docID)?.summary.count, 350)
     }
 
+    /// 旧版无标题纯正文曾被直接写成 `completed / total_sections=0`。
+    /// 候选重新纳入这类文档后，不能再把它当全书阶段调用注定失败的汇总，
+    /// 应先补出「全文」章节摘要，再进入全书摘要。
+    func testCompletedJobWithoutSectionsRetriesChapterPhase() async throws {
+        let store = try makeStore()
+        let markdown = String(repeating: "这是一段没有标题的正文内容。", count: 40)
+        let document = try insertDocument(store, markdown: markdown,
+                                          name: "untitled.doc")
+        try store.upsertSummaryJob(SummaryJobRecord(
+            docID: document.docID, status: .completed, nextSection: 0,
+            totalSections: 0, updatedAt: 0))
+        let resident = CoordinatorStubLLM()
+        let coordinator = makeCoordinator(store: store, resident: resident)
+
+        let outcome = await coordinator.runTick(mode: .resident)
+        guard case .processedChapter(_, _, let sectionIndex, let total, _) = outcome else {
+            return XCTFail("无标题文档应先补出章节摘要，实际 \(outcome)")
+        }
+        XCTAssertEqual(sectionIndex, 0)
+        XCTAssertEqual(total, 1)
+        XCTAssertEqual(try store.summaryJob(docID: document.docID)?.status, .summarizingBook)
+        XCTAssertEqual(try store.summaryJob(docID: document.docID)?.totalSections, 1)
+    }
+
     func testFailureDoesNotAdvanceNextSection() async throws {
         let store = try makeStore()
         let markdown = chapterMarkdown(1)

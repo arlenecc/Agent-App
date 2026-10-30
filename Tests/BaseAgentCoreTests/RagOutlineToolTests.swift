@@ -118,6 +118,40 @@ final class RagOutlineToolTests: XCTestCase {
         XCTAssertTrue(result.output.contains("章节摘要进度: 3/3"))
     }
 
+    /// 结构化格式应信任解析器标题，避免把 HTML/Word 的有序列表项当成章节；
+    /// digest 与 chapters 必须来自同一份大纲。
+    func testStructuredIngestUsesParserOutlineForDigestAndChapters() async throws {
+        let html = """
+        <html><body>
+        <h1>第一章 概述</h1>
+        <p>本章介绍主题的背景、目标与范围。Additional sentences make the body long enough for indexing, so the document is kept in the knowledge base.</p>
+        <h2>1.1 背景</h2>
+        <p>背景部分说明为什么需要这项研究，以及现有的问题与限制。</p>
+        <ol>
+        <li>列表要点一</li>
+        <li>列表要点二</li>
+        </ol>
+        <p>补充正文继续展开细节，确保清洗后的有效正文超过入库阈值。</p>
+        </body></html>
+        """
+        try write(html, relativePath: "outline.html")
+        let engine = makeEngine()
+        _ = await engine.ingest()
+        guard let record = engine.getDocumentOutline(docName: "outline.html") else {
+            return XCTFail("入库后应能查到 outline.html")
+        }
+
+        XCTAssertTrue(record.digest.contains("第一章"))
+        XCTAssertTrue(record.digest.contains("概述"))
+        XCTAssertTrue(record.digest.contains("1.1 背景"))
+        XCTAssertFalse(record.digest.contains("列表要点"))
+        XCTAssertFalse(record.chapters.contains("列表要点"))
+
+        let chapters = try XCTUnwrap(
+            JSONSerialization.jsonObject(with: Data(record.chapters.utf8)) as? [[String: Any]])
+        XCTAssertEqual(chapters.count, 2)
+    }
+
     func testRagOutlineShowsProgressWhenPartial() async throws {
         let markdown = """
         # 第一章 水果

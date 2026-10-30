@@ -35,4 +35,18 @@ enum LegacyOfficeLimits {
         guard limit > 0, text.count > limit else { return (text, false) }
         return (String(text.prefix(limit)), true)
     }
+
+    /// 返回不超过 `limit` 的安全 UTF-16 前缀长度。
+    ///
+    /// `NSAttributedString` 的长度按 UTF-16 计数，直接截断可能把 emoji 的
+    /// 代理对切成半个字符；落点在代理对中间时退回到前一个完整字符。
+    static func safeUTF16PrefixLength(_ string: NSString, limit: Int) -> Int {
+        guard limit > 0 else { return 0 }
+        guard string.length > limit else { return string.length }
+        let last = string.character(at: limit - 1)
+        if last >= 0xD800 && last <= 0xDBFF {
+            return limit - 1
+        }
+        return limit
+    }
 }

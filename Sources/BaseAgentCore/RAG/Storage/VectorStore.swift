@@ -1670,10 +1670,9 @@ public final class VectorStore: @unchecked Sendable {
         WHERE d.md_path != '' AND (
             j.doc_id IS NULL
             OR j.status IN ('pending', 'summarizing_book', 'failed')
-            -- 完成但没有章节的文档（无标题纯正文）不再生成全书摘要，
-            -- 否则每个空闲会话都会重试一次注定失败的汇总。
-            OR (j.status = 'completed' AND b.doc_id IS NULL
-                AND j.total_sections > 0)
+            -- 完成但缺少全书摘要：包括旧版无标题纯正文直接写成的
+            -- completed / total_sections=0，现在由引擎合成「全文」章节补出摘要。
+            OR (j.status = 'completed' AND b.doc_id IS NULL)
         )
         ORDER BY COALESCE(j.updated_at, 0), d.updated_at
         LIMIT ?

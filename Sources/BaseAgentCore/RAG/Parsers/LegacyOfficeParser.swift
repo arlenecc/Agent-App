@@ -53,6 +53,7 @@ public final class LegacyOfficeParser: DocumentParser {
                 "旧版 Office 解析失败（\(url.lastPathComponent)）：\(error.localizedDescription)")
         }
 
+        if Task.isCancelled { throw AgentError.cancelled }
         guard !result.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw AgentError.parse("旧版 Office 文档未解析出正文（\(url.lastPathComponent)）")
         }
@@ -64,6 +65,7 @@ public final class LegacyOfficeParser: DocumentParser {
                                     outline: MarkdownOutline.build(result.outline),
                                     metadata: metadata)
         parsed = finish(parsed, options: options, profile: .structured)
+        if Task.isCancelled { throw AgentError.cancelled }
         progress?(.message("旧版 \(formatName(ext)) 文档解析完成"))
         return parsed
     }

@@ -52,6 +52,47 @@ final class OutlineResolverTests: XCTestCase {
         XCTAssertEqual(resolved.nodes.map(\.title), ["第一章 引言", "1.1 背景"])
     }
 
+    /// Word/PPT 正文里的「1. xxx」「一、xxx」「(1) xxx」是列表或条款编号，
+    /// 不能生成章节；结构化格式只信任显式 Markdown 标题与语义章节标记。
+    func testStructuredOfficeIgnoresNumberedBodyLinesAsHeadings() throws {
+        let wordMarkdown = """
+        # 第一章 总则
+
+        1. 背景与目标
+
+        2. 范围与限制
+
+        # 第二章 实施
+
+        一、组织分工
+
+        （一）执行步骤
+        """
+        let word = OutlineResolver.resolve(markdown: wordMarkdown,
+                                           parsedOutline: "",
+                                           docName: "plan.doc")
+        XCTAssertEqual(word.nodes.map(\.title), ["第一章 总则", "第二章 实施"])
+
+        let pptMarkdown = """
+        ## Slide 1：年度计划
+
+        1. 背景
+
+        2. 目标
+
+        ## Slide 2：执行方案
+
+        1. 架构
+
+        2. 交付
+        """
+        let ppt = OutlineResolver.resolve(markdown: pptMarkdown,
+                                          parsedOutline: "",
+                                          docName: "deck.ppt")
+        XCTAssertEqual(ppt.nodes.map(\.title),
+                       ["Slide 1：年度计划", "Slide 2：执行方案"])
+    }
+
     func testConservativeRepairFillsDanglingAndDummyTitles() throws {
         let danglingMarkdown = """
         # 第一章

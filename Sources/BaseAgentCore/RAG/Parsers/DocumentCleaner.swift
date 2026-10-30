@@ -444,7 +444,10 @@ public enum DocumentCleaner {
         result = normalizeUnicodeScalars(result)
         result = normalizeHorizontalWhitespace(result, preserveIndent: markdown)
         // OCR 常在汉字之间插入空格（「新 中 新」），先合并再判断噪声行。
-        result = replace(cjkSpaceRegex, in: result, with: "")
+        // 结构化文档里的汉字空格是作者排版（「第一章 概述」），必须保留。
+        if profile == .ocr {
+            result = replace(cjkSpaceRegex, in: result, with: "")
+        }
         result = normalizeRepeatedPunctuation(result)
         return result
     }

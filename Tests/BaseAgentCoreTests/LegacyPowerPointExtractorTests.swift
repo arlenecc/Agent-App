@@ -80,6 +80,79 @@ final class LegacyPowerPointExtractorTests: XCTestCase {
         XCTAssertTrue(output.markdown.contains("naïve café"), output.markdown)
     }
 
+    func testBytesAtomDecodesGBKChinese() throws {
+        // GBK 的「季度报告」字节含非法 UTF-8 起始字节，UTF-8 解码会失败。
+        let builder = PowerPointTestBuilder(slides: [
+            .init(slideId: 1, blocks: [
+                .init(headerType: 0, text: "季度报告", useBytesAtom: true,
+                      byteEncoding: PowerPointTestBuilder.gb18030),
+                .init(headerType: 1, text: "中文正文", useBytesAtom: true,
+                      byteEncoding: PowerPointTestBuilder.gb18030),
+            ]),
+        ])
+
+        let output = try LegacyPowerPointExtractor().extract(url: try write(builder.build()))
+        XCTAssertTrue(output.markdown.contains("## Slide 1：季度报告"), output.markdown)
+        XCTAssertTrue(output.markdown.contains("中文正文"), output.markdown)
+        XCTAssertEqual(output.outline.map(\.title), ["Slide 1：季度报告"])
+    }
+
+    func testBytesAtomDecodesGBKChineseThatLooksLikeValidUTF8() throws {
+        // 「中文」的 GBK 字节 D6 D0 CE C4 恰好是合法 UTF-8，会被解成
+        // 希伯来/希腊字母；解码器必须识别这种乱码并改选 GB18030。
+        let builder = PowerPointTestBuilder(slides: [
+            .init(slideId: 1, blocks: [
+                .init(headerType: 0, text: "中文", useBytesAtom: true,
+                      byteEncoding: PowerPointTestBuilder.gb18030),
+            ]),
+        ])
+
+        let output = try LegacyPowerPointExtractor().extract(url: try write(builder.build()))
+        XCTAssertTrue(output.markdown.contains("## Slide 1：中文"), output.markdown)
+    }
+
+    func testBytesAtomDecodesUTF8Chinese() throws {
+        let builder = PowerPointTestBuilder(slides: [
+            .init(slideId: 1, blocks: [
+                .init(headerType: 0, text: "中文标题", useBytesAtom: true,
+                      byteEncoding: .utf8),
+            ]),
+        ])
+
+        let output = try LegacyPowerPointExtractor().extract(url: try write(builder.build()))
+        XCTAssertTrue(output.markdown.contains("## Slide 1：中文标题"), output.markdown)
+    }
+
+    func testBytesAtomDecodesUTF8WesternTextWithoutSwitchingToGBK() throws {
+        // 合法 UTF-8 西文不应因为 GB18030 也能解码而被误判成中文。
+        let builder = PowerPointTestBuilder(slides: [
+            .init(slideId: 1, blocks: [
+                .init(headerType: 0, text: "Résumé 2024", useBytesAtom: true,
+                      byteEncoding: .utf8),
+            ]),
+        ])
+
+        let output = try LegacyPowerPointExtractor().extract(url: try write(builder.build()))
+        XCTAssertTrue(output.markdown.contains("## Slide 1：Résumé 2024"), output.markdown)
+    }
+
+    func testBytesAtomKeepsUTF8CyrillicText() throws {
+        // 合法 UTF-8 的西里尔文同样能被 GB18030 解成汉字，不能只凭「能解出
+        // 中文」就覆盖 UTF-8；只有多种文字混杂或 C1 控制字符才是 GBK 乱码。
+        let builder = PowerPointTestBuilder(slides: [
+            .init(slideId: 1, blocks: [
+                .init(headerType: 0, text: "Привет 2024", useBytesAtom: true,
+                      byteEncoding: .utf8),
+                .init(headerType: 1, text: "Ελληνικά", useBytesAtom: true,
+                      byteEncoding: .utf8),
+            ]),
+        ])
+
+        let output = try LegacyPowerPointExtractor().extract(url: try write(builder.build()))
+        XCTAssertTrue(output.markdown.contains("## Slide 1：Привет 2024"), output.markdown)
+        XCTAssertTrue(output.markdown.contains("Ελληνικά"), output.markdown)
+    }
+
     func testSlideContainersAreUsedWhenSlideListIsMissing() throws {
         let builder = PowerPointTestBuilder(
             slides: [
@@ -99,6 +172,76 @@ final class LegacyPowerPointExtractorTests: XCTestCase {
         XCTAssertTrue(output.markdown.contains("## Slide 1：文件顺序一"), output.markdown)
         XCTAssertTrue(output.markdown.contains("## Slide 2：文件顺序二"), output.markdown)
         XCTAssertEqual(output.metadata["slides"], "2")
+    }
+
+    func testUnlistedSlidesAreRestoredInFileOrder() throws {
+        let builder = PowerPointTestBuilder(slides: [
+            .init(slideId: 1, blocks: [
+                .init(headerType: 0, text: "第一页"),
+                .init(headerType: 1, text: "正文一"),
+            ]),
+            .init(slideId: 2, blocks: [
+                .init(headerType: 0, text: "缺失页"),
+                .init(headerType: 1, text: "正文二"),
+            ], inSlideList: false),
+            .init(slideId: 3, blocks: [
+                .init(headerType: 0, text: "第三页"),
+                .init(headerType: 1, text: "正文三"),
+            ]),
+        ])
+
+        let output = try LegacyPowerPointExtractor().extract(url: try write(builder.build()))
+        XCTAssertTrue(output.markdown.contains("## Slide 2：缺失页"), output.markdown)
+        XCTAssertTrue(output.markdown.contains("正文二"), output.markdown)
+        XCTAssertEqual(output.metadata["slides"], "3")
+        XCTAssertEqual(output.outline.map(\.title), [
+            "Slide 1：第一页",
+            "Slide 2：缺失页",
+            "Slide 3：第三页",
+        ])
+
+        let first = try XCTUnwrap(output.markdown.range(of: "## Slide 1"))
+        let second = try XCTUnwrap(output.markdown.range(of: "## Slide 2"))
+        let third = try XCTUnwrap(output.markdown.range(of: "## Slide 3"))
+        XCTAssertLessThan(first.lowerBound, second.lowerBound)
+        XCTAssertLessThan(second.lowerBound, third.lowerBound)
+    }
+
+    func testSlideContainerBodyIsKeptWhenListTextIsPartial() throws {
+        let builder = PowerPointTestBuilder(slides: [
+            .init(slideId: 1,
+                  blocks: [
+                      .init(headerType: 0, text: "标题"),
+                      .init(headerType: 1, text: "容器正文"),
+                  ],
+                  listBlocks: [
+                      .init(headerType: 0, text: "标题"),
+                  ]),
+        ])
+
+        let output = try LegacyPowerPointExtractor().extract(url: try write(builder.build()))
+        XCTAssertTrue(output.markdown.contains("## Slide 1：标题"), output.markdown)
+        XCTAssertTrue(output.markdown.contains("容器正文"), output.markdown)
+        XCTAssertEqual(output.markdown.components(separatedBy: "容器正文").count - 1, 1)
+    }
+
+    func testMismatchedSlideIdsFallBackToSlideContainers() throws {
+        // 真实文件里 SlideListWithText 的 ID 与 Slide 容器 SlideAtom 的
+        // 字段并不保证一致；列表没有文本时必须按位置回退到容器。
+        let builder = PowerPointTestBuilder(slides: [
+            .init(slideId: 1,
+                  blocks: [
+                      .init(headerType: 0, text: "容器标题"),
+                      .init(headerType: 1, text: "容器正文"),
+                  ],
+                  listSlideId: 900,
+                  listBlocks: []),
+        ])
+
+        let output = try LegacyPowerPointExtractor().extract(url: try write(builder.build()))
+        XCTAssertTrue(output.markdown.contains("## Slide 1：容器标题"), output.markdown)
+        XCTAssertTrue(output.markdown.contains("容器正文"), output.markdown)
+        XCTAssertEqual(output.metadata["slides"], "1")
     }
 
     func testMissingPowerPointStreamIsParseError() throws {

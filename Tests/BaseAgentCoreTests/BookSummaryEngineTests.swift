@@ -174,6 +174,84 @@ final class BookSummaryEngineTests: XCTestCase {
         XCTAssertEqual(segments.joined(), body)
     }
 
+    /// 大表格是一整段无空行文本，分段必须线性完成；旧实现每轮复制剩余文本，
+    /// 500k 字符在本地会超过 3 秒，并在 20M 字符上限下退化为小时级。
+    func testLongSingleParagraphSplitsInLinearTime() throws {
+        let body = String(repeating: "甲", count: 500_000)
+        let started = Date()
+        let segments = BookSummaryEngine.splitSegments(
+            body, tokenBudget: 8_000, characterBudget: 3_000)
+        let elapsed = Date().timeIntervalSince(started)
+
+        XCTAssertEqual(segments.count, 167)
+        XCTAssertEqual(segments.joined(), body)
+        for segment in segments {
+            XCTAssertLessThanOrEqual(segment.count, 3_000)
+        }
+        XCTAssertLessThan(elapsed, 1.5, "500k 单段落分段耗时 \(elapsed)s，疑似重复扫描剩余文本")
+    }
+
+    /// `digest` 为控制提示长度会截断；章节树仍保存完整大纲，摘要解析应优先使用它，
+    /// 否则带标点的旧版 Office 标题在第一次摘要时会被丢掉。
+    func testResolveUsesFullChaptersBeyondTruncatedDigest() throws {
+        let store = try makeStore()
+        let markdown = """
+        ## Sheet: 汇总？
+
+        汇总内容。
+
+        ## Sheet: 明细？
+
+        明细内容。
+
+        ## Sheet: 附录？
+
+        附录内容。
+        """
+        let chapters = """
+        [{"title":"Sheet: 汇总？","level":2},
+         {"title":"Sheet: 明细？","level":2},
+         {"title":"Sheet: 附录？","level":2}]
+        """
+        let record = DocumentRecord(
+            docID: VectorStore.hashSource("workbook.xls"),
+            docName: "workbook.xls",
+            digest: "# 目录\n\nSheet: 汇总？",
+            chapters: chapters)
+        let resolved = BookSummaryEngine(store: store).resolve(record, markdown: markdown)
+
+        XCTAssertEqual(resolved.sections.count, 3)
+        XCTAssertEqual(resolved.nodes.map(\.title),
+                       ["Sheet: 汇总？", "Sheet: 明细？", "Sheet: 附录？"])
+    }
+
+    /// 无标题纯正文（旧版 Word 没有识别到任何标题样式）不能因为章节为空
+    /// 就跳过全书摘要：整份 Markdown 作为唯一的「全文」章节参与汇总。
+    func testResolveWithoutHeadingsUsesWholeTextAsSingleSection() throws {
+        let store = try makeStore()
+        let document = try insertDocument(store, name: "untitled.doc")
+        let markdown = "这是一份没有标题的文档。\n\n"
+            + String(repeating: "正文内容。", count: 30)
+        let resolved = BookSummaryEngine(store: store).resolve(document, markdown: markdown)
+
+        XCTAssertTrue(resolved.nodes.isEmpty)
+        XCTAssertEqual(resolved.sections.count, 1)
+        let section = try XCTUnwrap(resolved.sections.first)
+        XCTAssertEqual(section.index, 0)
+        XCTAssertEqual(section.level, 1)
+        XCTAssertEqual(section.title, "全文")
+        XCTAssertEqual(section.heading, "全文")
+        XCTAssertEqual(section.body, markdown)
+        XCTAssertFalse(section.contentHash.isEmpty)
+        // 合成章节只服务于摘要，不能把「全文」写回入库目录。
+        XCTAssertEqual(resolved.digest, document.digest)
+        XCTAssertEqual(resolved.chaptersJSON, document.chapters)
+
+        // 真正没有正文时仍保持无章节，避免产生无意义的摘要。
+        XCTAssertTrue(BookSummaryEngine(store: store)
+            .resolve(document, markdown: " \n\t").sections.isEmpty)
+    }
+
     func testChapterUnderFourThousandCharactersStaysSingleMap() async throws {
         let store = try makeStore()
         let document = try insertDocument(store)
@@ -491,5 +569,37 @@ final class BookSummaryEngineTests: XCTestCase {
         XCTAssertTrue(try store.chapterSummaries(docID: document.docID)
             .allSatisfy { $0.sectionIndex < 1 },
             "目录收缩后越界的旧摘要应被清理")
+    }
+
+    func testUntitledDocumentProducesChapterAndBookSummary() async throws {
+        let store = try makeStore()
+        let document = try insertDocument(store, name: "untitled.doc")
+        let engine = BookSummaryEngine(store: store)
+        let markdown = String(repeating: "这是一段没有标题的正文内容。", count: 40)
+
+        let chapterStub = SummaryStubLLM()
+        let chapter = try await engine.processNextChapter(
+            document: document, markdown: markdown, llm: chapterStub,
+            now: Date(), isCancelled: { false })
+        XCTAssertEqual(chapter.sectionIndex, 0)
+        XCTAssertEqual(chapter.totalSections, 1)
+        XCTAssertTrue(chapter.chapterCompleted)
+        XCTAssertFalse(chapter.bookCompleted)
+        XCTAssertFalse(chapter.summary.isEmpty)
+        XCTAssertEqual(try store.summaryJob(docID: document.docID)?.status, .summarizingBook)
+        XCTAssertEqual(try store.summaryJob(docID: document.docID)?.nextSection, 1)
+        XCTAssertEqual(try store.summaryJob(docID: document.docID)?.totalSections, 1)
+
+        let bookStub = SummaryStubLLM(
+            response: String(repeating: "全书内容概括。", count: 50))
+        let record = try await engine.processBookSummary(
+            document: document, markdown: markdown, llm: bookStub,
+            now: Date(), isCancelled: { false })
+        XCTAssertEqual(record.chapterCount, 1)
+        XCTAssertFalse(record.summary.isEmpty)
+        XCTAssertTrue(record.outline.contains("untitled.doc"))
+        XCTAssertEqual(try store.summaryJob(docID: document.docID)?.status, .completed)
+        XCTAssertEqual(try store.summaryJob(docID: document.docID)?.totalSections, 1)
+        XCTAssertEqual(try store.bookSummary(docID: document.docID)?.summary, record.summary)
     }
 }

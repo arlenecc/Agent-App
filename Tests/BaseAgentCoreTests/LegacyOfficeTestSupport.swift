@@ -378,6 +378,8 @@ struct BIFF8TestBuilder {
     struct Sheet {
         let name: String
         let cells: [Cell]
+        /// 非空时替代自动生成的工作表子流；传空 `Data` 可模拟损坏的工作表。
+        var rawPayload: Data? = nil
     }
 
     struct Cell {
@@ -431,7 +433,7 @@ struct BIFF8TestBuilder {
     }
 
     func build() throws -> OLE2TestFile {
-        let sheetPayloads = sheets.map(sheetData)
+        let sheetPayloads = sheets.map { $0.rawPayload ?? sheetData($0) }
         let placeholder = globalData(sheetOffsets: Array(repeating: 0, count: sheets.count))
 
         var offsets: [UInt32] = []
@@ -811,15 +813,24 @@ struct BIFF8TestBuilder {
 /// `includeSlideList` 为 false 时验证回退到文件顺序。
 struct PowerPointTestBuilder {
 
+    /// macOS 未提供 `.gb18030` 常量，测试按 CoreFoundation 编码号构造。
+    static let gb18030 = String.Encoding(
+        rawValue: CFStringConvertEncodingToNSStringEncoding(
+            CFStringEncoding(CFStringEncodings.GB_18030_2000.rawValue)))
+
     struct TextBlock {
         let headerType: UInt32
         let text: String
         let useBytesAtom: Bool
+        /// `useBytesAtom` 为 true 时写入的字节编码；默认按 CP1252 写入。
+        let byteEncoding: String.Encoding?
 
-        init(headerType: UInt32, text: String, useBytesAtom: Bool = false) {
+        init(headerType: UInt32, text: String, useBytesAtom: Bool = false,
+             byteEncoding: String.Encoding? = nil) {
             self.headerType = headerType
             self.text = text
             self.useBytesAtom = useBytesAtom
+            self.byteEncoding = byteEncoding
         }
     }
 
@@ -827,11 +838,19 @@ struct PowerPointTestBuilder {
         let slideId: UInt32
         let blocks: [TextBlock]
         let inSlideList: Bool
+        /// `SlideListWithText` 中 `SlidePersistAtom` 的 ID；默认与容器相同。
+        /// 真实文件里二者可能不一致，用于验证位置回退。
+        let listSlideId: UInt32?
+        /// 非空时只把这些文本块写入 `SlideListWithText`，模拟列表文本不完整。
+        let listBlocks: [TextBlock]?
 
-        init(slideId: UInt32, blocks: [TextBlock], inSlideList: Bool = true) {
+        init(slideId: UInt32, blocks: [TextBlock], inSlideList: Bool = true,
+             listSlideId: UInt32? = nil, listBlocks: [TextBlock]? = nil) {
             self.slideId = slideId
             self.blocks = blocks
             self.inSlideList = inSlideList
+            self.listSlideId = listSlideId
+            self.listBlocks = listBlocks
         }
     }
 
@@ -919,9 +938,11 @@ struct PowerPointTestBuilder {
             if !listed.isEmpty {
                 var list = Data()
                 for slide in listed {
-                    list.append(Self.slidePersistAtom(slideId: slide.slideId,
-                                                      textCount: UInt32(slide.blocks.count)))
-                    for block in slide.blocks { list.append(textRecords(block)) }
+                    let listBlocks = slide.listBlocks ?? slide.blocks
+                    list.append(Self.slidePersistAtom(
+                        slideId: slide.listSlideId ?? slide.slideId,
+                        textCount: UInt32(listBlocks.count)))
+                    for block in listBlocks { list.append(textRecords(block)) }
                 }
                 payload.append(Self.container(type: 0x0FF0, instance: 0, payload: list))
             }
@@ -957,7 +978,8 @@ struct PowerPointTestBuilder {
         data.append(Self.record(type: 0x0F9F,
                                 payload: Data(Self.u32(block.headerType))))
         if block.useBytesAtom {
-            let bytes = block.text.data(using: .windowsCP1252) ?? Data(block.text.utf8)
+            let encoding = block.byteEncoding ?? .windowsCP1252
+            let bytes = block.text.data(using: encoding) ?? Data(block.text.utf8)
             data.append(Self.record(type: 0x0FA8, payload: bytes))
         } else {
             var payload = Data()

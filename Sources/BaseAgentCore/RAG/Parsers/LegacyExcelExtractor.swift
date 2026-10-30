@@ -1,5 +1,10 @@
 import Foundation
 
+/// 同步解析循环无法被系统中断，只能在阶段边界和循环内主动观察取消信号。
+private func checkExcelCancellation() throws {
+    if Task.isCancelled { throw AgentError.cancelled }
+}
+
 /// Excel 97–2003 `.xls`（BIFF8）提取。
 ///
 /// 只读取 `Workbook` 流的 BIFF8 记录：全局子流负责工作表位置、共享字符串、
@@ -27,6 +32,7 @@ struct LegacyExcelExtractor {
     // MARK: - 入口
 
     private func extractInternal(url: URL) throws -> Output {
+        try checkExcelCancellation()
         let values = try url.resourceValues(forKeys: [.fileSizeKey])
         if let size = values.fileSize, size > LegacyOfficeLimits.maxFileSize {
             throw AgentError.parse(
@@ -34,6 +40,7 @@ struct LegacyExcelExtractor {
                 + "（\(url.lastPathComponent)）")
         }
 
+        try checkExcelCancellation()
         let compound: OLE2CompoundFile
         do {
             compound = try OLE2CompoundFile.open(url: url)
@@ -51,6 +58,7 @@ struct LegacyExcelExtractor {
             throw AgentError.parse("Excel 工作簿缺少 Workbook 流（\(url.lastPathComponent)）")
         }
 
+        try checkExcelCancellation()
         let stream: Data
         do {
             stream = try compound.streamData(named: "Workbook")
@@ -59,6 +67,7 @@ struct LegacyExcelExtractor {
                 "Excel 工作簿流读取失败（\(url.lastPathComponent)）：\(error.localizedDescription)")
         }
 
+        try checkExcelCancellation()
         let globals = try parseGlobals(stream, fileName: url.lastPathComponent)
         let formatter = ExcelNumberFormatter(formats: globals.formats,
                                              xfFormatIDs: globals.xfFormatIDs,
@@ -69,6 +78,7 @@ struct LegacyExcelExtractor {
         var skippedSheets = 0
 
         for sheet in globals.sheets.prefix(LegacyOfficeLimits.maxExcelSheets) {
+            try checkExcelCancellation()
             do {
                 guard let buffer = try parseSheet(stream: stream, info: sheet,
                                                   sharedStrings: globals.sharedStrings,
@@ -77,9 +87,11 @@ struct LegacyExcelExtractor {
                     skippedSheets += 1
                     continue
                 }
-                guard let table = buffer.markdownTable() else { continue }
+                guard let table = try buffer.markdownTable() else { continue }
                 sections.append("## Sheet: \(sheet.name)\n\n\(table)")
                 outline.append(OutlineEntry(level: 2, title: "Sheet: \(sheet.name)"))
+            } catch AgentError.cancelled {
+                throw AgentError.cancelled
             } catch {
                 skippedSheets += 1
                 AgentLog.warning(
@@ -101,7 +113,12 @@ struct LegacyExcelExtractor {
         ]
         let sheetLimitHit = globals.sheets.count > LegacyOfficeLimits.maxExcelSheets
         if sheetLimitHit { metadata["sheet_limit_hit"] = "true" }
-        if skippedSheets > 0 { metadata["skipped_sheets"] = String(skippedSheets) }
+        if skippedSheets > 0 {
+            metadata["skipped_sheets"] = String(skippedSheets)
+            // 入库层按 `failed_pages` 判断是否完整；损坏的工作表与失败页等价，
+            // 必须让增量同步下次重试，而不是被 manifest 的 complete=true 永久跳过。
+            metadata["failed_pages"] = String(skippedSheets)
+        }
 
         var markdown = sections.joined(separator: "\n\n")
         let limited = LegacyOfficeLimits.limitText(markdown)
@@ -166,8 +183,11 @@ struct LegacyExcelExtractor {
         var globals = WorkbookGlobals()
         var sstSegments: [Data] = []
         var collectingSST = false
+        var recordIndex = 0
 
         while let record = try reader.next() {
+            recordIndex += 1
+            if recordIndex % 4096 == 0 { try checkExcelCancellation() }
             if collectingSST {
                 if record.type == 0x003C {
                     sstSegments.append(record.payload)
@@ -249,7 +269,8 @@ struct LegacyExcelExtractor {
         }
         var strings: [String] = []
         strings.reserveCapacity(uniqueCount)
-        for _ in 0..<uniqueCount {
+        for index in 0..<uniqueCount {
+            if index % 4096 == 0 { try checkExcelCancellation() }
             strings.append(try reader.readString())
         }
         return strings
@@ -354,11 +375,12 @@ struct LegacyExcelExtractor {
             maxColumn = max(maxColumn, column)
         }
 
-        func markdownTable() -> String? {
+        func markdownTable() throws -> String? {
             guard maxRow >= 0, maxColumn >= 0 else { return nil }
             var rows: [[String]] = []
             rows.reserveCapacity(maxRow + 1)
             for row in 0...maxRow {
+                if row % 1024 == 0 { try checkExcelCancellation() }
                 let values = self.rows[row] ?? [:]
                 var cells: [String] = []
                 cells.reserveCapacity(maxColumn + 1)
@@ -389,8 +411,11 @@ struct LegacyExcelExtractor {
 
         var buffer = SheetBuffer()
         var pendingString: (row: Int, column: Int)?
+        var recordIndex = 0
 
         while let record = try reader.next() {
+            recordIndex += 1
+            if recordIndex % 4096 == 0 { try checkExcelCancellation() }
             // STRING 记录必须紧跟在缓存结果为字符串的 FORMULA 之后。
             if record.type != 0x0207 { pendingString = nil }
 
