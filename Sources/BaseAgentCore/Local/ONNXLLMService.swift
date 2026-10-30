@@ -24,6 +24,8 @@ public final class ONNXLLMService: LLMService, PreloadableLLMService,
     public let identifier: String
     public let contextWindow: Int
     public let supportsTools = true
+    /// `isolated` 请求使用独立的 past/logits，且 ONNX Runtime 的 Session.run 可并发。
+    public var supportsConcurrentIsolatedRequests: Bool { true }
 
     private let directory: URL
     private let tokenizerDirectory: URL?
@@ -68,11 +70,29 @@ public final class ONNXLLMService: LLMService, PreloadableLLMService,
     public func chatStream(messages: [ChatMessage],
                            tools: [JSONValue],
                            temperature: Double) -> AsyncThrowingStream<LLMStreamEvent, Error> {
+        makeStream(messages: messages, tools: tools, temperature: temperature,
+                   options: .default)
+    }
+
+    public func chatStream(messages: [ChatMessage],
+                           tools: [JSONValue],
+                           temperature: Double,
+                           options: LLMRequestOptions) -> AsyncThrowingStream<LLMStreamEvent, Error> {
+        makeStream(messages: messages, tools: tools, temperature: temperature,
+                   options: options)
+    }
+
+    private func makeStream(messages: [ChatMessage],
+                            tools: [JSONValue],
+                            temperature: Double,
+                            options: LLMRequestOptions) -> AsyncThrowingStream<LLMStreamEvent, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
                     try await self.run(messages: messages, tools: tools,
                                        temperature: temperature,
+                                       enableThinking: options.enableThinking ?? self.enableThinking,
+                                       isolated: options.isolated,
                                        continuation: continuation)
                     continuation.finish()
                 } catch {
@@ -178,10 +198,35 @@ public final class ONNXLLMService: LLMService, PreloadableLLMService,
     private func run(messages: [ChatMessage],
                      tools: [JSONValue],
                      temperature: Double,
+                     enableThinking: Bool,
+                     isolated: Bool,
                      continuation: AsyncThrowingStream<LLMStreamEvent, Error>.Continuation) async throws {
-        try await gate.withLock {
-            try Task.checkCancellation()
-            let loaded = try await loaded()
+        if isolated {
+            // 一次性分片各自持有 past/logits，不读写共享 cache；ONNX Runtime 的
+            // Session.run 可并发执行，因此不占用串行 gate，辅助模型分片可真正并行。
+            try await generate(messages: messages, tools: tools,
+                               temperature: temperature,
+                               enableThinking: enableThinking,
+                               isolated: true, continuation: continuation)
+        } else {
+            try await gate.withLock {
+                try await generate(messages: messages, tools: tools,
+                                   temperature: temperature,
+                                   enableThinking: enableThinking,
+                                   isolated: false, continuation: continuation)
+            }
+        }
+    }
+
+    /// 生成主体。共享 cache 的会话请求由调用方持有 gate；`isolated` 请求不碰 cache。
+    private func generate(messages: [ChatMessage],
+                          tools: [JSONValue],
+                          temperature: Double,
+                          enableThinking: Bool,
+                          isolated: Bool,
+                          continuation: AsyncThrowingStream<LLMStreamEvent, Error>.Continuation) async throws {
+        try Task.checkCancellation()
+        let loaded = try await loaded()
             let tokenizer = loaded.tokenizer
             let baseTokens = try tokenizer.applyChatTemplate(
                 messages: messages, tools: tools, enableThinking: enableThinking,
@@ -207,7 +252,7 @@ public final class ONNXLLMService: LLMService, PreloadableLLMService,
             var lastLogits: [Float]
             let promptTokenCount = tokens.count
 
-            if loaded.graph.canReusePast,
+            if !isolated, loaded.graph.canReusePast,
                let cached,
                cached.toolsKey == toolsKey,
                cached.tokens.count <= tokens.count,
@@ -347,7 +392,9 @@ public final class ONNXLLMService: LLMService, PreloadableLLMService,
                 AgentLog.info("[onnx] prompt=\(promptTokenCount) cached=\(cachedPromptTokens) "
                     + "generated=\(generated.count) reused=\(reused)")
 
-                if loaded.graph.canReusePast {
+                if isolated {
+                    // 一次性请求不覆盖共享缓存；下一次会话请求仍走自己的缓存。
+                } else if loaded.graph.canReusePast {
                     stateLock.lock()
                     cache = ONNXCache(tokens: tokens + generated, past: past,
                                       logits: logits, toolsKey: toolsKey)
@@ -363,12 +410,13 @@ public final class ONNXLLMService: LLMService, PreloadableLLMService,
                     usage: usage,
                     rawContent: rawContent))
             } catch {
-                stateLock.lock()
-                cache = nil
-                stateLock.unlock()
+                if !isolated {
+                    stateLock.lock()
+                    cache = nil
+                    stateLock.unlock()
+                }
                 throw error
             }
-        }
     }
 
     private static let chunkSize = 512

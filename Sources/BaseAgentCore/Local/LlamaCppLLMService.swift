@@ -60,11 +60,29 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
     public func chatStream(messages: [ChatMessage],
                            tools: [JSONValue],
                            temperature: Double) -> AsyncThrowingStream<LLMStreamEvent, Error> {
+        makeStream(messages: messages, tools: tools, temperature: temperature,
+                   options: .default)
+    }
+
+    public func chatStream(messages: [ChatMessage],
+                           tools: [JSONValue],
+                           temperature: Double,
+                           options: LLMRequestOptions) -> AsyncThrowingStream<LLMStreamEvent, Error> {
+        makeStream(messages: messages, tools: tools, temperature: temperature,
+                   options: options)
+    }
+
+    private func makeStream(messages: [ChatMessage],
+                            tools: [JSONValue],
+                            temperature: Double,
+                            options: LLMRequestOptions) -> AsyncThrowingStream<LLMStreamEvent, Error> {
         AsyncThrowingStream { continuation in
             let task = Task {
                 do {
                     try await self.run(messages: messages, tools: tools,
                                        temperature: temperature,
+                                       enableThinking: options.enableThinking ?? self.enableThinking,
+                                       isolated: options.isolated,
                                        continuation: continuation)
                     continuation.finish()
                 } catch {
@@ -185,6 +203,8 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
     private func run(messages: [ChatMessage],
                      tools: [JSONValue],
                      temperature: Double,
+                     enableThinking: Bool,
+                     isolated: Bool,
                      continuation: AsyncThrowingStream<LLMStreamEvent, Error>.Continuation) async throws {
         try await gate.withLock {
             try Task.checkCancellation()
@@ -219,16 +239,17 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
             }
 
             let toolsKey = Self.toolsKey(tools)
-            let toolsMatch = kvReuse && cachedToolsKey == toolsKey
-            var common = toolsMatch
-                ? LlamaCppContext.commonPrefix(cachedTokens, tokens) : 0
-            if !kvReuse, cachedTokens.count > 0 {
-                // 开关关闭：丢弃上一轮缓存，整段重建（关闭前已缓存的 KV 一并清掉）。
+            let reuseAllowed = kvReuse && !isolated
+            if !reuseAllowed {
+                // 关闭复用或一次性请求：丢弃上一轮缓存并整段重建，
+                // 避免把其它分片/会话的 KV 当作当前 prompt 的前缀。
                 llama_memory_clear(loaded.memory, true)
                 cachedTokens = []
                 cachedToolsKey = nil
-                common = 0
             }
+            let toolsMatch = reuseAllowed && cachedToolsKey == toolsKey
+            var common = toolsMatch
+                ? LlamaCppContext.commonPrefix(cachedTokens, tokens) : 0
             if common == tokens.count {
                 common = max(0, tokens.count - 1)
             }
@@ -350,8 +371,10 @@ public final class LlamaCppLLMService: LLMService, PreloadableLLMService,
                 + "generated=\(generated.count) prefill_ms=\(prefillMilliseconds) "
                 + "tps=\(usage["tokens_per_second"] ?? 0)")
 
-            cachedTokens = tokens + generated
-            cachedToolsKey = toolsKey
+            if !isolated {
+                cachedTokens = tokens + generated
+                cachedToolsKey = toolsKey
+            }
             continuation.yield(LLMStreamEvent(
                 kind: .done,
                 toolCalls: toolCalls,

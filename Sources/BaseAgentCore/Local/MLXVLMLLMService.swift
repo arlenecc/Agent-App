@@ -74,6 +74,22 @@ public final class MLXVLMLLMService: LLMService, PreloadableLLMService,
     public func chatStream(messages: [ChatMessage],
                            tools: [JSONValue],
                            temperature: Double) -> AsyncThrowingStream<LLMStreamEvent, Error> {
+        chatStream(messages: messages, tools: tools, temperature: temperature,
+                   options: .default)
+    }
+
+    public func chatStream(messages: [ChatMessage],
+                           tools: [JSONValue],
+                           temperature: Double,
+                           options: LLMRequestOptions) -> AsyncThrowingStream<LLMStreamEvent, Error> {
+        makeStream(messages: messages, tools: tools, temperature: temperature,
+                   enableThinking: options.enableThinking ?? enableThinking)
+    }
+
+    private func makeStream(messages: [ChatMessage],
+                            tools: [JSONValue],
+                            temperature: Double,
+                            enableThinking: Bool) -> AsyncThrowingStream<LLMStreamEvent, Error> {
         AsyncThrowingStream { continuation in
             Task {
                 do {

@@ -14,6 +14,8 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
     public let identifier: String
     public let supportsTools = true
     public let contextWindow: Int
+    /// `isolated` 请求会创建共享权重、独立 KV 的轻量副本，可安全并行。
+    public var supportsConcurrentIsolatedRequests: Bool { true }
     public let directory: URL
     public let modelName: String
 
@@ -30,7 +32,8 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
     private let kvReuse: Bool
     /// KV cache int8 量化（QuantizedKVCache kvBits=8），KV 内存约减半。
     private let kvInt8: Bool
-    private let state = LLMLoadState()
+    /// 模型容器共享给同一模型的轻量副本；容器内是只读权重。
+    private let state: LLMLoadState
     /// 跨轮 KV cache 与模型状态。MLX 调用由 Agent 串行驱动。
     private var rawCache: [KVCache]?
     private var rawState: LMOutput.State?
@@ -77,6 +80,28 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
         self.promptBatchSize = max(0, promptBatchSize)
         self.kvReuse = kvReuse
         self.kvInt8 = kvInt8
+        self.state = LLMLoadState()
+    }
+
+    /// 共享已加载权重的轻量副本：独立持有 KV/session，用于并行的一次性请求。
+    ///
+    /// 只有 `state` 共享；`rawCache`、会话轨迹等仍各自独立，因此不会互相污染。
+    private init(sharing other: MLXLLMService, enableThinking: Bool) {
+        self.directory = other.directory
+        self.modelName = other.modelName
+        self.identifier = other.identifier
+        self.maxTokens = other.maxTokens
+        self.topP = other.topP
+        self.minP = other.minP
+        self.topK = other.topK
+        self.repetitionPenalty = other.repetitionPenalty
+        self.enableThinking = enableThinking
+        self.contextWindow = other.contextWindow
+        self.promptBatchSize = other.promptBatchSize
+        // 一次性请求不能复用其它分片的 KV，也不能把半截历史留给下一次调用。
+        self.kvReuse = false
+        self.kvInt8 = other.kvInt8
+        self.state = other.state
     }
 
     // MARK: - LLMService
@@ -422,6 +447,22 @@ public final class MLXLLMService: LLMService, PreloadableLLMService,
                 task.cancel()
             }
         }
+    }
+
+    public func chatStream(
+        messages: [ChatMessage],
+        tools: [JSONValue],
+        temperature: Double,
+        options: LLMRequestOptions
+    ) -> AsyncThrowingStream<LLMStreamEvent, Error> {
+        let thinking = options.enableThinking ?? enableThinking
+        // 覆盖 thinking 或要求独立会话时，用共享权重的副本跑一次完整请求：
+        // 既不会改动常驻会话的 KV，也能让多个摘要分片真正并行。
+        guard options.isolated || thinking != enableThinking else {
+            return chatStream(messages: messages, tools: tools, temperature: temperature)
+        }
+        let isolated = MLXLLMService(sharing: self, enableThinking: thinking)
+        return isolated.chatStream(messages: messages, tools: tools, temperature: temperature)
     }
 
     // MARK: - 加载 / 卸载
@@ -953,7 +994,9 @@ private struct TemplateProbe: Sendable {
 private actor LLMLoadState {
     private var container: ModelContainer?
     private var failure: AgentError?
-    private var probe: TemplateProbe?
+    /// 模板探针按 thinking 开关分别缓存：同一模型可能同时服务摘要（关闭）
+    /// 与前台对话（开启），两种模板尾部的生成前缀不同。
+    private var probes: [Bool: TemplateProbe] = [:]
 
     func container(directory: URL) async throws -> ModelContainer {
         if let container { return container }
@@ -977,12 +1020,12 @@ private actor LLMLoadState {
 
     func unload() {
         container = nil
-        probe = nil
+        probes = [:]
         failure = nil
     }
 
     func templateProbe(container: ModelContainer, enableThinking: Bool) async throws -> TemplateProbe {
-        if let probe { return probe }
+        if let probe = probes[enableThinking] { return probe }
 
         let tokens = try await container.perform { context in
             try context.tokenizer.applyChatTemplate(
@@ -1002,7 +1045,7 @@ private actor LLMLoadState {
         }
 
         let result = TemplateProbe(startInThink: startInThink, generationPrefix: prefix)
-        probe = result
+        probes[enableThinking] = result
         return result
     }
 }

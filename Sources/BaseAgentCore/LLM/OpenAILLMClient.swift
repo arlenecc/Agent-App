@@ -18,6 +18,8 @@ public final class OpenAILLMClient: LLMService, ClosableLLMService {
     public let contextWindow: Int
 
     public var identifier: String { "openai:\(model)" }
+    /// HTTP 请求彼此无共享会话状态，可并发提交。
+    public var supportsConcurrentIsolatedRequests: Bool { true }
 
     private let http: URLSession
 
