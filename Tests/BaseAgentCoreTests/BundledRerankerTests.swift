@@ -9,6 +9,10 @@ final class BundledRerankerTests: XCTestCase {
     private var temporaryRoot: URL!
 
     override func setUpWithError() throws {
+        // 全量测试中其它用例可能已按不同模型目录缓存过 FailingRerankProvider；
+        // 先清空缓存与环境，避免命中旧失败实例。
+        unsetenv("BASE_AGENT_MODELS_DIR")
+        LocalModelFactory.shared.clearCaches()
         temporaryRoot = URL(fileURLWithPath: NSTemporaryDirectory())
             .appendingPathComponent("bundled-reranker-\(UUID().uuidString)")
         try FileManager.default.createDirectory(
