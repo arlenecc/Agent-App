@@ -43,7 +43,7 @@ public enum LocalModelError: LocalizedError, Sendable {
         case .missingONNXModel(let kind, let directory, let expected):
             return "\(kind.displayName)目录中缺少 ONNX 权重：\(directory)\n期望文件名（按优先级）：\(expected.joined(separator: "、"))"
         case .missingTokenizer(let directory, let file):
-            return "模型目录缺少 tokenizer 文件：\(directory)/\(file)。请确保 tokenizer.json 与 tokenizer_config.json 与模型权重位于同一目录。"
+            return "模型目录缺少 tokenizer 文件：\(directory)/\(file)。请确保 tokenizer.json 与模型权重位于同一目录（tokenizer_config.json 可选）。"
         case .invalidConfiguration(let message):
             return "本地模型配置无效：\(message)"
         case .unsupportedArchitecture(let message):

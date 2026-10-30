@@ -1,4 +1,5 @@
 import Foundation
+import Hub
 import Tokenizers
 import MLXLMCommon
 
@@ -49,7 +50,11 @@ public final class LocalTokenizer: @unchecked Sendable {
             || lowerType.contains("xlm_roberta")
     }
 
-    /// 从模型目录加载 tokenizer。`tokenizer.json` 与 `tokenizer_config.json` 必须同目录。
+    /// 从模型目录加载 tokenizer。
+    ///
+    /// `tokenizer.json` 必须存在；`tokenizer_config.json` 可选。部分转换产物
+    /// （如 jina-v5 ONNX/MLX 目录）只带 tokenizer.json，此时用 tokenizer.json
+    /// 自身的 `padding` 元数据与合成的最小配置构建 tokenizer。
     public static func load(directory: URL) async throws -> LocalTokenizer {
         let fm = FileManager.default
         let tokenizerURL = directory.appendingPathComponent("tokenizer.json")
@@ -58,24 +63,39 @@ public final class LocalTokenizer: @unchecked Sendable {
         guard fm.fileExists(atPath: tokenizerURL.path) else {
             throw LocalModelError.missingTokenizer(directory: directory.path, file: "tokenizer.json")
         }
-        guard fm.fileExists(atPath: configURL.path) else {
-            throw LocalModelError.missingTokenizer(directory: directory.path, file: "tokenizer_config.json")
-        }
 
+        let hasTokenizerConfig = fm.fileExists(atPath: configURL.path)
+        let config: [String: Any]
         let base: any Tokenizers.Tokenizer
         do {
-            // 非严格模式：tokenizer_config 里的 tokenizer_class 可能来自更新版本的
-            // transformers（如 Qwen3_5Tokenizer）；只要 tokenizer.json 是标准 BPE，
-            // 就应回退到 BPE 而不是直接拒绝加载整个模型。
-            base = try await Tokenizers.AutoTokenizer.from(modelFolder: directory, strict: false)
+            if hasTokenizerConfig {
+                // 非严格模式：tokenizer_config 里的 tokenizer_class 可能来自更新版本的
+                // transformers（如 Qwen3_5Tokenizer）；只要 tokenizer.json 是标准 BPE，
+                // 就应回退到 BPE 而不是直接拒绝加载整个模型。
+                base = try await Tokenizers.AutoTokenizer.from(
+                    modelFolder: directory, strict: false)
+                config = readJSON(configURL) ?? [:]
+            } else {
+                let tokenizerData = try HubApi.shared.configuration(fileURL: tokenizerURL)
+                // 最小合成配置：没有 tokenizer_config 时按通用 PreTrainedTokenizer
+                // 构建；特殊 token 与 padding 由 tokenizer.json 提供。
+                let synthetic = Config([
+                    "tokenizer_class": Config("PreTrainedTokenizer"),
+                    "model_max_length": Config(8192),
+                ])
+                base = try Tokenizers.AutoTokenizer.from(
+                    tokenizerConfig: synthetic,
+                    tokenizerData: tokenizerData,
+                    strict: false)
+                config = readJSON(tokenizerURL) ?? [:]
+            }
         } catch {
             throw LocalModelError.runtime("tokenizer 加载失败（\(directory.path)）：\(error.localizedDescription)")
         }
 
-        let config = readJSON(configURL) ?? [:]
         let tokenizerClass = (config["tokenizer_class"] as? String)
             ?? (config["model_type"] as? String)
-            ?? ""
+            ?? "PreTrainedTokenizer"
         let modelType = (config["model_type"] as? String) ?? ""
 
         var padID: Int?
@@ -83,6 +103,14 @@ public final class LocalTokenizer: @unchecked Sendable {
             padID = value
         } else if let token = config["pad_token"] as? String, !token.isEmpty {
             padID = base.convertTokenToId(token)
+        }
+        if padID == nil,
+           let padding = config["padding"] as? [String: Any] {
+            if let value = padding["pad_id"] as? Int, value >= 0 {
+                padID = value
+            } else if let token = padding["pad_token"] as? String, !token.isEmpty {
+                padID = base.convertTokenToId(token)
+            }
         }
         if padID == nil {
             padID = base.eosTokenId
