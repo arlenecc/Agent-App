@@ -768,6 +768,7 @@ struct SettingsView: View {
         TextField("可选", text: path)
             .textFieldStyle(.roundedBorder)
             .frame(minWidth: 140)
+            .help("留空时使用应用内置的默认模型；仅在需要自定义模型时填写路径")
         Button("选择…") { chooseDirectory(path, title: chooseTitle) }
     }
 
@@ -799,7 +800,8 @@ struct SettingsView: View {
     private func rerankControls() -> some View {
         Toggle("启用重排序", isOn: $rerankEnabled)
             .help("开启后先用混合检索取候选，再由 reranker 重新打分排序，"
-                + "按下面的 TopN 返回最终结果；关闭则直接用 RRF 排序结果")
+                + "按下面的 TopN 返回最终结果；关闭则直接用 RRF 排序结果。"
+                + "路径保持默认或留空时使用 App 内置 jina reranker")
         Stepper("TopN：\(rerankTopN)", value: $rerankTopN, in: 1...20)
             .help("重排序之后保留的结果数量，默认 5；候选池会按它放大后再打乱重排。"
                 + "关闭重排序时按检索调用方的 top_k 返回")
