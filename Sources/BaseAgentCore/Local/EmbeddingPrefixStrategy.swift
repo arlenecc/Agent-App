@@ -5,6 +5,7 @@ enum EmbeddingModelFamily: Equatable, Sendable {
     case nomic
     case bgeZh
     case jina
+    case jinaV5
     case e5
     case generic
 }
@@ -55,6 +56,10 @@ struct EmbeddingPrefixStrategy: Equatable, Sendable {
             return "clustering: "
         case (.jina, .classification):
             return "classification: "
+        case (.jinaV5, .retrievalDocument):
+            return JinaV5Profile.documentPrefix
+        case (.jinaV5, .retrievalQuery):
+            return JinaV5Profile.queryPrefix
         case (.e5, .retrievalDocument):
             return "passage: "
         case (.e5, .retrievalQuery):
@@ -75,7 +80,7 @@ struct EmbeddingPrefixStrategy: Equatable, Sendable {
         switch family {
         case .nomic:
             return 8
-        case .jina, .e5:
+        case .jina, .jinaV5, .e5:
             return 4
         case .bgeZh, .generic:
             return 0
@@ -95,7 +100,11 @@ struct EmbeddingPrefixStrategy: Equatable, Sendable {
         if tokens.contains("bge") {
             return tokens.contains("zh") ? .bgeZh : .generic
         }
-        if tokens.contains("jina") { return .jina }
+        if tokens.contains("jina") {
+            // v5 与小写前缀的 v3 是不同模型族，必须在 jina 之前分流。
+            if tokens.contains("v5") { return .jinaV5 }
+            return .jina
+        }
         if tokens.contains("e5") { return .e5 }
         return .generic
     }

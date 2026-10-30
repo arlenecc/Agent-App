@@ -104,6 +104,17 @@ final class EmbeddingPrefixStrategyTests: XCTestCase {
                        "query: 文本")
     }
 
+    func testJinaV5UsesDocumentAndQueryLabels() {
+        let strategy = EmbeddingPrefixStrategy(
+            modelName: "jina-embeddings-v5-text-nano-mlx-int4")
+
+        XCTAssertEqual(strategy.family, .jinaV5)
+        XCTAssertEqual(strategy.prefix(for: .retrievalDocument), "Document: ")
+        XCTAssertEqual(strategy.prefix(for: .retrievalQuery), "Query: ")
+        XCTAssertNil(strategy.prefix(for: .clustering))
+        XCTAssertNil(strategy.prefix(for: .classification))
+    }
+
     // MARK: - E5
 
     func testE5AddsPassageAndQueryPrefixes() {
