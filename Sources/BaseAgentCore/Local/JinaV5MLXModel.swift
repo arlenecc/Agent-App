@@ -8,7 +8,7 @@ import MLX
 /// 与 v3 不同，V5 没有 task LoRA / token_type embedding / q_norm / k_norm，
 /// 任务类型完全由输入前缀（`Query: ` / `Document: `）表达。
 ///
-/// 输出按检索约定取原生 768 维的前 128 维并重新 L2 归一化。
+/// 输出按 provider 配置的 Matryoshka 维度截断（默认 128）并重新 L2 归一化。
 final class JinaV5MLXModel: @unchecked Sendable {
     // MARK: - 配置
 
@@ -252,11 +252,13 @@ final class JinaV5MLXModel: @unchecked Sendable {
 
     // MARK: - 推理
 
-    /// 双向编码 + last-token pooling，返回前 128 维、已重新 L2 归一化的向量。
+    /// 双向编码 + last-token pooling，返回前 `dimension` 维、已重新 L2 归一化的向量。
     ///
     /// - Parameters:
     ///   - inputIDs / attentionMask: 等长的 batch（右 padding）。
-    func encode(inputIDs: [[Int]], attentionMask: [[Int]]) -> [[Float]] {
+    ///   - dimension: Matryoshka 输出维度；大于原生维时按原生维处理。
+    func encode(inputIDs: [[Int]], attentionMask: [[Int]],
+                dimension: Int) -> [[Float]] {
         guard let first = inputIDs.first, !first.isEmpty else { return [] }
         let batch = inputIDs.count
         let ids = MLXArray(inputIDs.map { row in row.map(Int32.init) })
@@ -290,10 +292,10 @@ final class JinaV5MLXModel: @unchecked Sendable {
         let lengthIndices = MLXArray(lastIndices.map { Int32($0) })
         var pooled = hidden[batchIndices, lengthIndices]
 
-        // Matryoshka 截断：取前 128 维后必须重新归一化（不是复用 768 维的范数）。
-        let dimension = JinaV5Profile.retrievalDimension
-        if pooled.dim(-1) > dimension {
-            pooled = pooled[.ellipsis, 0 ..< dimension]
+        // Matryoshka 截断：取前 N 维后必须重新归一化（不是复用 768 维的范数）。
+        let target = max(1, min(dimension, pooled.dim(-1)))
+        if pooled.dim(-1) > target {
+            pooled = pooled[.ellipsis, 0 ..< target]
         }
         let normalized = pooled.l2Normalized(axis: -1, eps: 1e-12)
         normalized.eval()

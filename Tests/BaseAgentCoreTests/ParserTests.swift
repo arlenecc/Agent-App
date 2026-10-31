@@ -1024,6 +1024,23 @@ final class ParserTests: XCTestCase {
         XCTAssertEqual(loaded.export()["rag_aux_summarize_min_chars"] as? Int, 3_000)
     }
 
+    /// jina-v5 开放的 Matryoshka 维度：六档合法，其它值回落 128。
+    func testConfigAcceptsJinaV5MatryoshkaDimensions() throws {
+        for dimension in [32, 64, 128, 256, 512, 768] {
+            let path = directory.appendingPathComponent("config-mrl-\(dimension).json")
+            try #"{"rag_matryoshka_dim":\#(dimension)}"#
+                .write(to: path, atomically: true, encoding: .utf8)
+            XCTAssertEqual(AgentConfig.load(path.path).ragMatryoshkaDim, dimension,
+                           "jina-v5 声明的维度必须可持久化并回读")
+        }
+
+        let invalid = directory.appendingPathComponent("config-mrl-invalid.json")
+        try #"{"rag_matryoshka_dim":100}"#
+            .write(to: invalid, atomically: true, encoding: .utf8)
+        XCTAssertEqual(AgentConfig.load(invalid.path).ragMatryoshkaDim, 128,
+                       "未训练维度必须回落到默认 128")
+    }
+
     /// embedding token 预算与指纹校验开关：默认值、持久化与越界收口。
     func testConfigEmbeddingTokenBudgetAndFingerprintVerify() throws {
         let defaults = AgentConfig()
@@ -1270,6 +1287,45 @@ final class ParserTests: XCTestCase {
         config = AgentConfig.load(path.path)
         XCTAssertFalse(config.auxEnabled)
         XCTAssertEqual(config.export()["aux_enabled"] as? Bool, false)
+    }
+
+    /// 辅助模型默认为低延迟/忠实原文调参：8k 上下文与 KV、低温、轻重复惩罚、
+    /// 思考关闭；这些值仍应可被用户配置覆盖。
+    func testConfigAuxModelLatencyDefaults() throws {
+        let defaults = AgentConfig()
+        XCTAssertEqual(defaults.auxMaxContextTokens, 8_192)
+        XCTAssertEqual(defaults.auxKvCacheMaxTokens, 8_192)
+        XCTAssertEqual(defaults.effectiveAuxContextTokens, 8_192)
+        XCTAssertEqual(defaults.auxTemperature, 0.3)
+        XCTAssertEqual(defaults.auxRepetitionPenalty, 1.1)
+        XCTAssertFalse(defaults.auxLocalLLMEnableThinking)
+        XCTAssertEqual(defaults.export()["aux_max_context_tokens"] as? Int, 8_192)
+        XCTAssertEqual(defaults.export()["aux_kv_cache_max_tokens"] as? Int, 8_192)
+        XCTAssertEqual(defaults.export()["aux_temperature"] as? Double, 0.3)
+        XCTAssertEqual(defaults.export()["aux_repetition_penalty"] as? Double, 1.1)
+        XCTAssertEqual(defaults.export()["aux_local_llm_enable_thinking"] as? Bool, false)
+    }
+
+    /// 新的低延迟默认值只作缺省，用户显式配置仍原样生效，不被强制覆盖。
+    func testConfigAuxModelLatencyDefaultsRemainOverridable() throws {
+        let path = directory.appendingPathComponent("config-aux-latency.json")
+        try """
+        {"aux_max_context_tokens":16384,"aux_kv_cache_max_tokens":4096,
+         "aux_temperature":0.8,"aux_repetition_penalty":1.0,
+         "aux_local_llm_enable_thinking":true}
+        """.write(to: path, atomically: true, encoding: .utf8)
+        let config = AgentConfig.load(path.path)
+        XCTAssertEqual(config.auxMaxContextTokens, 16_384)
+        XCTAssertEqual(config.auxKvCacheMaxTokens, 4_096)
+        XCTAssertEqual(config.effectiveAuxContextTokens, 4_096)
+        XCTAssertEqual(config.auxTemperature, 0.8)
+        XCTAssertEqual(config.auxRepetitionPenalty, 1.0)
+        XCTAssertTrue(config.auxLocalLLMEnableThinking)
+        XCTAssertEqual(config.export()["aux_max_context_tokens"] as? Int, 16_384)
+        XCTAssertEqual(config.export()["aux_kv_cache_max_tokens"] as? Int, 4_096)
+        XCTAssertEqual(config.export()["aux_temperature"] as? Double, 0.8)
+        XCTAssertEqual(config.export()["aux_repetition_penalty"] as? Double, 1.0)
+        XCTAssertEqual(config.export()["aux_local_llm_enable_thinking"] as? Bool, true)
     }
 
     /// 辅助模型的 KV 复用 / 量化独立于主模型：旧配置缺失这两个键时，

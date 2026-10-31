@@ -121,8 +121,8 @@ public protocol EmbeddingTokenCounting: Sendable {
 
 /// embedding 模型对落盘元素类型的硬性要求。
 ///
-/// 返回非 nil 时覆盖 `rag_vector_element_type`：例如 jina-v5 的检索语义
-/// 依赖 128 维截断后的 int8 量化，不能落成 fp32/bin。
+/// 返回非 nil 时覆盖 `rag_vector_element_type`。当前没有内置模型使用该约束
+/// （jina-v5 已开放 int8 / fp32 / fp16 / bin）；保留协议供未来模型按语义强制。
 public protocol EmbeddingVectorElementConstraining: Sendable {
     var requiredVectorElementType: VectorElementType? { get }
 }

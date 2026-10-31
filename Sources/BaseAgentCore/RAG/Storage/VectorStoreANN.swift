@@ -175,8 +175,8 @@ struct ANNBlockBuffer {
         lastRowID = 0
     }
 
-    /// 追加一行。`pointer` 指向向量表里的原始落盘字节（int8 / bit）或
-    /// float32 指针（fp32）。
+    /// 追加一行。`pointer` 指向向量表里的原始落盘字节（int8 / bit / fp16）
+    /// 或 float32 指针（fp32）。
     mutating func append(rowID: Int64, pointer: UnsafeRawPointer, dim: Int,
                          elementType: VectorElementType, scratch: inout [Int8]) {
         switch layout {
@@ -190,7 +190,11 @@ struct ANNBlockBuffer {
                 codes.append(contentsOf: UnsafeBufferPointer(start: bytes, count: dim))
                 scales.append(1)
             } else {
-                let floats = pointer.assumingMemoryBound(to: Float.self)
+                // fp16 先解码为 Float（每维 2 字节），再按同一规则量化。
+                let floats = elementType == .fp16
+                    ? VectorEncoder.decodeFloat16(pointer: pointer, count: dim)
+                    : Array(UnsafeBufferPointer(
+                        start: pointer.assumingMemoryBound(to: Float.self), count: dim))
                 var maxAbs: Float = 0
                 for i in 0..<dim {
                     let value = abs(floats[i])
@@ -893,6 +897,14 @@ extension VectorStore {
                     var dot: Float = 0
                     vDSP_dotpr(scratch, 1, queryBase, 1, &dot, vDSP_Length(dim))
                     pool.offer(rowid: hitRowID, score: Double(dot / 127))
+                } else if elementType == .fp16 {
+                    let floats = VectorEncoder.decodeFloat16(pointer: pointer, count: dim)
+                    var dot: Float = 0
+                    floats.withUnsafeBufferPointer { decoded in
+                        guard let decodedBase = decoded.baseAddress else { return }
+                        vDSP_dotpr(decodedBase, 1, queryBase, 1, &dot, vDSP_Length(dim))
+                    }
+                    pool.offer(rowid: hitRowID, score: Double(dot))
                 } else {
                     let floats = pointer.assumingMemoryBound(to: Float.self)
                     var dot: Float = 0

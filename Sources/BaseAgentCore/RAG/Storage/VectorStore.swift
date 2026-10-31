@@ -35,7 +35,8 @@ public final class VectorStore: @unchecked Sendable {
     /// 当前向量维度。极少数模型（缺少 config.json）会在首次推理后才发现
     /// 真实维度；若库还是空的，允许自动按真实维度重建。
     public private(set) var dimension: Int
-    /// 落盘元素类型（fp32 / int8 / bin）。fp16 在 init 校验时直接报错。
+    /// 落盘元素类型（fp32 / int8 / fp16 / bin）。
+    /// fp16 没有 vec0 原生列类型，使用普通表 + 精确余弦扫描。
     public private(set) var elementType: VectorElementType
     /// 索引指纹：embedding 标识 + 维度 + Matryoshka 截断维 + 元素类型。
     /// 非空时与 meta 中的值比对，不一致即要求显式重建。
@@ -75,7 +76,7 @@ public final class VectorStore: @unchecked Sendable {
                 elementType: VectorElementType = .fp32,
                 indexFingerprint: String = "") throws {
         let resolvedDimension = max(1, dimension)
-        // fp16 / 非法维度（如 bin 维度不是 8 的倍数）在打开库之前就报错，
+        // 非法维度（如 bin 维度不是 8 的倍数）在打开库之前就报错，
         // 避免先建出一张错误的表再回滚。
         try elementType.validate(dimension: resolvedDimension)
         self.dimension = resolvedDimension
@@ -93,7 +94,7 @@ public final class VectorStore: @unchecked Sendable {
         if rebuildReason != nil {
             // 待重建：旧表保持原样（不删数据），但向量通道暂时关闭。
             self.vectorEnabled = false
-        } else if sqliteVecAvailable {
+        } else if sqliteVecAvailable, elementType.supportsVec0Index {
             var enabled = true
             do {
                 try ensureVectorTable(dimension: self.dimension, useVec0: true)
@@ -757,7 +758,7 @@ public final class VectorStore: @unchecked Sendable {
     /// 丢弃旧向量表并按当前配置重建。返回 sqlite-vec 是否可用。
     private func recreateVectorTableLocked() throws -> Bool {
         try db.execute("DROP TABLE IF EXISTS \(Self.vectorTable)")
-        if sqliteVecAvailable {
+        if sqliteVecAvailable, elementType.supportsVec0Index {
             do {
                 try ensureVectorTable(dimension: dimension, useVec0: true)
                 return true

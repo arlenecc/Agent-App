@@ -6,7 +6,6 @@ import Foundation
 /// - 输出做 attention-mask 加权 mean pooling，再 L2 归一化；
 /// - 按子批执行，避免长文本批量推理一次性占用过多内存。
 public final class ONNXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCounting,
-                                          EmbeddingVectorElementConstraining,
                                           @unchecked Sendable {
     public let identifier: String
     public let modelName: String
@@ -31,18 +30,14 @@ public final class ONNXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCount
 
     private let dimensionLock = NSLock()
     private var storedDimension = 768
+    /// jina-v5 的 Matryoshka 输出维度；其它模型不使用。
+    private let v5OutputDimension: Int
 
     /// 标准输出维度；实际值会在首次推理后按输出张量更新。
     public var dimension: Int {
         dimensionLock.lock()
         defer { dimensionLock.unlock() }
         return storedDimension
-    }
-
-    /// jina-v5 的 ONNX 输出同样固定 128 维并要求 int8 落盘；
-    /// 其它 ONNX embedding 仍尊重用户配置。
-    public var requiredVectorElementType: VectorElementType? {
-        isJinaV5 ? .int8 : nil
     }
 
     /// - Parameters:
@@ -52,8 +47,11 @@ public final class ONNXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCount
     ///   - intraOpThreads: 单 session 的 intra-op 线程数；0 表示按逻辑
     ///     核数自动分配。实测 8 核机器上 2×8 比 2×4 快约 10%（见
     ///     `ONNXThreadBenchTests`），说明并发 run 并没有成倍占用线程。
+    ///   - v5Dimension: jina-v5 的 Matryoshka 输出维度（默认 128，仅接受
+    ///     模型声明的六档）；其它模型忽略该参数。落盘元素类型由用户配置。
     public init(directory: URL, modelName: String, batchSize: Int = 32,
-                concurrentRuns: Int = 2, intraOpThreads: Int = 0) {
+                concurrentRuns: Int = 2, intraOpThreads: Int = 0,
+                v5Dimension: Int = MatryoshkaDimensions.defaultValue) {
         let runs = max(1, concurrentRuns)
         let threads = intraOpThreads > 0
             ? max(1, min(32, intraOpThreads))
@@ -72,6 +70,7 @@ public final class ONNXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCount
         let isV5 = JinaV5Profile.isJinaV5(directory: directory)
         self.isJinaV3 = isJina
         self.isJinaV5 = isV5
+        self.v5OutputDimension = JinaV5Profile.validDimension(v5Dimension)
         // config 已认出 jina 时固定用模型族前缀，避免权重目录被改名后前缀退化。
         if isV5 {
             self.prefixStrategy = EmbeddingPrefixStrategy(family: .jinaV5)
@@ -94,9 +93,9 @@ public final class ONNXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCount
 
         // 从 config.json 预读真实维度，避免非 768 模型建库时维度错配。
         // Jina v3 的 ONNX config 没有 hidden_size，按模型族固定 1024；
-        // Jina v5 原生 768 维但检索固定截断到 128，不能被 hidden_size 覆盖。
+        // Jina v5 原生 768 维但按 Matryoshka 配置截断，不能被 hidden_size 覆盖。
         if isV5 {
-            self.storedDimension = JinaV5Profile.retrievalDimension
+            self.storedDimension = self.v5OutputDimension
         } else if isJina {
             self.storedDimension = JinaV3Profile.nativeDimension
             if let data = FileManager.default.contents(
@@ -222,11 +221,12 @@ public final class ONNXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCount
                 throw ONNXRuntimeError.shape("输出 batch=\(batch) 与输入 batch=\(mask.batchSize) 不一致")
             }
             if isJinaV5 {
-                // V5 图内已做 last-token pooling + L2；这里只截前 128 维并重新归一化。
-                updateDimension(JinaV5Profile.retrievalDimension)
+                // V5 图内已做 last-token pooling + L2；这里按配置维截断并重新归一化。
+                updateDimension(v5OutputDimension)
                 return (0..<batch).map { row in
                     JinaV5Profile.truncateAndNormalize(
-                        Array(tensor.values[(row * hidden)..<((row + 1) * hidden)]))
+                        Array(tensor.values[(row * hidden)..<((row + 1) * hidden)]),
+                        dimension: v5OutputDimension)
                 }
             }
             updateDimension(hidden)
@@ -248,20 +248,21 @@ public final class ONNXEmbeddingProvider: EmbeddingProvider, EmbeddingTokenCount
                 "输出 shape=\(shape) 与输入 batch/token=\(mask.batchSize)/\(mask.sequenceLength) 不一致"
             )
         }
-        updateDimension(isJinaV5 ? JinaV5Profile.retrievalDimension : hidden)
+        updateDimension(isJinaV5 ? v5OutputDimension : hidden)
 
         var result: [[Float]] = []
         result.reserveCapacity(batch)
         for row in 0..<batch {
             if isJinaV5 {
-                // [B,T,H] 输出时按 V5 约定做 last-token pooling，再截断重归一化。
+                // [B,T,H] 输出时按 V5 约定做 last-token pooling，再按配置维截断重归一化。
                 var lastToken = 0
                 for token in 0..<length where mask.attentionMask[row][token] != 0 {
                     lastToken = token
                 }
                 let offset = (row * length + lastToken) * hidden
                 result.append(JinaV5Profile.truncateAndNormalize(
-                    Array(tensor.values[offset..<(offset + hidden)])))
+                    Array(tensor.values[offset..<(offset + hidden)]),
+                    dimension: v5OutputDimension))
                 continue
             }
             var vector = [Float](repeating: 0, count: hidden)

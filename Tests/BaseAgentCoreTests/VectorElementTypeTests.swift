@@ -1,7 +1,7 @@
 import XCTest
 @testable import BaseAgentCore
 
-/// 向量落盘类型与编解码：int8 对称量化、bin 位图、fp16 拒绝。
+/// 向量落盘类型与编解码：int8 对称量化、bin 位图、fp16 half。
 final class VectorElementTypeTests: XCTestCase {
     func testInt8RoundTripPreservesDirection() {
         let vector = VectorCodec.normalize([0.6, 0.8, -0.2, 0.1])
@@ -39,21 +39,35 @@ final class VectorElementTypeTests: XCTestCase {
                        0.75, accuracy: 1e-9)
     }
 
-    func testFP16IsRejectedWithActionableMessage() {
-        XCTAssertThrowsError(try VectorElementType.fp16.validate(dimension: 512)) { error in
-            XCTAssertTrue(error.localizedDescription.contains("fp16"))
-            XCTAssertTrue(error.localizedDescription.contains("int8"))
+    /// fp16：真正的 IEEE 754 half（每维 2 字节），解码后仍保持余弦方向。
+    func testFP16RoundTripUsesHalfPrecisionBytes() {
+        let vector = VectorCodec.normalize([0.6, 0.8, -0.2, 0.1])
+        let data = VectorEncoder.encode(vector, as: .fp16)
+        XCTAssertEqual(data.count, 8, "fp16 每维 2 字节")
+
+        let decoded = VectorEncoder.decode(data, as: .fp16, dimension: 4)
+        XCTAssertEqual(decoded.count, 4)
+        XCTAssertEqual(VectorCodec.cosine(vector, decoded), 1.0, accuracy: 0.002)
+        for (original, restored) in zip(vector, decoded) {
+            XCTAssertEqual(restored, original, accuracy: 0.002)
         }
-        XCTAssertNotNil(VectorElementType.fp16.unsupportedReason)
-        XCTAssertNil(VectorElementType.int8.unsupportedReason)
+    }
+
+    func testEveryElementTypeIsSelectable() {
+        for type in VectorElementType.allCases {
+            XCTAssertNil(type.unsupportedReason, "\(type) 应可选")
+            XCTAssertNoThrow(try type.validate(dimension: 512), "\(type)")
+        }
     }
 
     func testBindExpressionsAndBlobSizes() {
         XCTAssertEqual(VectorElementType.int8.bindExpression("?"), "vec_int8(?)")
         XCTAssertEqual(VectorElementType.bin.bindExpression("?"), "vec_bit(?)")
         XCTAssertEqual(VectorElementType.fp32.bindExpression("?"), "?")
+        XCTAssertEqual(VectorElementType.fp16.bindExpression("?"), "?")
 
         XCTAssertEqual(VectorElementType.fp32.blobSize(dimension: 512), 2048)
+        XCTAssertEqual(VectorElementType.fp16.blobSize(dimension: 512), 1024)
         XCTAssertEqual(VectorElementType.int8.blobSize(dimension: 512), 512)
         XCTAssertEqual(VectorElementType.bin.blobSize(dimension: 512), 64)
     }

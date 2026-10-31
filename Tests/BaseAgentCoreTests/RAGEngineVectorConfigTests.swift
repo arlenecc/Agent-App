@@ -25,13 +25,11 @@ private final class NomicVectorFakeEmbedding: EmbeddingProvider,
     }
 }
 
-/// 模拟 jina-v5：provider 自带 128 维 + int8 硬约束，用于验证配置覆盖。
-private final class ConstrainedVectorFakeEmbedding: EmbeddingProvider,
-                                                    EmbeddingVectorElementConstraining,
-                                                    @unchecked Sendable {
+/// 模拟 jina-v5：维度由 provider 内部按配置裁剪，元素类型交由用户配置。
+private final class JinaV5VectorFakeEmbedding: EmbeddingProvider,
+                                               @unchecked Sendable {
     let identifier = "local:mlx-embedding:renamed-jina-v5"
     let dimension = 128
-    var requiredVectorElementType: VectorElementType? { .int8 }
 
     func embedDocuments(_ texts: [String]) async throws -> [[Float]] {
         texts.map { text in
@@ -152,28 +150,29 @@ final class RAGEngineVectorConfigTests: XCTestCase {
         XCTAssertEqual(second.status(maxAge: 0)["vector_rebuild_required"]?.boolValue, false)
     }
 
-    /// jina-v5 固定 128 维 + int8：即使配置 fp32，入库/查询也必须回落 int8。
-    func testJinaV5ConstraintOverridesConfiguredFp32() async throws {
+    /// jina-v5 不再强制 int8：用户配置的 fp32 应直接用于建库与检索。
+    func testJinaV5RespectsConfiguredElementType() async throws {
         let config = makeConfig(elementType: .fp32, matryoshka: .auto, matryoshkaDim: 4)
         let engine = RAGEngine(config: config, knowledgeBase: kb.path,
-                               embedding: ConstrainedVectorFakeEmbedding(), reranker: nil)
+                               embedding: JinaV5VectorFakeEmbedding(), reranker: nil)
         defer { engine.close() }
 
-        XCTAssertEqual(engine.effectiveVectorElementType, .int8)
-        XCTAssertEqual(engine.effectiveMatryoshkaDimension, 0)
+        XCTAssertEqual(engine.effectiveVectorElementType, .fp32)
+        XCTAssertEqual(engine.effectiveMatryoshkaDimension, 0,
+                       "V5 的截断发生在 provider 内部，外层不再包装")
         let fingerprint = engine.vectorIndexFingerprint
         XCTAssertTrue(fingerprint.contains("dimension=128"), fingerprint)
-        XCTAssertTrue(fingerprint.contains("element=int8"), fingerprint)
+        XCTAssertTrue(fingerprint.contains("element=fp32"), fingerprint)
 
         let stats = await engine.ingest()
         XCTAssertTrue(stats.errors.isEmpty, stats.errors.joined(separator: "; "))
         XCTAssertGreaterThan(stats.chunks, 0)
 
         let status = engine.status(maxAge: 0)
-        XCTAssertEqual(status["vector_element_type"]?.stringValue, "int8")
+        XCTAssertEqual(status["vector_element_type"]?.stringValue, "fp32")
         XCTAssertEqual(status["vector_rebuild_required"]?.boolValue, false)
 
         let hits = try await engine.search(query: "水果")
-        XCTAssertFalse(hits.isEmpty, "int8 入库与查询应能正常检索")
+        XCTAssertFalse(hits.isEmpty, "fp32 入库与查询应能正常检索")
     }
 }

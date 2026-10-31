@@ -1,12 +1,25 @@
 import Foundation
 
+/// Matryoshka 截断维的合法取值。
+public enum MatryoshkaDimensions {
+    /// 上一版通用三档（nomic / jina-v3 的设置面板仍使用这三档）。
+    public static let standard = [128, 256, 512]
+
+    /// jina-v5 模型声明的全部 Matryoshka 维度。
+    public static let jinaV5 = [32, 64, 128, 256, 512, 768]
+
+    /// 推荐默认检索维。
+    public static let defaultValue = 128
+}
+
 /// Matryoshka（俄罗斯套娃）截断策略。
 ///
 /// - `auto`：对已知支持该特性的模型启用（nomic、jina-embeddings-v3），
-///   截断维跟随设置中的下拉框（128 / 256 / 512）；
+///   截断维跟随设置中的下拉框；jina-v5 由 provider 内部按同一配置裁剪，
+///   不经过外层包装；
 /// - `on`：任何 embedding 都按配置维截断（超过原生维时按原生维处理）；
-///   jina-v5 provider 自身固定 128 维，wrap 时会跳过他，避免二次截断；
-/// - `off`：不截断。
+///   jina-v5 provider 自身已按配置维输出，wrap 时会跳过他，避免二次截断；
+/// - `off`：不截断（jina-v5 输出原生 768 维）。
 public enum MatryoshkaMode: String, CaseIterable, Sendable {
     case auto
     case on
@@ -14,7 +27,7 @@ public enum MatryoshkaMode: String, CaseIterable, Sendable {
 
     public var displayName: String {
         switch self {
-        case .auto: return "自动（nomic / jina-v3 启用；jina-v5 固定 128 维）"
+        case .auto: return "自动（nomic / jina-v3 / jina-v5）"
         case .on: return "始终启用"
         case .off: return "关闭"
         }
@@ -53,7 +66,7 @@ public final class MatryoshkaEmbedding: EmbeddingProvider, EmbeddingTokenCountin
     /// 目标截断维（模型原生维更小时按原生维）。
     public let truncateDimension: Int
 
-    /// 透传底层模型的落盘类型约束（例如 jina-v5 必须 int8）。
+    /// 透传底层模型的落盘类型约束（未来模型可能要求特定元素类型）。
     public var requiredVectorElementType: VectorElementType? {
         (base as? EmbeddingVectorElementConstraining)?.requiredVectorElementType
     }
@@ -68,8 +81,8 @@ public final class MatryoshkaEmbedding: EmbeddingProvider, EmbeddingTokenCountin
     public static func wrap(_ base: EmbeddingProvider,
                             mode: MatryoshkaMode,
                             dimension: Int) -> EmbeddingProvider {
-        // jina-v5 provider 自身已固定 128 维并在截断后重新归一化；
-        // 再套一层会二次截断（甚至截到 64/32 维），必须直接放行。
+        // jina-v5 provider 已在内部按配置维截断并重新归一化；
+        // 再套一层会二次截断，必须直接放行。
         if JinaV5Profile.matches(base.identifier) { return base }
         guard mode.enabled(for: base.identifier) else { return base }
         let target = max(1, mode.effectiveDimension(

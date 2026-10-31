@@ -159,7 +159,7 @@ public final class LocalModelFactory: @unchecked Sendable {
         let value = config.localEmbeddingModelPath.isEmpty
             ? effectiveName
             : config.localEmbeddingModelPath
-        let key = "embedding:\(backend):\(value)"
+        let baseKey = "embedding:\(backend):\(value)"
 
         // 先解析目录：失败不进缓存——目录可能尚未就绪或依赖运行中才设置的
         // 环境变量（如测试的 BASE_AGENT_MODELS_DIR），缓存失败实例会让
@@ -169,7 +169,7 @@ public final class LocalModelFactory: @unchecked Sendable {
             if backend == "gguf" {
                 let file = try GGUFFileResolver.resolve(
                     kind: .embedding, value: value, config: config)
-                return embeddings.value(for: key) {
+                return embeddings.value(for: baseKey) {
                     LlamaCppEmbeddingProvider(modelPath: file.path, modelName: value)
                 }
             }
@@ -189,14 +189,22 @@ public final class LocalModelFactory: @unchecked Sendable {
             )
         }
 
+        // jina-v5 的 Matryoshka 维度由设置决定：缓存键必须纳入维度，
+        // 否则切换维度后会复用旧维度的 provider。其它模型的 key 保持不变。
+        let isV5 = JinaV5Profile.isJinaV5(directory: directory)
+        let v5Dimension = JinaV5Profile.outputDimension(
+            mode: config.ragMatryoshka, configured: config.ragMatryoshkaDim)
+        let key = isV5 ? "\(baseKey)#v5dim=\(v5Dimension)" : baseKey
+
         if backend == "mlx" {
             // 实测多实例只是共享同一块 GPU，吞吐无收益且内存翻倍，
             // 因此固定单实例；并发由 AdaptiveEmbeddingScheduler 串行。
             return embeddings.value(for: key) {
                 // jina-v5 / jina-v3 都不在 MLXEmbedders 的工厂里，走自定义架构。
-                if JinaV5Profile.isJinaV5(directory: directory) {
+                if isV5 {
                     return JinaV5MLXEmbeddingProvider(
-                        directory: directory, modelName: value)
+                        directory: directory, modelName: value,
+                        dimension: v5Dimension)
                 }
                 if JinaV3Profile.isJinaV3(directory: directory) {
                     return JinaV3MLXEmbeddingProvider(
@@ -206,7 +214,9 @@ public final class LocalModelFactory: @unchecked Sendable {
             }
         }
         return embeddings.value(for: key) {
-            ONNXEmbeddingProvider(directory: directory, modelName: value)
+            ONNXEmbeddingProvider(
+                directory: directory, modelName: value,
+                v5Dimension: v5Dimension)
         }
     }
 

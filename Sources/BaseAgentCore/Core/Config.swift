@@ -85,7 +85,8 @@ public struct AgentConfig: Sendable {
     /// 同时作用于 MLX 与 GGUF (llama.cpp) 后端；辅助模型用 `auxKvReuse`。
     public var llmKVReuse: Bool = true
     /// 辅助模型 KV cache 的 token 硬上限；0 表示跟随 auxMaxContextTokens。
-    public var auxKvCacheMaxTokens: Int = 16_384
+    /// 默认与上下文同为 8k：辅助调用多为短摘要/精简，降低 KV 常驻和 prefill。
+    public var auxKvCacheMaxTokens: Int = 8_192
     /// 辅助模型跨轮 KV/前缀复用开关（`aux_llm_kv_reuse`，默认关闭）：
     /// 辅助调用多为一次性长文本、跨调用命中率低，关闭时每轮全量重建并在
     /// 调用结束后丢弃 KV，避免长 KV 常驻；开启后保留缓存供相同前缀复用。
@@ -248,16 +249,16 @@ public struct AgentConfig: Sendable {
     public var ragFTSOverfetch: Int = 4
 
     // 向量落盘编码
-    /// 向量元素类型：int8（默认；默认模型固定 128 维，每行 128B）/ fp32 / bin。
-    /// fp16 仅为配置对齐保留——sqlite-vec 0.1.9 不支持，选择后会报错。
+    /// 向量元素类型：int8（默认；默认模型 128 维时每行 128B）/ fp32 / fp16 / bin。
+    /// fp16 每维 2 字节，因 sqlite-vec 0.1.9 没有该列类型，走普通表 + 精确扫描。
     /// 改变类型会让已有向量失效，需要重建向量库。
     public var ragVectorElementType: VectorElementType = .defaultValue
-    /// Matryoshka 截断策略（auto = 仅 nomic / jina-v3 等已知模型启用；
-    /// jina-v5 固定 128 维，不参与该设置）。
+    /// Matryoshka 截断策略（auto = nomic / jina-v3 由外层截断；
+    /// jina-v5 由 provider 内部按配置维输出）。
     public var ragMatryoshka: MatryoshkaMode = .auto
-    /// Matryoshka 截断维：128 / 256 / 512，默认 128。
-    /// jina-v5 provider 自身固定 128 维；该值只对 nomic / jina-v3 生效。
-    public var ragMatryoshkaDim: Int = 128
+    /// Matryoshka 截断维：默认 128。jina-v5 支持
+    /// 32 / 64 / 128 / 256 / 512 / 768；其它模型沿用 128 / 256 / 512。
+    public var ragMatryoshkaDim: Int = MatryoshkaDimensions.defaultValue
 
     // ANN 向量索引（分块 IVF，见 VectorStoreANN.swift）
     /// 检索是否走 ANN 索引。索引不可用（未构建/维度不符/尾块超预算）时
@@ -296,14 +297,16 @@ public struct AgentConfig: Sendable {
     public var auxLLMProvider: String = "local"
     public var auxLocalLLMModel: String = "models/Qwen3.5-2B-MLX-4bit"
     public var auxLocalLLMBackend: String = "mlx-lm"
-    public var auxTemperature: Double = 0.7
+    /// 辅助模型默认低温 + 轻重复惩罚：减少发散和复读，同时保持原文信息。
+    public var auxTemperature: Double = 0.3
     public var auxMaxTokens: Int = 32768
-    public var auxMaxContextTokens: Int = 32768
+    /// 辅助调用默认 8k 上下文：缩短 prefill、降低 KV 内存，加快响应。
+    public var auxMaxContextTokens: Int = 8_192
     public var auxPromptBatchSize: Int = 512
     public var auxTopP: Double = 0.95
     public var auxMinP: Double = 0.05
     public var auxTopK: Int = 20
-    public var auxRepetitionPenalty: Double = 1.0
+    public var auxRepetitionPenalty: Double = 1.1
     public var auxRequestTimeout: Double = 120.0
     public var auxLocalLLMEnableThinking: Bool = false
 
@@ -687,8 +690,8 @@ public struct AgentConfig: Sendable {
                 localEmbeddingModel = defaultEmbeddingName
                 localEmbeddingModelPath = defaultEmbeddingPath
             }
-            // 旧默认 512 / 256 维随默认模型一起收口到 V5 固定的 128；
-            // 用户显式配置的其他模型/维度不动。
+            // 旧默认 512 / 256 维随默认模型一起收口到 V5 默认的 128；
+            // 用户显式配置的其它模型/维度不动。
             if ragIsLegacy || migrateLocalConfig,
                ragMatryoshkaDim == 512 || ragMatryoshkaDim == 256 {
                 ragMatryoshkaDim = 128
@@ -766,10 +769,10 @@ public struct AgentConfig: Sendable {
                                              min(ragEmbeddingTokenBudgetMax,
                                                  ragEmbeddingTokenBudgetInitial))
         ragEmbeddingTokenBudgetStep = max(128, min(8_192, ragEmbeddingTokenBudgetStep))
-        // Matryoshka 截断维只允许 128 / 256 / 512，其它值回落到默认 256。
-        // 元素类型不做收口：fp16 保留在配置里，打开向量库时给出明确报错。
-        if ![128, 256, 512].contains(ragMatryoshkaDim) {
-            ragMatryoshkaDim = 256
+        // Matryoshka 截断维只允许模型声明的六档，其它值回落到默认 128。
+        // 元素类型不做收口：int8 / fp32 / fp16 / bin 全部由用户选择。
+        if !MatryoshkaDimensions.jinaV5.contains(ragMatryoshkaDim) {
+            ragMatryoshkaDim = MatryoshkaDimensions.defaultValue
         }
     }
 

@@ -44,13 +44,13 @@ struct SettingsView: View {
     @State private var auxEnabled = false
     @State private var auxBackend = "mlx-lm"
     @State private var auxPath = ""
-    @State private var auxContext = 32768
-    @State private var auxKVCache = 16384
-    @State private var auxTemperature = 0.7
+    @State private var auxContext = 8192
+    @State private var auxKVCache = 8192
+    @State private var auxTemperature = 0.3
     @State private var auxTopP = 0.95
     @State private var auxMinP = 0.05
     @State private var auxTopK = 20
-    @State private var auxRepetitionPenalty = 1.0
+    @State private var auxRepetitionPenalty = 1.1
     @State private var auxTimeout = 120.0
     @State private var auxPromptBatch = 512
     @State private var auxThinking = false
@@ -903,7 +903,7 @@ struct SettingsView: View {
 
     // MARK: - 向量存储 / Matryoshka
 
-    /// 当前 Embedding 路径是否指向 jina-v5（provider 自身固定 128 维）。
+    /// 当前 Embedding 路径是否指向 jina-v5（向量维度与元素类型可配置）。
     /// 空路径 + MLX 会用内置默认 jina-v5，因此同样按 V5 处理。
     private var isJinaV5Embedding: Bool {
         let lower = embeddingPath.lowercased()
@@ -913,6 +913,13 @@ struct SettingsView: View {
         return lower.contains("jina-embeddings-v5")
             || lower.contains("jina_v5")
             || lower.contains("jina-v5")
+    }
+
+    /// 截断维选项：jina-v5 暴露模型声明的六档，其它模型保持原有三档。
+    private var matryoshkaDimensionOptions: [Int] {
+        isJinaV5Embedding
+            ? MatryoshkaDimensions.jinaV5
+            : MatryoshkaDimensions.standard
     }
 
     /// 向量落盘元素类型 + Matryoshka 模式/截断维。
@@ -926,11 +933,9 @@ struct SettingsView: View {
         }
         .labelsHidden()
         .frame(width: 120)
-        .disabled(isJinaV5Embedding)
-        .help(isJinaV5Embedding
-            ? "jina-embeddings-v5 固定 128 维并强制 int8 落盘/检索，元素类型不可更改。"
-            : "向量落盘元素类型：int8 体积是 fp32 的 1/4（默认）；bin 体积最小但只有汉明排序。"
-                + "fp16 在 sqlite-vec 0.1.9 中不可用，选择后应用配置会直接报错。")
+        .help("向量落盘元素类型：int8 体积是 fp32 的 1/4（默认）；"
+            + "fp16 每维 2 字节（sqlite-vec 无该列类型，走精确扫描）；"
+            + "bin 体积最小但只有汉明排序。")
         Text("Matryoshka").font(.caption)
         Picker("", selection: $matryoshkaMode) {
             ForEach(MatryoshkaMode.allCases, id: \.rawValue) { mode in
@@ -940,25 +945,20 @@ struct SettingsView: View {
         .labelsHidden()
         .frame(width: 135)
         .help("截断向量后强制重新归一化，入库与查询使用同一套变换。"
-            + "自动模式只对 nomic / jina-v3 等已知支持该特性的模型启用。")
-        if isJinaV5Embedding {
-            Text("固定 128 维 + int8（Matryoshka 不生效）")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-                .help("jina-embeddings-v5 的 provider 已固定输出 128 维并重新归一化，"
-                    + "落盘与检索统一 int8，Matryoshka 截断不会再次生效。")
-        } else {
-            Picker("", selection: $matryoshkaDim) {
-                Text("128 维").tag(128)
-                Text("256 维").tag(256)
-                Text("512 维").tag(512)
+            + "自动模式对 nomic / jina-v3 / jina-v5 生效；关闭时 jina-v5 输出原生 768 维。")
+        Picker("", selection: $matryoshkaDim) {
+            ForEach(matryoshkaDimensionOptions, id: \.self) { dimension in
+                Text("\(dimension) 维").tag(dimension)
             }
-            .labelsHidden()
-            .frame(width: 90)
-            .disabled(matryoshkaMode == .off)
-            .help("Matryoshka 截断维：越小向量库越小、召回精度越低；默认 128。"
-                + "nomic / jina-v3 在自动模式下都按此维度截断。")
         }
+        .labelsHidden()
+        .frame(width: 90)
+        .disabled(matryoshkaMode == .off)
+        .help(isJinaV5Embedding
+            ? "jina-v5 仅提供模型训练过的 32 / 64 / 128 / 256 / 512 / 768 维；"
+                + "默认 128，向量库最小且召回稳定。关闭 Matryoshka 时输出原生 768 维。"
+            : "Matryoshka 截断维：越小向量库越小、召回精度越低；默认 128。"
+                + "nomic / jina-v3 在自动模式下都按此维度截断。")
     }
 
     @ViewBuilder
@@ -984,7 +984,7 @@ struct SettingsView: View {
         switch type {
         case .fp32: return "FP32"
         case .int8: return "INT8（推荐）"
-        case .fp16: return "FP16（不支持）"
+        case .fp16: return "FP16（2 字节/维）"
         case .bin: return "BIN（最小）"
         }
     }
@@ -1186,7 +1186,7 @@ struct SettingsView: View {
         ocrBinarize = config.ragOCRBinarize
         chunkSize = config.ragChunkSize
         chunkOverlap = config.ragChunkOverlap
-        vectorElementType = isJinaV5Embedding ? .int8 : config.ragVectorElementType
+        vectorElementType = config.ragVectorElementType
         matryoshkaMode = config.ragMatryoshka
         matryoshkaDim = config.ragMatryoshkaDim
         rerankEnabled = config.ragRerankEnabled
@@ -1401,9 +1401,9 @@ struct SettingsView: View {
             statusMessage = "Embedding 类型 \(embeddingBackend) 当前版本尚未接入，请选择 ONNX / FastEmbed / MLX / GGUF"
             return nil
         }
-        // fp16：sqlite-vec 0.1.9 没有该元素类型，直接拒绝应用并给出明确提示。
-        // jina-v5 固定 int8，不受用户选择影响。
-        let effectiveElementType = isJinaV5Embedding ? .int8 : vectorElementType
+        // jina-v5 与其它模型一样尊重用户选择的元素类型（默认 int8）。
+        // fp16 走普通表 + 精确扫描，四种类型都可以直接应用。
+        let effectiveElementType = vectorElementType
         if let reason = effectiveElementType.unsupportedReason {
             statusMessage = reason
             return nil
@@ -1510,9 +1510,9 @@ struct SettingsView: View {
         config.ragVisionConcurrency = min(max(1, visionConcurrency), 8)
         config.ragVectorElementType = effectiveElementType
         config.ragMatryoshka = matryoshkaMode
-        config.ragMatryoshkaDim = isJinaV5Embedding
-            ? 128
-            : ([128, 256, 512].contains(matryoshkaDim) ? matryoshkaDim : 128)
+        config.ragMatryoshkaDim = matryoshkaDimensionOptions.contains(matryoshkaDim)
+            ? matryoshkaDim
+            : MatryoshkaDimensions.defaultValue
         config.ragANNEnabled = annEnabled
         config.ragANNAutoBuild = annAutoBuild
         config.ragEmbeddingMaxBatch = min(max(2, embeddingMaxBatch), 256)

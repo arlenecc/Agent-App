@@ -2,37 +2,36 @@ import Foundation
 
 /// jina-embeddings-v5-text-nano 的本地 MLX Embedding provider。
 ///
-/// V5 的任务类型通过输入前缀表达（`Query: ` / `Document: `），provider 直接
-/// 返回 128 维单位向量：内部已完成 Matryoshka 截断与重新 L2 归一化，
-/// 外层 `MatryoshkaEmbedding` 不会再包装它。
+/// V5 的任务类型通过输入前缀表达（`Query: ` / `Document: `），provider 按
+/// Matryoshka 配置输出对应维度的单位向量：内部已完成截断与重新 L2 归一化，
+/// 外层 `MatryoshkaEmbedding` 不会再包装它。落盘元素类型由用户配置决定。
 final class JinaV5MLXEmbeddingProvider: EmbeddingProvider,
                                        EmbeddingTokenCounting,
-                                       EmbeddingVectorElementConstraining,
                                        @unchecked Sendable {
     let identifier: String
     let modelName: String
     let directory: URL
     let prefixStrategy: EmbeddingPrefixStrategy
 
-    /// V5 固定 128 维后必须量化成 int8 入库/检索。
-    var requiredVectorElementType: VectorElementType? { .int8 }
-
     private let maxLength: Int
     private let state = JinaV5MLXLoadState()
 
-    /// 原生 768 维截断到检索用的 128 维。
-    var dimension: Int { JinaV5Profile.retrievalDimension }
+    /// Matryoshka 输出维度：模型声明的六档之一，默认 128。
+    let dimension: Int
 
     /// MLX 受全局 Metal 队列限制，固定单实例串行。
     var maxConcurrentRuns: Int { 1 }
 
-    init(directory: URL, modelName: String) {
+    init(directory: URL, modelName: String,
+         dimension: Int = JinaV5Profile.defaultRetrievalDimension) {
         self.directory = directory
         self.modelName = modelName
         self.identifier = "local:mlx-embedding:\(modelName)"
         // 只服务 jina-v5：即使目录被改名，也必须保留 V5 的大写前缀。
         self.prefixStrategy = EmbeddingPrefixStrategy(family: .jinaV5)
         self.maxLength = Self.window(directory: directory)
+        // 防御非法值：只接受模型训练过的维度，其余回落到默认 128。
+        self.dimension = JinaV5Profile.validDimension(dimension)
     }
 
     func embedDocuments(_ texts: [String]) async throws -> [[Float]] {
@@ -54,7 +53,8 @@ final class JinaV5MLXEmbeddingProvider: EmbeddingProvider,
         let (model, tokenizer) = try await state.handles(directory: directory)
         let batch = tokenizer.encodeBatch(texts, maxLength: maxLength)
         return model.encode(
-            inputIDs: batch.inputIDs, attentionMask: batch.attentionMask)
+            inputIDs: batch.inputIDs, attentionMask: batch.attentionMask,
+            dimension: dimension)
     }
 
     /// 释放权重；provider 保留，下次 embed 时按需重载。

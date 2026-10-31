@@ -4,16 +4,39 @@ import Foundation
 ///
 /// V5 的查询/文档区分不在模型内做任务头，而是靠输入前缀：
 /// 文档分片用 `Document: `，检索查询用 `Query: `。原生输出 768 维，
-/// 业务统一截前 128 维后**重新 L2 归一化**，再交给 Storage 量化成 int8。
+/// provider 按设置中的 Matryoshka 维度截断后**重新 L2 归一化**，再交给
+/// Storage 量化成用户选择的元素类型（默认 int8）。
 enum JinaV5Profile {
     /// 原生输出维度。
     static let nativeDimension = 768
 
-    /// 业务检索维度（Matryoshka 截断后）。
-    static let retrievalDimension = 128
+    /// 默认检索维度（Matryoshka 推荐值）。
+    static let defaultRetrievalDimension = MatryoshkaDimensions.defaultValue
+
+    /// 兼容既有调用方的别名。
+    static let retrievalDimension = defaultRetrievalDimension
+
+    /// 模型声明支持的全部 Matryoshka 维度。
+    static let supportedDimensions = MatryoshkaDimensions.jinaV5
 
     static let queryPrefix = "Query: "
     static let documentPrefix = "Document: "
+
+    /// 按 Matryoshka 模式计算最终输出维度。
+    ///
+    /// - `off`：不截断，输出原生 768 维；
+    /// - `auto` / `on`：使用配置维度；只有模型训练过的六档生效，
+    ///   其它值回落到默认 128，避免选到未训练维度。
+    static func outputDimension(mode: MatryoshkaMode, configured: Int) -> Int {
+        guard mode != .off else { return nativeDimension }
+        return validDimension(configured)
+    }
+
+    /// 单点维度收口：非模型声明的维度一律回落到默认 128。
+    static func validDimension(_ dimension: Int) -> Int {
+        supportedDimensions.contains(dimension)
+            ? dimension : defaultRetrievalDimension
+    }
 
     /// 名称/标识符是否指向 jina-embeddings-v5。
     static func matches(_ text: String) -> Bool {

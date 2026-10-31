@@ -75,6 +75,72 @@ final class LocalModelFactoryTests: XCTestCase {
         XCTAssertEqual(provider.dimension, 128)
     }
 
+    /// jina-v5 解锁后：工厂按 Matryoshka 配置把维度传给 provider，
+    /// 并且缓存 key 随维度变化，避免配置切换后复用旧实例。
+    func testFactoryPassesJinaV5ConfiguredDimensionToMLX() throws {
+        let directory = try makeFakeV5Directory()
+        defer { LocalModelFactory.shared.clearCaches() }
+
+        var config = AgentConfig()
+        config.localEmbeddingBackend = "mlx"
+        config.localEmbeddingModel = "jina-embeddings-v5-text-nano-test"
+        config.localEmbeddingModelPath = directory.path
+        config.ragMatryoshka = .auto
+
+        config.ragMatryoshkaDim = 512
+        let wide = try XCTUnwrap(
+            LocalModelFactory.shared.makeEmbedding(config: config))
+        XCTAssertTrue(wide is JinaV5MLXEmbeddingProvider, "\(wide)")
+        XCTAssertEqual(wide.dimension, 512)
+        XCTAssertNil((wide as? EmbeddingVectorElementConstraining)?
+            .requiredVectorElementType, "jina-v5 不应再强制 int8")
+
+        config.ragMatryoshkaDim = 128
+        let narrow = try XCTUnwrap(
+            LocalModelFactory.shared.makeEmbedding(config: config))
+        XCTAssertEqual(narrow.dimension, 128)
+        XCTAssertFalse((wide as AnyObject) === (narrow as AnyObject),
+                       "维度变化不能复用旧维度 provider")
+
+        config.ragMatryoshka = .off
+        let native = try XCTUnwrap(
+            LocalModelFactory.shared.makeEmbedding(config: config))
+        XCTAssertEqual(native.dimension, JinaV5Profile.nativeDimension)
+    }
+
+    func testFactoryPassesJinaV5ConfiguredDimensionToONNX() throws {
+        let directory = try makeFakeV5Directory()
+        defer { LocalModelFactory.shared.clearCaches() }
+
+        var config = AgentConfig()
+        config.localEmbeddingBackend = "onnx"
+        config.localEmbeddingModel = "jina-embeddings-v5-text-nano-test"
+        config.localEmbeddingModelPath = directory.path
+        config.ragMatryoshka = .auto
+        config.ragMatryoshkaDim = 256
+
+        let provider = try XCTUnwrap(
+            LocalModelFactory.shared.makeEmbedding(config: config))
+        XCTAssertTrue(provider is ONNXEmbeddingProvider, "\(provider)")
+        XCTAssertEqual(provider.dimension, 256)
+    }
+
+    /// 构造只含 config.json 的 V5 目录：足以识别模型族，无需真实权重即可建 provider。
+    private func makeFakeV5Directory() throws -> URL {
+        let directory = temporaryRoot.appendingPathComponent(
+            "jina-embeddings-v5-text-nano-test", isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory, withIntermediateDirectories: true)
+        let modelConfig: [String: Any] = [
+            "model_type": "eurobert",
+            "base_model": "jinaai/jina-embeddings-v5-text-nano",
+            "hidden_size": 768,
+        ]
+        try JSONSerialization.data(withJSONObject: modelConfig)
+            .write(to: directory.appendingPathComponent("config.json"))
+        return directory
+    }
+
     // MARK: - Bundle 模型目录
 
     func testBundledModelsDirectoryPrefersResources() throws {

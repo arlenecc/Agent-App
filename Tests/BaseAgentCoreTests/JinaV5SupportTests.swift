@@ -94,6 +94,74 @@ final class JinaV5SupportTests: XCTestCase {
         XCTAssertEqual(JinaV5Profile.retrievalDimension, 128)
     }
 
+    // MARK: - 可配置的输出维度
+
+    func testSupportedDimensionsCoverPublishedMatryoshkaSizes() {
+        XCTAssertEqual(JinaV5Profile.supportedDimensions,
+                       [32, 64, 128, 256, 512, 768])
+        XCTAssertEqual(JinaV5Profile.defaultRetrievalDimension, 128)
+        XCTAssertEqual(MatryoshkaDimensions.jinaV5,
+                       JinaV5Profile.supportedDimensions,
+                       "设置面板与 provider 必须共用同一份维度清单")
+    }
+
+    func testOutputDimensionHonorsMatryoshkaMode() {
+        XCTAssertEqual(JinaV5Profile.outputDimension(mode: .auto, configured: 512),
+                       512)
+        XCTAssertEqual(JinaV5Profile.outputDimension(mode: .on, configured: 32),
+                       32)
+        XCTAssertEqual(JinaV5Profile.outputDimension(mode: .off, configured: 128),
+                       JinaV5Profile.nativeDimension,
+                       "关闭 Matryoshka 时输出原生 768 维")
+        XCTAssertEqual(JinaV5Profile.outputDimension(mode: .auto, configured: 100),
+                       JinaV5Profile.defaultRetrievalDimension,
+                       "未训练维度回落到默认 128")
+    }
+
+    func testMLXProviderUsesConfiguredDimensionAndNoElementConstraint() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let provider = JinaV5MLXEmbeddingProvider(
+            directory: directory,
+            modelName: "jina-embeddings-v5-text-nano-mlx-int4",
+            dimension: 256)
+
+        XCTAssertEqual(provider.dimension, 256)
+        XCTAssertNil((provider as? EmbeddingVectorElementConstraining)?
+            .requiredVectorElementType, "jina-v5 不再强制 int8")
+    }
+
+    func testMLXProviderDefaultsTo128Dimensions() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+
+        let provider = JinaV5MLXEmbeddingProvider(
+            directory: directory,
+            modelName: "jina-embeddings-v5-text-nano-mlx-int4")
+        XCTAssertEqual(provider.dimension, 128)
+    }
+
+    func testONNXProviderUsesConfiguredV5DimensionAndNoElementConstraint() throws {
+        let directory = try makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let config: [String: Any] = [
+            "model_type": "eurobert",
+            "base_model": "jinaai/jina-embeddings-v5-text-nano",
+            "hidden_size": 768,
+        ]
+        try JSONSerialization.data(withJSONObject: config)
+            .write(to: directory.appendingPathComponent("config.json"))
+
+        let provider = ONNXEmbeddingProvider(
+            directory: directory,
+            modelName: "renamed-v5-onnx",
+            v5Dimension: 512)
+        XCTAssertEqual(provider.dimension, 512)
+        XCTAssertNil((provider as? EmbeddingVectorElementConstraining)?
+            .requiredVectorElementType, "jina-v5 ONNX 不再强制 int8")
+    }
+
     // MARK: - 128 维截断与重归一化
 
     func testTruncatesAndRenormalizes() {

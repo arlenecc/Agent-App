@@ -676,7 +676,7 @@ public final class RAGEngine {
     }
 
     /// 当前生效的落盘元素类型：embedding provider 的硬性约束优先
-    /// （jina-v5 固定 int8），否则使用用户配置。
+    /// （当前内置模型均无约束），否则使用用户配置。
     public var effectiveVectorElementType: VectorElementType {
         (embedding as? EmbeddingVectorElementConstraining)?
             .requiredVectorElementType ?? config.ragVectorElementType
@@ -2404,8 +2404,8 @@ public final class RAGEngine {
     public func status(sourceLimit: Int = 256,
                        maxAge: TimeInterval = 600,
                        timeout: Double? = nil) -> [String: JSONValue] {
-        // fp16 等 sqlite-vec 不支持的类型：打开库会直接失败，优先给出配置原因，
-        // 否则调用方只能看到笼统的「向量库不可用」。
+        // provider/存储层明确不支持的元素类型：打开库会直接失败，优先给出配置
+        // 原因，否则调用方只能看到笼统的「向量库不可用」。当前四种类型均可用。
         if let unsupported = effectiveVectorElementType.unsupportedReason {
             return unsupportedVectorTypeSnapshot(unsupported)
         }

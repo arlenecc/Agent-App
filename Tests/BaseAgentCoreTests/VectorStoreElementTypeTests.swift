@@ -55,9 +55,9 @@ final class VectorStoreElementTypeTests: XCTestCase {
         }
     }
 
-    /// 退化到普通表时，精确扫描也必须按元素类型解码（不能把 int8/bin 当 float32）。
+    /// 退化到普通表时，精确扫描也必须按元素类型解码（不能把 int8/bin/fp16 当 float32）。
     func testExactScanPathForQuantizedTypes() throws {
-        for type in [VectorElementType.int8, .bin] {
+        for type in [VectorElementType.int8, .bin, .fp16] {
             let store = try VectorStore(dbPath: dbPath("exact-\(type.rawValue)"),
                                         dimension: dimension,
                                         enableSQLiteVec: false,
@@ -73,14 +73,34 @@ final class VectorStoreElementTypeTests: XCTestCase {
         }
     }
 
-    func testFP16IsRejectedBeforeCreatingDatabase() {
+    /// fp16 没有 vec0 原生列类型：普通表 + 精确扫描，但仍是真正的 2 字节 half。
+    func testFP16UsesHalfPrecisionStorageAndExactScan() throws {
         let path = dbPath("fp16")
-        XCTAssertThrowsError(try VectorStore(dbPath: path, dimension: dimension,
-                                             elementType: .fp16)) { error in
-            XCTAssertTrue(error.localizedDescription.contains("fp16"))
-        }
-        XCTAssertFalse(FileManager.default.fileExists(atPath: path),
-                       "校验必须在打开/创建数据库之前完成")
+        let store = try VectorStore(dbPath: path, dimension: dimension,
+                                    elementType: .fp16,
+                                    indexFingerprint: "fp16")
+        XCTAssertEqual(store.elementType, .fp16)
+        XCTAssertFalse(store.vectorEnabled, "fp16 没有 vec0 列类型，应走精确扫描")
+        XCTAssertFalse(store.requiresRebuild)
+
+        XCTAssertEqual(try store.add(chunks: chunks(4),
+                                     vectors: (0..<4).map { oneHot($0) }), 4)
+        let blobBytes = try store.db.scalar(
+            "SELECT length(embedding) FROM chunk_vectors LIMIT 1").intValue
+        XCTAssertEqual(blobBytes, Int64(dimension * 2), "fp16 每维 2 字节")
+
+        let hits = try store.search(vector: oneHot(0), topK: 2)
+        XCTAssertEqual(hits.first?.text, "doc 0")
+        XCTAssertGreaterThan(hits.first?.score ?? 0, 0.99)
+        store.close()
+
+        // 重开：meta 记录的元素类型可以沿用，且旧 half 仍可检索。
+        let reopened = try VectorStore(dbPath: path, dimension: dimension,
+                                       elementType: .fp16,
+                                       indexFingerprint: "fp16")
+        XCTAssertFalse(reopened.requiresRebuild)
+        XCTAssertEqual(try reopened.search(vector: oneHot(0), topK: 1).first?.text, "doc 0")
+        reopened.close()
     }
 
     // MARK: - 指纹闸门 / 重建
@@ -206,7 +226,7 @@ final class VectorStoreElementTypeTests: XCTestCase {
     // MARK: - ANN 跟随元素类型
 
     func testANNIndexUsesElementTypeLayout() throws {
-        for type in [VectorElementType.int8, .bin] {
+        for type in [VectorElementType.int8, .bin, .fp16] {
             let store = try VectorStore(dbPath: dbPath("ann-\(type.rawValue)"),
                                         dimension: dimension,
                                         elementType: type,

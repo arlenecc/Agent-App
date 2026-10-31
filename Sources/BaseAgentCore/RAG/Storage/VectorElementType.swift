@@ -1,27 +1,23 @@
 import Foundation
 
-/// 向量落盘元素类型。对应 sqlite-vec 的三种原生列类型：
-/// float32（`float[N]`）、int8（`int8[N]`）、bit（`bit[N]`）。
+/// 向量落盘元素类型。
 ///
-/// `fp16` 保留为配置项以便与其它向量库对齐，但 sqlite-vec 0.1.9 没有
-/// fp16 元素类型，选择它会在打开向量库时直接报错并提示改用其它类型。
+/// sqlite-vec 0.1.9 原生列类型只有 float32（`float[N]`）、int8（`int8[N]`）、
+/// bit（`bit[N]`）。`fp16` 是真正的 IEEE 754 half（每维 2 字节），但没有
+/// vec0 列类型，因此使用普通表存储 + 精确余弦扫描。
 public enum VectorElementType: String, CaseIterable, Sendable {
     case fp32
     case int8
     case fp16
     case bin
 
-    /// 默认元素类型：int8（默认模型截断到 256 维，每行 256B，是 fp32 的 1/4）。
+    /// 默认元素类型：int8（默认模型截断到 128 维，每行 128B，是 fp32 的 1/4）。
     public static let defaultValue: VectorElementType = .int8
 
-    public var isSupported: Bool { self != .fp16 }
+    public var isSupported: Bool { true }
 
-    /// 不支持时的明确原因（状态面板与设置校验共用同一句提示）。
-    public var unsupportedReason: String? {
-        guard !isSupported else { return nil }
-        return "sqlite-vec 0.1.9 不支持 fp16 向量；请把 rag_vector_element_type "
-            + "改为 int8（推荐）/ fp32 / bin"
-    }
+    /// 不支持时的明确原因（预留给未来的向量库后端；当前四种类型均可用）。
+    public var unsupportedReason: String? { nil }
 
     public var displayName: String { rawValue }
 
@@ -30,16 +26,20 @@ public enum VectorElementType: String, CaseIterable, Sendable {
         switch self {
         case .fp32: return "fp32：4 字节/维，余弦距离，兼容旧库"
         case .int8: return "int8：1 字节/维，余弦距离（默认）"
-        case .fp16: return "fp16：sqlite-vec 不支持，需改用 int8 / fp32 / bin"
+        case .fp16: return "fp16：2 字节/维，余弦距离，精确扫描"
         case .bin: return "bin：1 bit/维，汉明距离，体积最小"
         }
     }
+
+    /// fp16 没有 vec0 原生列类型：普通表存储 + 精确扫描；其余走 vec0。
+    var supportsVec0Index: Bool { self != .fp16 }
 
     /// bit 列只能是汉明距离（vec0 显式拒绝 `distance_metric`）。
     public var isBinary: Bool { self == .bin }
 
     var sqlColumnType: String {
         switch self {
+        // fp16 仅占位：它不会走 vec0 建表，列类型由普通表 BLOB 承载。
         case .fp32, .fp16: return "float"
         case .int8: return "int8"
         case .bin: return "bit"
@@ -79,7 +79,8 @@ public enum VectorElementType: String, CaseIterable, Sendable {
     /// 单行落盘字节数。
     func blobSize(dimension: Int) -> Int {
         switch self {
-        case .fp32, .fp16: return dimension * 4
+        case .fp32: return dimension * 4
+        case .fp16: return dimension * 2
         case .int8: return dimension
         case .bin: return (dimension + 7) / 8
         }
@@ -117,8 +118,10 @@ public enum VectorEncoder {
     /// 编码为落盘字节。**入参必须是已归一化的向量**（int8/bin 依赖 |x| ≤ 1）。
     public static func encode(_ vector: [Float], as type: VectorElementType) -> Data {
         switch type {
-        case .fp32, .fp16:
+        case .fp32:
             return VectorCodec.encode(vector)
+        case .fp16:
+            return encodeFloat16(vector)
         case .int8:
             return encodeInt8(vector)
         case .bin:
@@ -126,12 +129,14 @@ public enum VectorEncoder {
         }
     }
 
-    /// 落盘字节还原为近似向量（fp32 原样、int8 ÷127、bin ±1/√dim）。
+    /// 落盘字节还原为近似向量（fp32/half 原样、int8 ÷127、bin ±1/√dim）。
     public static func decode(_ data: Data, as type: VectorElementType,
                               dimension: Int) -> [Float] {
         switch type {
-        case .fp32, .fp16:
+        case .fp32:
             return VectorCodec.decode(data)
+        case .fp16:
+            return decodeFloat16(data, dimension: dimension)
         case .int8:
             guard dimension > 0, data.count >= dimension else { return [] }
             return dequantizeInt8(data, dimension: dimension)
@@ -139,6 +144,50 @@ public enum VectorEncoder {
             guard dimension > 0, data.count * 8 >= dimension else { return [] }
             return dequantizeBits(data, dimension: dimension)
         }
+    }
+
+    // MARK: fp16
+
+    /// IEEE 754 half，小端序，每维 2 字节。
+    public static func encodeFloat16(_ vector: [Float]) -> Data {
+        var bytes = [UInt8](repeating: 0, count: vector.count * 2)
+        for (index, value) in vector.enumerated() {
+            let pattern = Float16(value).bitPattern
+            bytes[index * 2] = UInt8(pattern & 0xFF)
+            bytes[index * 2 + 1] = UInt8((pattern >> 8) & 0xFF)
+        }
+        return Data(bytes)
+    }
+
+    public static func decodeFloat16(_ data: Data, dimension: Int) -> [Float] {
+        guard dimension > 0 else { return [] }
+        let available = min(dimension, data.count / 2)
+        var output = [Float](repeating: 0, count: dimension)
+        guard available > 0 else { return output }
+        data.withUnsafeBytes { raw in
+            guard let base = raw.baseAddress else { return }
+            for i in 0..<available {
+                output[i] = Float(Float16(bitPattern: halfPattern(pointer: base,
+                                                                 offset: i * 2)))
+            }
+        }
+        return output
+    }
+
+    /// ANN 热路径：直接从候选行指针解码 half，不复制整行 BLOB。
+    public static func decodeFloat16(pointer: UnsafeRawPointer, count: Int) -> [Float] {
+        guard count > 0 else { return [] }
+        var output = [Float](repeating: 0, count: count)
+        for i in 0..<count {
+            output[i] = Float(Float16(bitPattern: halfPattern(pointer: pointer,
+                                                             offset: i * 2)))
+        }
+        return output
+    }
+
+    private static func halfPattern(pointer: UnsafeRawPointer, offset: Int) -> UInt16 {
+        UInt16(littleEndian: pointer.loadUnaligned(fromByteOffset: offset,
+                                                   as: UInt16.self))
     }
 
     // MARK: int8
