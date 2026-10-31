@@ -88,6 +88,7 @@ final class EmbeddingSchedulerTests: XCTestCase {
         let maxContentTokens = 4_096
         private let lock = NSLock()
         private(set) var batches: [[String]] = []
+        private(set) var tokenCounterCalls = 0
 
         func embedDocuments(_ texts: [String]) async throws -> [[Float]] {
             lock.lock()
@@ -102,7 +103,10 @@ final class EmbeddingSchedulerTests: XCTestCase {
         }
 
         func makeTokenCounter() async -> (@Sendable (String) -> Int)? {
-            { $0.count }
+            lock.lock()
+            tokenCounterCalls += 1
+            lock.unlock()
+            return { $0.count }
         }
     }
 
@@ -249,6 +253,52 @@ final class EmbeddingSchedulerTests: XCTestCase {
         XCTAssertEqual(vectors.compactMap { $0.first.map(Int.init) }, [1, 2, 3, 4, 5])
         XCTAssertEqual(progress.map(\.0), [2, 4, 5])
         XCTAssertTrue(progress.allSatisfy { $0.1 == texts.count })
+    }
+
+    /// token 计数器只应创建一次：按窗口重复创建会反复初始化分词器，
+    /// 也说明 token 计数没有在全篇范围内复用。
+    func testSchedulerBuildsTokenCounterOncePerCall() async throws {
+        let base = TokenBudgetRecordingEmbedding()
+        let scheduler = AdaptiveEmbeddingScheduler(
+            base: base,
+            options: .init(minBatchSize: 2, maxBatchSize: 2,
+                           initialBatchSize: 2, step: 1,
+                           memoryLimitMB: 32_768, throughputTolerance: 0.5,
+                           probeBatches: 16, probeSeconds: 30,
+                           tokenBudgetMin: 4_096, tokenBudgetMax: 4_096,
+                           initialTokenBudget: 4_096, tokenBudgetStep: 128,
+                           windowTexts: 2),
+            log: { _ in })
+        let texts = ["a", "bb", "ccc", "dddd"]
+        let vectors = try await scheduler.embedDocuments(texts)
+
+        XCTAssertEqual(vectors.compactMap { $0.first.map(Int.init) }, [1, 2, 3, 4])
+        XCTAssertEqual(base.tokenCounterCalls, 1)
+    }
+
+    /// 窗口化前必须按全篇 token 长度排序：否则长短切片混在同一窗口，
+    /// 每批被最长切片拖慢并放大 padding。排序后的窗口应保持同质性。
+    func testSchedulerSortsGloballyBeforeSplittingWindows() async throws {
+        let base = TokenBudgetRecordingEmbedding()
+        let scheduler = AdaptiveEmbeddingScheduler(
+            base: base,
+            options: .init(minBatchSize: 1, maxBatchSize: 2,
+                           initialBatchSize: 2, step: 1,
+                           memoryLimitMB: 32_768, throughputTolerance: 0.5,
+                           probeBatches: 16, probeSeconds: 30,
+                           tokenBudgetMin: 4_096, tokenBudgetMax: 4_096,
+                           initialTokenBudget: 4_096, tokenBudgetStep: 128,
+                           windowTexts: 2),
+            log: { _ in })
+        let lengths = [1, 100, 2, 90, 3, 80]
+        let texts = lengths.map { String(repeating: "a", count: $0) }
+        let vectors = try await scheduler.embedDocuments(texts)
+
+        XCTAssertEqual(vectors.compactMap { $0.first.map(Int.init) }, lengths,
+                       "结果仍需按原始下标写回")
+        XCTAssertEqual(base.batches.map { $0.map(\.count) },
+                       [[100, 90], [80, 3], [2, 1]],
+                       "先全篇降序排序，再按 windowTexts 切窗口")
     }
 
     func testSchedulerSerializesConcurrentCalls() async throws {

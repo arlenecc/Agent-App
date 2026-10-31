@@ -336,51 +336,21 @@ public final class AdaptiveEmbeddingScheduler: EmbeddingProvider, EmbeddingToken
     /// 独占模型直到自己全部完成，其他文件只能等待，整体完成时间被最长的
     /// 单文件绑定。按 `options.windowTexts` 切窗口后，每个窗口单独申请许可，
     /// 窗口之间 `Task.yield()`，公平信号量会把模型让给其他等待的文件。
-    /// 输出仍按原始下标顺序拼接，进度回调按整次调用的条数推进。
+    ///
+    /// 切窗口之前先按全篇 token 长度降序排序：同一窗口内的切片长度相近，
+    /// 可减少 padding 放大，也避免自适应批次因吞吐下降而不断缩小。
+    /// 向量仍按原始下标写回，进度回调按整次调用的条数推进。
     public func embedDocuments(
         _ texts: [String],
         progress: ((Int, Int) -> Void)?
     ) async throws -> [[Float]] {
         guard !texts.isEmpty else { return [] }
-        let window = max(1, options.windowTexts)
-        guard texts.count > window else {
-            return try await embedWindow(texts, progress: progress, total: texts.count)
-        }
 
-        var result: [[Float]] = []
-        result.reserveCapacity(texts.count)
-        var processed = 0
-        var start = 0
-        while start < texts.count {
+        // 全篇只创建一次计数器、只计数一次。分词器初始化开销大，按窗口
+        // 重复创建会反复初始化；计数期间持有信号量，避免与 embedding
+        // 调用并发使用同一个分词器。
+        let tokenCounts = try await semaphore.withPermit { () -> [Int] in
             if Task.isCancelled { throw AgentError.cancelled }
-            let end = min(start + window, texts.count)
-            let slice = Array(texts[start..<end])
-            let completed = processed
-            let vectors = try await embedWindow(
-                slice,
-                progress: { done, _ in progress?(completed + done, texts.count) },
-                total: texts.count)
-            result.append(contentsOf: vectors)
-            processed += slice.count
-            start = end
-            await Task.yield()
-        }
-        return result
-    }
-
-    /// 单个窗口内的组批与执行。调用方负责按窗口切分，这里只在窗口期间
-    /// 持有信号量，因此其他文件可以在窗口之间获得模型时间。
-    ///
-    /// 先按长度降序排列，贪心装入「条数上限 + token 预算」双约束的子批；
-    /// 当前批装不下的切片跳过并留给下一批，继续用更短的切片填满预算，
-    /// 减少 padding 浪费。向量按原始下标写回，顺序与输入一致。长切片由
-    /// token 预算决定批大小，短切片由条数上限决定。
-    private func embedWindow(
-        _ texts: [String],
-        progress: ((Int, Int) -> Void)?,
-        total: Int
-    ) async throws -> [[Float]] {
-        try await semaphore.withPermit {
             let counter: @Sendable (String) -> Int
             if let provider = base as? EmbeddingTokenCounting,
                let exact = await provider.makeTokenCounter() {
@@ -388,15 +358,60 @@ public final class AdaptiveEmbeddingScheduler: EmbeddingProvider, EmbeddingToken
             } else {
                 counter = { EmbeddingTokenEstimator.count($0) }
             }
-            let tokenCounts = texts.map { max(1, counter($0)) }
-            // 大块优先：单条超预算时独占一批，小块随后紧凑填满。
-            let order = texts.indices.sorted { lhs, rhs in
-                tokenCounts[lhs] == tokenCounts[rhs]
-                    ? lhs < rhs
-                    : tokenCounts[lhs] > tokenCounts[rhs]
+            return texts.map { max(1, counter($0)) }
+        }
+        // 大块优先：单条超预算时独占一批，小块随后紧凑填满。
+        let order = texts.indices.sorted { lhs, rhs in
+            tokenCounts[lhs] == tokenCounts[rhs]
+                ? lhs < rhs
+                : tokenCounts[lhs] > tokenCounts[rhs]
+        }
+
+        let window = max(1, options.windowTexts)
+        var result = [[Float]](repeating: [], count: texts.count)
+        var processed = 0
+        var start = 0
+        while start < order.count {
+            if Task.isCancelled { throw AgentError.cancelled }
+            let end = min(start + window, order.count)
+            let slice = Array(order[start..<end])
+            let completed = processed
+            let vectors = try await embedWindow(
+                slice,
+                texts: texts,
+                tokenCounts: tokenCounts,
+                progress: { done, _ in progress?(completed + done, texts.count) },
+                total: texts.count)
+            for (offset, index) in slice.enumerated() {
+                result[index] = vectors[offset]
             }
-            var result = [[Float]](repeating: [], count: texts.count)
-            var pending = order
+            processed += slice.count
+            start = end
+            await Task.yield()
+        }
+        return result
+    }
+
+    /// 单个窗口内的组批与执行。调用方负责按窗口切分并传入全篇 token
+    /// 计数，这里只在窗口期间持有信号量，因此其他文件可以在窗口之间
+    /// 获得模型时间。
+    ///
+    /// 窗口内的下标已按长度降序排列，贪心装入「条数上限 + token 预算」
+    /// 双约束的子批；当前批装不下的切片跳过并留给下一批，继续用更短的
+    /// 切片填满预算，减少 padding 浪费。向量按窗口内位置写回，调用方再
+    /// 映射回原始下标。长切片由 token 预算决定批大小，短切片由条数上限
+    /// 决定。
+    private func embedWindow(
+        _ indices: [Int],
+        texts: [String],
+        tokenCounts: [Int],
+        progress: ((Int, Int) -> Void)?,
+        total: Int
+    ) async throws -> [[Float]] {
+        try await semaphore.withPermit {
+            var result = [[Float]](repeating: [], count: indices.count)
+            // pending 使用窗口内位置，避免全局下标与局部下标的映射开销。
+            var pending = Array(indices.indices)
             var processed = 0
             while !pending.isEmpty {
                 if Task.isCancelled { throw AgentError.cancelled }
@@ -405,29 +420,29 @@ public final class AdaptiveEmbeddingScheduler: EmbeddingProvider, EmbeddingToken
                 let budget = max(1, tokenBudget)
                 stateLock.unlock()
 
-                var indices: [Int] = []
-                indices.reserveCapacity(min(sizeCap, pending.count))
+                var selected: [Int] = []
+                selected.reserveCapacity(min(sizeCap, pending.count))
                 var remaining: [Int] = []
                 remaining.reserveCapacity(pending.count)
                 var tokens = 0
-                for index in pending {
-                    let cost = tokenCounts[index]
-                    guard indices.count < sizeCap else {
-                        remaining.append(index)
+                for position in pending {
+                    let cost = tokenCounts[indices[position]]
+                    guard selected.count < sizeCap else {
+                        remaining.append(position)
                         continue
                     }
                     // 装不下就先跳过，继续用后面更短的切片填满预算；
                     // 单条超过预算时仍允许独占一批，否则会永远装不进去。
-                    if indices.isEmpty || tokens + cost <= budget {
-                        indices.append(index)
+                    if selected.isEmpty || tokens + cost <= budget {
+                        selected.append(position)
                         tokens += cost
                     } else {
-                        remaining.append(index)
+                        remaining.append(position)
                     }
                 }
                 pending = remaining
-                processed += indices.count
-                let batch = indices.map { texts[$0] }
+                processed += selected.count
+                let batch = selected.map { texts[indices[$0]] }
                 let batchStarted = Date()
                 let vectors = try await base.embedDocuments(batch)
                 let seconds = Date().timeIntervalSince(batchStarted)
@@ -435,8 +450,8 @@ public final class AdaptiveEmbeddingScheduler: EmbeddingProvider, EmbeddingToken
                     throw AgentError.storage(
                         "embedding 子批返回数量异常: \(vectors.count) != \(batch.count)")
                 }
-                for (offset, index) in indices.enumerated() {
-                    result[index] = vectors[offset]
+                for (offset, position) in selected.enumerated() {
+                    result[position] = vectors[offset]
                 }
                 record(texts: batch.count, tokens: tokens, seconds: seconds)
                 progress?(processed, total)

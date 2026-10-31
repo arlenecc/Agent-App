@@ -271,6 +271,8 @@ git commit -m "perf(rag): journal manifest writes"
 
 **设计:** 新增 `Options.windowTexts`（默认 32，最小 1）。`embedDocuments` 将输入切成窗口，每个窗口单独 `semaphore.withPermit`；窗口之间 `await Task.yield()`。这样公平信号量会把模型时间让给其他文件，输出仍是原始顺序，token 预算与自适应批大小逻辑不变。
 
+> 后续真实语料基准发现：按原文顺序切窗口会让长短切片混在一起，吞吐显著回退。修复见 **Task 7**。
+
 - [x] **Step 1: 写失败测试**
 
 ```swift
@@ -986,9 +988,70 @@ Expected: 得到预分词 ms/片、索引文本膨胀比、单事务写入片/�
 
 ---
 
+## Task 7: 窗口化回退修复 —— 全篇长度排序后再切窗口
+
+**背景:** 6 本真实 EPUB 端到端对比显示 Task 2 的窗口化造成回退：基线 `a765ac7` 139.6s，
+HEAD `c67d5a9` 207.8-225.3s；临时关闭窗口化（`windowTexts = 10_000_000`）后恢复到 136.1s，
+确认回退只来自窗口切分。原因是按原文顺序切窗口使长短切片混在同一窗口，padding 放大、
+tokens/s 下降，自适应批次随后不断缩小形成负反馈。
+
+**Files:**
+- Modify: `Sources/BaseAgentCore/RAG/AdaptiveEmbeddingScheduler.swift`
+- Modify: `Tests/BaseAgentCoreTests/EmbeddingSchedulerTests.swift`
+- 临时基准（不提交）: `Tests/BaseAgentCoreTests/IngestBenchmarkTests.swift`
+
+**设计（方案 B）:** 保留窗口化让出模型；切窗口前一次性创建 token counter 并计数全篇，
+按 token 数降序排列，在排序后的索引上切窗口；向量按原始下标写回。每个窗口仍单独申请
+信号量，窗口之间 `Task.yield()`。窗口内不再重复计数与排序。
+
+- [x] **Step 1: RED（token 计数只创建一次）**
+
+`testSchedulerBuildsTokenCounterOncePerCall`：4 条文本、`windowTexts=2`，
+原实现每个窗口调用一次 `makeTokenCounter()`，实测 `tokenCounterCalls == 2`，期望 1。
+
+- [x] **Step 2: RED（全篇排序后再切窗口）**
+
+`testSchedulerSortsGloballyBeforeSplittingWindows`：长度 `[1,100,2,90,3,80]`、
+`windowTexts=2`，原实现批次为 `[[100,1],[90,2],[80,3]]`（窗口内排序、窗口间仍是原文顺序），
+期望 `[[100,90],[80,3],[2,1]]`。
+
+- [x] **Step 3: GREEN**
+
+`embedDocuments` 在信号量内一次创建计数器并得到全篇 `tokenCounts`，全局降序排序后切窗口；
+`embedWindow` 接收已排序的原始下标与 `tokenCounts`，窗口内按位置组批，调用方按原始下标写回。
+
+- [x] **Step 4: 回归**
+
+- `EmbeddingSchedulerTests`：11 tests / 0 failures（含窗口公平、输出顺序、进度、并发串行）。
+- 全量 `swift test`：**518 tests / 43 skipped / 0 failures**。
+
+- [x] **Step 5: 真实语料复跑（同 6 本 EPUB、`force: true`、并发 6、ANN/rerank 关闭）**
+
+| 版本 | 第 1 次 | 第 2 次 | embedding 吞吐 | chunks | errors |
+|---|---:|---:|---:|---:|---:|
+| 基线 `a765ac7` | 139.65s | 139.60s | 3705 / 3707 token/s | 3267 | 0 |
+| HEAD `c67d5a9`（窗口化） | 225.34s | 207.79s | 2083 / 2274 token/s | 3267 | 0 |
+| HEAD 关闭窗口化 | 136.07s | — | 3722 token/s | 3267 | 0 |
+| 修复（方案 B） | **143.93s** | **142.34s** | **3559 / 3608 token/s** | 3267 | 0 |
+
+修复后比 HEAD 窗口化快约 31%-36%，吞吐恢复至基线的约 96%；仍比关闭窗口化慢约 4%-6%，
+这是保留跨文件公平让出模型所需的代价。两次复跑 chunk 数与总 token（412782）一致，无错误。
+
+- [x] **Step 6: 提交**
+
+```bash
+git add Sources/BaseAgentCore/RAG/AdaptiveEmbeddingScheduler.swift \
+        Tests/BaseAgentCoreTests/EmbeddingSchedulerTests.swift \
+        docs/superpowers/plans/2026-10-31-rag-performance-optimizations.md
+git commit -m "perf(rag): sort embedding texts globally before windowing"
+```
+
+---
+
 ## 验收与收尾
 
 - [x] `swift test` 全量通过（516 tests / 33 skipped / 0 failures）。
+- [x] Task 7 修复后全量回归通过（518 tests / 43 skipped / 0 failures）。
 - [x] 更新 `README.md` 与 `docs/软件设计文档.md` 中受影响的性能说明。
 - [x] 逐项独立提交；不提交 `benchmarks/` 未跟踪目录。
 - [ ] 推送与打 tag 由用户确认后执行。
