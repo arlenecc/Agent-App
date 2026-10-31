@@ -762,6 +762,31 @@ public final class RAGEngine {
         }
     }
 
+    /// 带超时的检索入口：限时取 `searchLock`、限时等「打开库」，然后把剩余
+    /// 期限交给 `hybridSearch`（向量候选在写入锁内取，FTS/hydrate 走只读
+    /// WAL 快照，不再整段持有写入锁）。任何一步超时都抛 `AgentError.timeout`，
+    /// 由调用方跳过本次查询。
+    private func withSnapshotStoreBounded<T>(
+        timeout: Double,
+        _ body: (VectorStore, Date?) throws -> T
+    ) throws -> T {
+        guard timeout > 0 else { return try withStore { try body($0, nil) } }
+        let deadline = Date().addingTimeInterval(timeout)
+        guard searchLock.lock(before: deadline) else {
+            throw logTimeout(AgentError.timeout(
+                "知识库正忙（同步/维护进行中），本次查询已跳过"))
+        }
+        defer { searchLock.unlock() }
+        do {
+            let store = try storeBounded(by: deadline)
+            let remaining = deadline.timeIntervalSinceNow
+            guard remaining > 0 else { throw AgentError.timeout("查询超出时限被跳过") }
+            return try body(store, deadline)
+        } catch {
+            throw logTimeout(error)
+        }
+    }
+
     /// 限时拿到已打开的 store。打开动作放后台队列执行（同一时刻只有一个），
     /// 超时即抛出；打开完成后后续查询自动可用，不会重复建连接。
     private func storeBounded(by deadline: Date) throws -> VectorStore {
@@ -2115,8 +2140,8 @@ public final class RAGEngine {
             : requested
         let candidateCount = max(requested, resultCount) * (rerankEnabled ? 4 : 1)
 
-        let fetched: [SearchHit]? = try withStoreBounded(timeout: limit) { store in
-            guard store.hasChunks else { return nil }
+        let fetched: [SearchHit]? = try withSnapshotStoreBounded(timeout: limit) {
+            store, deadline in
             func run(sourceFilter: String? = nil,
                      sourceContains: String? = nil) throws -> [SearchHit] {
                 try store.hybridSearch(
@@ -2126,7 +2151,8 @@ public final class RAGEngine {
                     overfetch: config.ragVectorOverfetch,
                     // ANN 索引就绪时向量通道走分块 IVF；不可用（未构建/
                     // 尾块超预算/维度不符）时内部自动回退精确路径。
-                    ann: annQueryOptions
+                    ann: annQueryOptions,
+                    deadline: deadline
                 )
             }
             // source 是「来源子串」而不是 SQL 过滤条件：先解析成真实来源，

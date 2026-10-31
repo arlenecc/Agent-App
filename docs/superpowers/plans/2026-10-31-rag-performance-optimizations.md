@@ -600,7 +600,7 @@ git commit -m "perf(epub): OCR chapters concurrently"
 
 **设计:** VectorStore 增加惰性只读连接与 `BEGIN DEFERRED` 读事务。`searchFTS` 的 FTS 候选与 hydrate 在同一个读快照内完成，不持 `store.lock`。`hybridSearch` 在 `store.lock` 内完成向量候选，同时开启读快照，随后释放 `store.lock`，FTS + hydrate + RRF 在快照内运行；删除/写入在快照外可继续提交，快照内的 rowid 不会失效。`SQLiteDatabase` 的只读连接跳过 `journal_mode=WAL` 写入型 PRAGMA。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```swift
 import XCTest
@@ -678,12 +678,12 @@ final class VectorStoreReadSnapshotTests: XCTestCase {
 }
 ```
 
-- [ ] **Step 2: 运行并确认 RED**
+- [x] **Step 2: 运行并确认 RED**
 
 Run: `swift test --filter VectorStoreReadSnapshotTests`
 Expected: 编译失败（`withReadSnapshot` 不存在）。
 
-- [ ] **Step 3: 实现读连接与读事务**
+- [x] **Step 3: 实现读连接与读事务**
 
 `SQLiteDatabase`：
 
@@ -821,16 +821,16 @@ private func withSnapshotStoreBounded<T>(
 
 `search` 改用该入口，把 `deadline` 传给 `hybridSearch`；`hasChunks` 预检查删除（`hybridSearch` 内部已检查）。`annIndexStatus` 与状态快照继续用原 `withStoreBounded`。
 
-- [ ] **Step 4: 运行确认 GREEN**
+- [x] **Step 4: 运行确认 GREEN**
 
 Run: `swift test --filter 'VectorStoreReadSnapshotTests|VectorStoreTests|VectorStoreANNTests|RAGEngineTests'`
 Expected: all passed。
 
-- [ ] **Step 5: 更新锁语义文档**
+- [x] **Step 5: 更新锁语义文档**
 
 `docs/软件设计文档.md:262` 与 `README.md:155` 改为：检索走只读 WAL 快照，写入/删除在快照外并发提交；FTS 候选与 hydrate 在同一读事务内完成。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 git add Sources/BaseAgentCore/RAG/Storage/SQLiteDatabase.swift \

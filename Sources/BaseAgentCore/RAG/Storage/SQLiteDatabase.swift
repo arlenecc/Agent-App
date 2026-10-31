@@ -105,7 +105,11 @@ public final class SQLiteDatabase {
         }
         self.handle = db
         sqlite3_busy_timeout(db, 5_000)
-        try execute("PRAGMA journal_mode=WAL")
+        // 只读连接不能切换 journal_mode（那是写入型 PRAGMA）；库已由写连接
+        // 设为 WAL，只读连接直接沿用即可。
+        if !readOnly {
+            try execute("PRAGMA journal_mode=WAL")
+        }
         try execute("PRAGMA synchronous=NORMAL")
         try execute("PRAGMA foreign_keys=ON")
         try execute("PRAGMA temp_store=MEMORY")
@@ -359,6 +363,24 @@ public final class SQLiteDatabase {
     }
 
     // MARK: Transactions
+
+    /// 只读事务（BEGIN DEFERRED）：第一条 SELECT 建立 WAL 读快照，之后同一
+    /// 事务内的多次查询看到同一个数据库版本，不受并发写入/删除影响。
+    /// 读连接上只执行 SELECT，不会升级为写事务。
+    @discardableResult
+    public func readTransaction<T>(_ body: () throws -> T) throws -> T {
+        lock.lock(); defer { lock.unlock() }
+        guard let handle else { throw AgentError.storage("数据库已关闭") }
+        try execute("BEGIN DEFERRED")
+        do {
+            let value = try body()
+            try execute("COMMIT")
+            return value
+        } catch {
+            try? execute("ROLLBACK")
+            throw error
+        }
+    }
 
     /// 写事务（BEGIN IMMEDIATE）。可嵌套（savepoint）。
     @discardableResult

@@ -27,6 +27,11 @@ public final class VectorStore: @unchecked Sendable {
     public static let summaryRuntimeTable = "summary_runtime"
 
     public let db: SQLiteDatabase
+    /// 数据库路径；检索用独立的只读连接打开 WAL 快照，不阻塞写入。
+    private let dbPath: String
+    /// 只读连接与其锁。惰性创建，首次检索时打开。
+    private let readLock = NSLock()
+    private var readDB: SQLiteDatabase?
     /// 当前向量维度。极少数模型（缺少 config.json）会在首次推理后才发现
     /// 真实维度；若库还是空的，允许自动按真实维度重建。
     public private(set) var dimension: Int
@@ -76,6 +81,7 @@ public final class VectorStore: @unchecked Sendable {
         self.dimension = resolvedDimension
         self.elementType = elementType
         self.indexFingerprint = indexFingerprint
+        self.dbPath = dbPath
         try FileManager.default.createDirectory(
             atPath: (dbPath as NSString).deletingLastPathComponent,
             withIntermediateDirectories: true
@@ -103,10 +109,47 @@ public final class VectorStore: @unchecked Sendable {
         }
     }
 
-    public func close() { db.close() }
+    public func close() {
+        lock.lock()
+        readLock.lock()
+        readDB?.close()
+        readDB = nil
+        readLock.unlock()
+        lock.unlock()
+        db.close()
+    }
 
     /// 当前库是否需要显式重建（配置与索引指纹/维度/元素类型不符）。
     public var requiresRebuild: Bool { rebuildReason != nil }
+
+    /// 惰性打开只读连接。读连接与写连接共享同一个 WAL，读事务看到的是
+    /// 建立快照时的版本，写入/删除可以继续提交而不被阻塞。
+    private func readDatabase() throws -> SQLiteDatabase {
+        readLock.lock(); defer { readLock.unlock() }
+        if let readDB { return readDB }
+        let reader = try SQLiteDatabase(path: dbPath, readOnly: true)
+        readDB = reader
+        return reader
+    }
+
+    /// 在只读快照内执行查询（FTS 候选 + hydrate 必须处于同一版本）。
+    /// 快照期间不持有 `lock`，写入/删除可并发完成。
+    func withReadSnapshot<T>(deadline: Date? = nil,
+                             _ body: (SQLiteDatabase) throws -> T) throws -> T {
+        let reader = try readDatabase()
+        func run() throws -> T {
+            try reader.readTransaction {
+                // 先执行一次读，确保 WAL 快照在进入闭包前已经建立：
+                // 之后的写入在本次快照内不可见，rowid 不会消失。
+                _ = try reader.query("SELECT 1 FROM \(Self.chunksTable) LIMIT 1")
+                return try body(reader)
+            }
+        }
+        guard let deadline else { return try run() }
+        let seconds = deadline.timeIntervalSinceNow
+        guard seconds > 0 else { throw AgentError.timeout("查询超出时限被跳过") }
+        return try reader.withDeadline(seconds: seconds, run)
+    }
 
     /// 在期限内执行只读查询：先限时获取切片锁（避免大批量写入把读路径无限期
     /// 挡住），再把剩余时间交给底层语句级期限。超时抛 `AgentError.timeout`，
@@ -948,6 +991,14 @@ public final class VectorStore: @unchecked Sendable {
     private func filterCandidatesLocked(_ candidates: [(Int64, Double)],
                                         source: String? = nil,
                                         contains: String? = nil) throws -> [(Int64, Double)] {
+        try filterCandidates(db, candidates, source: source, contains: contains)
+    }
+
+    /// 候选行按来源过滤。`db` 可以是写连接，也可以是检索用的只读快照连接。
+    private func filterCandidates(_ db: SQLiteDatabase,
+                                  _ candidates: [(Int64, Double)],
+                                  source: String? = nil,
+                                  contains: String? = nil) throws -> [(Int64, Double)] {
         guard !candidates.isEmpty, source != nil || contains != nil else { return candidates }
         var allowed = Set<Int64>()
         allowed.reserveCapacity(candidates.count)
@@ -1074,6 +1125,12 @@ public final class VectorStore: @unchecked Sendable {
     }
 
     private func loadChunksLocked(rowIDs: [Int64]) throws -> [Int64: HydratedChunk] {
+        try loadChunks(db, rowIDs: rowIDs)
+    }
+
+    /// 按 rowid 批量读取正文；`db` 可以是写连接或只读快照连接。
+    private func loadChunks(_ db: SQLiteDatabase,
+                            rowIDs: [Int64]) throws -> [Int64: HydratedChunk] {
         guard !rowIDs.isEmpty else { return [:] }
         var output: [Int64: HydratedChunk] = [:]
         output.reserveCapacity(rowIDs.count)
@@ -1100,7 +1157,15 @@ public final class VectorStore: @unchecked Sendable {
     }
 
     /// 二段式收尾：按 rowid 批量取正文并过滤（精确路径与 ANN 路径共用）。
+    /// 调用方需已持有 `lock`。
     func hydrate(candidates: [(Int64, Double)], sourceFilter: String?,
+                 sourceContains: String? = nil, limit: Int) throws -> [SearchHit] {
+        try hydrate(db, candidates: candidates, sourceFilter: sourceFilter,
+                    sourceContains: sourceContains, limit: limit)
+    }
+
+    /// 二段式收尾；`db` 可以是写连接或只读快照连接。
+    func hydrate(_ db: SQLiteDatabase, candidates: [(Int64, Double)], sourceFilter: String?,
                  sourceContains: String? = nil, limit: Int) throws -> [SearchHit] {
         guard !candidates.isEmpty else { return [] }
         let starts = stride(from: 0, to: candidates.count, by: deleteBatchSize).map { $0 }
@@ -1109,7 +1174,7 @@ public final class VectorStore: @unchecked Sendable {
         for start in starts {
             guard result.count < limit else { break }
             let batch = Array(candidates[start..<min(start + deleteBatchSize, candidates.count)])
-            let byID = try loadChunksLocked(rowIDs: batch.map(\.0))
+            let byID = try loadChunks(db, rowIDs: batch.map(\.0))
             for (rowID, score) in batch {
                 guard let row = byID[rowID] else { continue }
                 if let sourceFilter, row.source != sourceFilter { continue }
@@ -1134,29 +1199,39 @@ public final class VectorStore: @unchecked Sendable {
     ///
     /// 查询 token 先按「停用词过滤 + 最多 32 个显著 token」构造 AND 表达式；
     /// AND 一条都命中不了时再退化为 OR，避免多个关键词被 OR 稀释成噪声。
+    ///
+    /// 候选查询与 hydrate 在同一个只读事务内完成，不持有写入锁：删除/写入
+    /// 可以并发提交，命中集合不会出现「FTS 有、主表已被删」的半截结果。
     public func searchFTS(query: String, topK: Int, sourceFilter: String? = nil,
-                          sourceContains: String? = nil) throws -> [SearchHit] {
+                          sourceContains: String? = nil,
+                          deadline: Date? = nil) throws -> [SearchHit] {
         guard topK > 0 else { return [] }
-        // 同 search：FTS 命中与主表 hydrate 必须处于同一写入快照。
-        lock.lock(); defer { lock.unlock() }
         let fetchLimit = sourceContains == nil ? topK : topK * 20
-        let ranked = try ftsCandidatesLocked(query: query, limit: fetchLimit,
-                                             sourceFilter: sourceFilter)
-        guard !ranked.isEmpty else { return [] }
-        let hydrated = try hydrateRaw(ranked: ranked, sourceFilter: sourceFilter,
-                                      sourceContains: sourceContains, limit: topK)
-        return hydrated.map { hit in
-            var copy = hit
-            let raw = hit.score
-            copy.score = raw > 0 ? raw / (1 + raw) : 0
-            copy.ftsScore = raw
-            return copy
+        return try withReadSnapshot(deadline: deadline) { reader in
+            let ranked = try ftsCandidates(reader, query: query, limit: fetchLimit,
+                                           sourceFilter: sourceFilter)
+            guard !ranked.isEmpty else { return [] }
+            let hydrated = try hydrateRaw(reader, ranked: ranked, sourceFilter: sourceFilter,
+                                          sourceContains: sourceContains, limit: topK)
+            return hydrated.map { hit in
+                var copy = hit
+                let raw = hit.score
+                copy.score = raw > 0 ? raw / (1 + raw) : 0
+                copy.ftsScore = raw
+                return copy
+            }
         }
     }
 
     /// FTS5 候选（rowid + 原始 BM25 分，不读正文）。调用方需已持有 `lock`。
     func ftsCandidatesLocked(query: String, limit: Int,
                              sourceFilter: String?) throws -> [(Int64, Double)] {
+        try ftsCandidates(db, query: query, limit: limit, sourceFilter: sourceFilter)
+    }
+
+    /// FTS5 候选；`db` 可以是写连接或只读快照连接。
+    func ftsCandidates(_ db: SQLiteDatabase, query: String, limit: Int,
+                       sourceFilter: String?) throws -> [(Int64, Double)] {
         guard limit > 0 else { return [] }
         let andQuery = TextAnalyzer.ftsQuery(query, mode: .and)
         let orQuery = TextAnalyzer.ftsQuery(query, mode: .or)
@@ -1198,10 +1273,11 @@ public final class VectorStore: @unchecked Sendable {
         }
     }
 
-    private func hydrateRaw(ranked: [(Int64, Double)], sourceFilter: String?,
+    private func hydrateRaw(_ db: SQLiteDatabase, ranked: [(Int64, Double)],
+                            sourceFilter: String?,
                             sourceContains: String? = nil, limit: Int) throws -> [SearchHit] {
         guard !ranked.isEmpty else { return [] }
-        let byID = try loadChunksLocked(rowIDs: ranked.map(\.0))
+        let byID = try loadChunks(db, rowIDs: ranked.map(\.0))
         var result: [SearchHit] = []
         for (rowID, score) in ranked {
             guard let row = byID[rowID] else { continue }
@@ -1226,16 +1302,31 @@ public final class VectorStore: @unchecked Sendable {
     ///
     /// 两路只取 rowid + 分数，先做 RRF 定出前 `topK`，最后一次性 hydrate 正文，
     /// 避免为几百个候选读取全文。`overfetch` 只按 1-2 倍内层放大。
+    ///
+    /// 向量候选在写入锁内取（vec0/ANN 用主连接，不能与删除并发），随后在
+    /// 锁内开启只读快照并释放锁；FTS 候选、RRF 与 hydrate 都在同一快照内
+    /// 完成。写入/删除在快照外可继续提交，这次检索看到的仍是同一版本。
     public func hybridSearch(vector: [Float], query: String, topK: Int,
                              sourceFilter: String? = nil,
                              sourceContains: String? = nil,
                              rrfK: Int = 60, overfetch: Int = 2,
-                             ann: ANNQueryOptions? = nil) throws -> [SearchHit] {
+                             ann: ANNQueryOptions? = nil,
+                             deadline: Date? = nil) throws -> [SearchHit] {
         guard topK > 0 else { return [] }
         guard vector.count == dimension else {
             throw AgentError.storage("查询向量维度 \(vector.count) != \(dimension)")
         }
-        lock.lock(); defer { lock.unlock() }
+        // 向量候选必须与写入/删除串行；有期限时不能无限期等待正在提交的
+        // 大批量写入，超时由调用方跳过本次检索。
+        if let deadline {
+            guard lock.lock(before: deadline) else {
+                throw AgentError.timeout("知识库正在写入，本次查询已跳过")
+            }
+        } else {
+            lock.lock()
+        }
+        var unlocked = false
+        defer { if !unlocked { lock.unlock() } }
         guard hasChunks else { return [] }
 
         // 待重建时向量通道暂停，但全文通道仍然可用（与 status 的提示一致）。
@@ -1248,48 +1339,75 @@ public final class VectorStore: @unchecked Sendable {
         let inner = max(topK * max(1, overfetch), 20)
         let targeted = sourceContains != nil
         let candidateCount = targeted ? max(inner * 4, 20) : inner
-        var vectorCandidates: [(Int64, Double)] = vectorUsable
+        let vectorCandidates: [(Int64, Double)] = vectorUsable
             ? try vectorCandidatesLocked(vector: vector, topK: candidateCount,
                                          sourceFilter: sourceFilter,
                                          ann: ann, targeted: targeted)
             : []
-        var ftsCandidates = try ftsCandidatesLocked(
-            query: query, limit: candidateCount, sourceFilter: sourceFilter)
-        if let needle = sourceContains?.trimmingCharacters(in: .whitespacesAndNewlines),
-           !needle.isEmpty {
-            vectorCandidates = try filterCandidatesLocked(vectorCandidates, contains: needle)
-            ftsCandidates = try filterCandidatesLocked(ftsCandidates, contains: needle)
-        }
-        guard !vectorCandidates.isEmpty || !ftsCandidates.isEmpty else { return [] }
 
-        var rrfScores: [Int64: Double] = [:]
-        var vectorScores: [Int64: Double] = [:]
-        var ftsScores: [Int64: Double] = [:]
-        let k = Double(max(1, rrfK))
-        for (rank, candidate) in vectorCandidates.enumerated() {
-            rrfScores[candidate.0, default: 0] += 1.0 / (k + Double(rank + 1))
-            vectorScores[candidate.0] = candidate.1
-        }
-        for (rank, candidate) in ftsCandidates.enumerated() {
-            rrfScores[candidate.0, default: 0] += 1.0 / (k + Double(rank + 1))
-            ftsScores[candidate.0] = candidate.1
+        // 仍持有写入锁时开启读快照：确保 FTS 候选与 hydrate 落在同一个
+        // 数据库版本；建立快照后即可解锁，让写入/删除并发提交。
+        let reader = try readDatabase()
+        let seconds: Double?
+        if let deadline {
+            let remaining = deadline.timeIntervalSinceNow
+            guard remaining > 0 else { throw AgentError.timeout("查询超出时限被跳过") }
+            seconds = remaining
+        } else {
+            seconds = nil
         }
 
-        let fused = rrfScores.sorted { $0.value > $1.value }
-        guard !fused.isEmpty else { return [] }
-        // hydrate 会跳过两次查询之间已被删除的 rowid，多取少量兜底。
-        let pool = fused.prefix(min(fused.count, topK * 2))
-        let hydrated = try hydrate(candidates: pool.map { ($0.key, $0.value) },
-                                   sourceFilter: sourceFilter,
-                                   sourceContains: sourceContains,
-                                   limit: topK)
-        return hydrated.map { hit in
-            var copy = hit
-            copy.rrfScore = hit.score
-            copy.vectorScore = vectorScores[hit.rowID]
-            copy.ftsScore = ftsScores[hit.rowID]
-            return copy
+        func run() throws -> [SearchHit] {
+            try reader.readTransaction {
+                _ = try reader.query("SELECT 1 FROM \(Self.chunksTable) LIMIT 1")
+                lock.unlock()
+                unlocked = true
+
+                var ftsCandidates = try self.ftsCandidates(
+                    reader, query: query, limit: candidateCount,
+                    sourceFilter: sourceFilter)
+                var vectorPool = vectorCandidates
+                if let needle = sourceContains?.trimmingCharacters(in: .whitespacesAndNewlines),
+                   !needle.isEmpty {
+                    vectorPool = try self.filterCandidates(reader, vectorPool, contains: needle)
+                    ftsCandidates = try self.filterCandidates(reader, ftsCandidates,
+                                                              contains: needle)
+                }
+                guard !vectorPool.isEmpty || !ftsCandidates.isEmpty else { return [] }
+
+                var rrfScores: [Int64: Double] = [:]
+                var vectorScores: [Int64: Double] = [:]
+                var ftsScores: [Int64: Double] = [:]
+                let k = Double(max(1, rrfK))
+                for (rank, candidate) in vectorPool.enumerated() {
+                    rrfScores[candidate.0, default: 0] += 1.0 / (k + Double(rank + 1))
+                    vectorScores[candidate.0] = candidate.1
+                }
+                for (rank, candidate) in ftsCandidates.enumerated() {
+                    rrfScores[candidate.0, default: 0] += 1.0 / (k + Double(rank + 1))
+                    ftsScores[candidate.0] = candidate.1
+                }
+
+                let fused = rrfScores.sorted { $0.value > $1.value }
+                guard !fused.isEmpty else { return [] }
+                // hydrate 会跳过快照建立前已被删除的 rowid，多取少量兜底。
+                let pool = fused.prefix(min(fused.count, topK * 2))
+                let hydrated = try self.hydrate(
+                    reader, candidates: pool.map { ($0.key, $0.value) },
+                    sourceFilter: sourceFilter,
+                    sourceContains: sourceContains,
+                    limit: topK)
+                return hydrated.map { hit in
+                    var copy = hit
+                    copy.rrfScore = hit.score
+                    copy.vectorScore = vectorScores[hit.rowID]
+                    copy.ftsScore = ftsScores[hit.rowID]
+                    return copy
+                }
+            }
         }
+        guard let seconds else { return try run() }
+        return try reader.withDeadline(seconds: seconds, run)
     }
 
     // MARK: - Documents
