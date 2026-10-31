@@ -401,7 +401,7 @@ git commit -m "perf(rag): window embedding calls across files"
 
 **设计:** 先串行读取/解析全部 spine 章节，判定哪些章节要走 OCR，并按图片数量预分配页号（`recognizeImages` 的 `pages` 恒等于图片路径数）。随后用 `withThrowingTaskGroup` 对有界并发（最多 3 章）执行 OCR；ZIPFoundation 的 `Archive` 仍通过 `NSLock` reader 串行访问，图片解码与归一化在锁外并行。完成后按章节原始顺序组装，页标记与 metadata 不变。
 
-- [ ] **Step 1: 写失败测试与测试替身**
+- [x] **Step 1: 写失败测试与测试替身**
 
 ```swift
 /// 记录跨章节 OCR 的最大并发；每页延迟 30ms 让其他章节有机会进入。
@@ -504,12 +504,12 @@ private func makeMultiChapterScannedEPUB(at url: URL, chapterCount: Int,
 }
 ```
 
-- [ ] **Step 2: 运行并确认 RED**
+- [x] **Step 2: 运行并确认 RED**
 
 Run: `swift test --filter ParserTests/testScannedEPUBOCRunsChaptersConcurrently`
 Expected: FAIL，`maxConcurrent == 1`；`fake.calls` 与 metadata 可能已经正确。
 
-- [ ] **Step 3: 实现串行 reader 与两阶段 OCR**
+- [x] **Step 3: 实现串行 reader 与两阶段 OCR**
 
 ```swift
 /// ZIPFoundation 的 Archive 句柄不能跨线程并发读；OCR 章节并发时用它串行化。
@@ -574,12 +574,12 @@ try await withThrowingTaskGroup(of: (Int, (text: String, pages: Int, recognized:
 
 按 `plans` 原始顺序组装 `chapters` / `headings`：OCR 结果非空则覆盖 `chapter`，否则保留文字层并记录原 warning；标题与大纲逻辑保持原样。
 
-- [ ] **Step 4: 运行确认 GREEN**
+- [x] **Step 4: 运行确认 GREEN**
 
 Run: `swift test --filter ParserTests`
 Expected: 所有 ParserTests 通过，含原有 3 个扫描 EPUB 测试。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add Sources/BaseAgentCore/RAG/Parsers/EPUBParser.swift Tests/BaseAgentCoreTests/ParserTests.swift

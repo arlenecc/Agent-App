@@ -656,6 +656,29 @@ final class ParserTests: XCTestCase {
         XCTAssertEqual(parsed.metadata["scanned_chapters"], "1")
     }
 
+    /// 多章扫描书：各章 OCR 必须跨章并发，不能按 spine 串行等待。
+    /// 页号仍按 spine 顺序预分配，输出页标记不能错乱。
+    func testScannedEPUBOCRunsChaptersConcurrently() throws {
+        let url = directory.appendingPathComponent("multi-scanned.epub")
+        let image = try makePNGData(width: 320, height: 480)
+        try makeMultiChapterScannedEPUB(at: url, chapterCount: 3, imageData: image)
+
+        let fake = ConcurrencyTrackingVLM()
+        let parser = EPUBParser(vlm: fake)
+        let parsed = try awaitSync {
+            try await parser.parse(url: url,
+                                   options: ParserOptions(epubOCREngine: .ovis),
+                                   progress: nil)
+        }
+        XCTAssertEqual(fake.calls, 3)
+        XCTAssertGreaterThanOrEqual(fake.maxConcurrent, 2, "章节 OCR 必须跨章并发")
+        XCTAssertEqual(parsed.metadata["ocr_pages"], "3")
+        XCTAssertEqual(parsed.metadata["scanned_chapters"], "3")
+        for page in 1...3 {
+            XCTAssertTrue(parsed.text.contains("第 \(page) 页"), "页标记必须按 spine 顺序保留：\(parsed.text)")
+        }
+    }
+
     /// 真实失败形态：spine 只有封面和目录页，正文文件都在 manifest 里但没被
     /// spine 引用。旧实现只在 spine 完全为空时回退，结果只抽出书名/目录。
     func testEPUBIncompleteSpineRecoversManifestChapters() throws {
@@ -1641,6 +1664,60 @@ final class ParserTests: XCTestCase {
         })
     }
 
+    /// 多章扫描书：N 个 spine 条目，各 1 张整页图、无文字层。
+    /// 用于验证跨章 OCR 并发与页号顺序。
+    private func makeMultiChapterScannedEPUB(at url: URL, chapterCount: Int,
+                                             imageData: Data) throws {
+        guard let archive = try Archive(url: url, accessMode: .create) else {
+            throw AgentError.parse("无法创建 EPUB 归档")
+        }
+        var manifestItems: [String] = []
+        var spineRefs: [String] = []
+        var files: [(String, String)] = [
+            ("mimetype", "application/epub+zip"),
+            ("META-INF/container.xml", """
+            <?xml version="1.0"?>
+            <container version="1.0" xmlns="urn:oasis:names:tc:opendocument:xmlns:container">
+              <rootfiles><rootfile full-path="OEBPS/content.opf" media-type="application/oebps-package+xml"/></rootfiles>
+            </container>
+            """),
+        ]
+        for i in 0..<chapterCount {
+            manifestItems.append("<item id=\"c\(i)\" href=\"chapter\(i).html\" media-type=\"application/xhtml+xml\"/>")
+            spineRefs.append("<itemref idref=\"c\(i)\"/>")
+            files.append(("OEBPS/chapter\(i).html", """
+            <html xmlns="http://www.w3.org/1999/xhtml"><body><p><img src="images/page\(i).png"/></p></body></html>
+            """))
+        }
+        files.append(("OEBPS/content.opf", """
+        <?xml version="1.0"?>
+        <package xmlns="http://www.idpf.org/2007/opf" version="2.0" unique-identifier="id">
+          <metadata xmlns:dc="http://purl.org/dc/elements/1.1/">
+            <dc:title>Multi Scanned</dc:title><dc:identifier id="id">multi</dc:identifier>
+          </metadata>
+          <manifest>\(manifestItems.joined(separator: "\n"))</manifest>
+          <spine>\(spineRefs.joined(separator: "\n"))</spine>
+        </package>
+        """))
+        for (path, content) in files {
+            let data = Data(content.utf8)
+            try archive.addEntry(with: path, type: .file,
+                                 uncompressedSize: Int64(data.count),
+                                 compressionMethod: path == "mimetype" ? .none : .deflate,
+                                 provider: { position, size in
+                data.subdata(in: Int(position)..<Int(position) + size)
+            })
+        }
+        for i in 0..<chapterCount {
+            try archive.addEntry(with: "OEBPS/images/page\(i).png", type: .file,
+                                 uncompressedSize: Int64(imageData.count),
+                                 compressionMethod: .deflate,
+                                 provider: { position, size in
+                imageData.subdata(in: Int(position)..<Int(position) + size)
+            })
+        }
+    }
+
     /// 转制书形态：单个 spine 条目 = 目录文本 + N 张扫描页图。
     /// 目录文本量超过旧兜底阈值（5000），只能靠整书预采样判定。
     private func makeMonolithicEPUB(at url: URL, imageData: Data,
@@ -1850,6 +1927,31 @@ private final class FakeVLM: VLMService {
         lastImageWidth = image.width
         lastImageHeight = image.height
         return "# Ovis page content\n\nFake VLM output."
+    }
+}
+
+/// 记录跨章节 OCR 的最大并发；每页延迟 30ms 让其他章节有机会进入。
+private final class ConcurrencyTrackingVLM: VLMService, @unchecked Sendable {
+    let identifier = "concurrency-tracking"
+    let isAvailable = true
+    private let lock = NSLock()
+    private var active = 0
+    private var _calls = 0
+    private var _maxConcurrent = 0
+
+    var calls: Int { lock.lock(); defer { lock.unlock() }; return _calls }
+    var maxConcurrent: Int { lock.lock(); defer { lock.unlock() }; return _maxConcurrent }
+
+    func recognize(image: CGImage, prompt: String, maxTokens: Int) async throws -> String {
+        lock.lock()
+        _calls += 1
+        let n = _calls
+        active += 1
+        _maxConcurrent = max(_maxConcurrent, active)
+        lock.unlock()
+        try? await Task.sleep(nanoseconds: 30_000_000)
+        lock.lock(); active -= 1; lock.unlock()
+        return "第 \(n) 页 OCR 正文\n\n这是用于并发测试的模拟识别内容，字符量足够通过清洗阈值。"
     }
 }
 

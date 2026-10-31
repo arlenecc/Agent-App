@@ -56,6 +56,20 @@ enum RAGArchiveReader {
     }
 }
 
+/// ZIPFoundation 的 `Archive` 句柄不能跨线程并发读；多章 OCR 并发时用它
+/// 把归档读取串行化。图片解码与归一化在锁外执行，仍可并行。
+final class SerializedArchiveReader: @unchecked Sendable {
+    private let archive: Archive
+    private let lock = NSLock()
+
+    init(_ archive: Archive) { self.archive = archive }
+
+    func data(path: String) -> Data? {
+        lock.lock(); defer { lock.unlock() }
+        return RAGArchiveReader.data(archive, path: path)
+    }
+}
+
 /// AEXML 辅助：按本地名（忽略命名空间前缀）查找元素/属性。
 enum RAGXMLHelper {
     static func localName(_ name: String) -> String {
@@ -185,6 +199,10 @@ public final class EPUBParser: DocumentParser {
     /// 正常插图周围有成千上万字，远超此线。
     static let scannedCharsPerImage = 150.0
 
+    /// 跨章 OCR 的最大并发章节数。章节再多也只同时压这么多，
+    /// 实际识别并发仍由 VLM 实例池与 Vision 闸门限制。
+    static let maxConcurrentOCRChapters = 3
+
     private let providedVLM: VLMService?
     private let config: AgentConfig?
     private lazy var resolvedVLM: VLMService? = {
@@ -231,6 +249,20 @@ public final class EPUBParser: DocumentParser {
         let level: Int
     }
 
+    /// 单个 spine 条目的解析结果。OCR 延后到第二阶段执行，
+    /// 这里保留文字层、图片列表与预分配的起始页号。
+    private struct ChapterPlan {
+        let index: Int
+        let path: String
+        let markdown: String
+        let documentHeadings: [OutlineEntry]
+        let imagePaths: [String]
+        let isScanned: Bool
+        let startPage: Int
+    }
+
+    private typealias OCROutcome = (text: String, pages: Int, recognized: Int)
+
     public func parse(url: URL,
                       options: ParserOptions,
                       progress: ((ParserProgress) -> Void)?) async throws -> ParsedDocument {
@@ -272,8 +304,7 @@ public final class EPUBParser: DocumentParser {
                                                       tocID: tocID,
                                                       opfPath: opfPath)
 
-        var chapters: [String] = []
-        var headings: [OutlineEntry] = []
+        var plans: [ChapterPlan] = []
         var nextPageNumber = 1
         var scannedChapters = 0
         var ocrPages = 0
@@ -287,6 +318,9 @@ public final class EPUBParser: DocumentParser {
             AgentLog.info("EPUB: 预采样判定为扫描版（图片多、平均每图文字不足 300），含图条目将走 OCR")
         }
 
+        // 第一阶段（串行）：读取并解析全部 spine 条目，判定哪些章要走 OCR，
+        // 同时按图片数预分配页号。页号只依赖图片数，可以在 OCR 前确定，
+        // 因此并发执行 OCR 不会打乱页标记顺序。
         for (index, path) in spinePaths.enumerated() {
             guard let data = RAGArchiveReader.data(archive, path: path), !data.isEmpty else {
                 AgentLog.warning("EPUB: spine 条目无法读取，已跳过：\(path)")
@@ -302,8 +336,6 @@ public final class EPUBParser: DocumentParser {
                 document, removeBoilerplate: false, includeSVGText: true)
             let imagePaths = Self.imagePaths(in: document, chapterPath: path)
 
-            var chapter = markdown
-            var isScannedChapter = false
             // 纯图片页（扫描版 EPUB）：文字层不足时按图片顺序 OCR，
             // 结果用与 PDF 相同的页标记拼接。
             // 扫描页三层判定（阈值统一为「每图分摊 150 有效文字」）：
@@ -314,45 +346,102 @@ public final class EPUBParser: DocumentParser {
             //   单图条目文字 <150 是层 2 的特例（1 × 150），整页插图条目可能被
             //   误 OCR（白识别一次，OCR 空结果时保留原文字层），但保证不漏。
             let effectiveChars = DocumentCleaner.effectiveCharacterCount(markdown)
-            if !imagePaths.isEmpty,
-               scannedBook
-                   || Double(effectiveChars) / Double(imagePaths.count)
-                       < Self.scannedCharsPerImage {
-                isScannedChapter = true
-                let ocr = try await recognizeImages(imagePaths, archive: archive,
-                                                    options: options,
-                                                    startingPage: nextPageNumber)
+            let isScannedChapter = !imagePaths.isEmpty
+                && (scannedBook
+                    || Double(effectiveChars) / Double(imagePaths.count)
+                        < Self.scannedCharsPerImage)
+            let startPage = nextPageNumber
+            if isScannedChapter {
                 scannedChapters += 1
-                ocrPages += ocr.pages
-                nextPageNumber += ocr.pages
+                ocrPages += imagePaths.count
+                nextPageNumber += imagePaths.count
+            }
+
+            plans.append(ChapterPlan(index: index,
+                                     path: path,
+                                     markdown: markdown,
+                                     documentHeadings: documentHeadings,
+                                     imagePaths: imagePaths,
+                                     isScanned: isScannedChapter,
+                                     startPage: startPage))
+        }
+
+        // 第二阶段（有界并发）：跨章同时执行 OCR。单章内部仍按批并发，
+        // 章节级并发让「每章一页」的扫描书不再逐页串行等待。归档读取
+        // 由 SerializedArchiveReader 串行化。
+        var ocrResults: [Int: OCROutcome] = [:]
+        let scannedPlans = plans.filter(\.isScanned)
+        if !scannedPlans.isEmpty {
+            let ocrService = try ocrVLMService(options: options)
+            let reader = SerializedArchiveReader(archive)
+            let limit = min(Self.maxConcurrentOCRChapters, scannedPlans.count)
+            try await withThrowingTaskGroup(of: (Int, OCROutcome).self) { group in
+                var pending = scannedPlans.makeIterator()
+                var running = 0
+                while running < limit, let plan = pending.next() {
+                    running += 1
+                    let imagePaths = plan.imagePaths
+                    let index = plan.index
+                    let startPage = plan.startPage
+                    group.addTask {
+                        let result = try await Self.recognizeImages(
+                            imagePaths, reader: reader, vlm: ocrService,
+                            options: options, startingPage: startPage)
+                        return (index, result)
+                    }
+                }
+                while let (index, result) = try await group.next() {
+                    ocrResults[index] = result
+                    if let plan = pending.next() {
+                        let imagePaths = plan.imagePaths
+                        let planIndex = plan.index
+                        let startPage = plan.startPage
+                        group.addTask {
+                            let result = try await Self.recognizeImages(
+                                imagePaths, reader: reader, vlm: ocrService,
+                                options: options, startingPage: startPage)
+                            return (planIndex, result)
+                        }
+                    }
+                }
+            }
+        }
+
+        // 第三阶段：按 spine 原始顺序组装章节与大纲。
+        var chapters: [String] = []
+        var headings: [OutlineEntry] = []
+        for plan in plans {
+            var chapter = plan.markdown
+            if plan.isScanned, let ocr = ocrResults[plan.index] {
                 if !ocr.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                     chapter = ocr.text
-                } else if !markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                    AgentLog.warning("EPUB: 第 \(index + 1) 章 OCR 无结果，保留原文字层")
+                } else if !plan.markdown.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    AgentLog.warning("EPUB: 第 \(plan.index + 1) 章 OCR 无结果，保留原文字层")
                 }
             }
 
             guard !chapter.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { continue }
 
-            let tocTitle = navigation.first(where: { $0.path == path })?.title
+            let tocTitle = navigation.first(where: { $0.path == plan.path })?.title
                 ?? navigation.first(where: {
-                    ($0.path as NSString).lastPathComponent == (path as NSString).lastPathComponent
+                    ($0.path as NSString).lastPathComponent
+                        == (plan.path as NSString).lastPathComponent
                 })?.title
             // 扫描页常常是「每个 spine 项一页」；没有真实 TOC/标题时
             // 不要为每页合成「第 N 节」标题，否则大纲会被几百个条目撑爆。
-            let explicitTitle = tocTitle ?? documentHeadings.first?.title
-            let chapterTitle = explicitTitle ?? "第 \(index + 1) 节"
+            let explicitTitle = tocTitle ?? plan.documentHeadings.first?.title
+            let chapterTitle = explicitTitle ?? "第 \(plan.index + 1) 节"
 
             // 章节标题转 Markdown 标题；已有标题时保持原结构。
             if MarkdownOutline.scan(chapter).isEmpty,
-               !isScannedChapter || explicitTitle != nil {
+               !plan.isScanned || explicitTitle != nil {
                 chapter = "## \(chapterTitle)\n\n" + chapter
             }
             chapters.append(chapter)
 
             let scanned = MarkdownOutline.scan(chapter)
             if scanned.isEmpty {
-                if !isScannedChapter || explicitTitle != nil {
+                if !plan.isScanned || explicitTitle != nil {
                     headings.append(OutlineEntry(level: 2, title: chapterTitle))
                 }
             } else {
@@ -729,25 +818,37 @@ public final class EPUBParser: DocumentParser {
         return result
     }
 
+    /// 解析扫描章所需的 OCR 后端；不可用时立即失败。
+    /// 在多章并发 OCR 前统一解析一次，避免每个任务重复判断。
+    private func ocrVLMService(options: ParserOptions) throws -> VLMService? {
+        guard options.epubOCREngine == .ovis || options.epubOCREngine == .custom else {
+            return nil
+        }
+        guard let service = vlm, service.isAvailable else {
+            throw AgentError.parse(
+                "扫描版 EPUB 需要 OCR 视觉模型，但视觉模型不可用（未配置本地 VLM）")
+        }
+        return service
+    }
+
     /// 对一章内的图片逐页 OCR；返回带页标记的 Markdown 与页数。
     ///
     /// 两条后端路径都先做统一归一化（缩放/灰度/对比度/锐化/可选二值化）：
     /// - `.vision`：每批最多 8 页并发调用 Apple Vision，全局受闸门限制；
     /// - `.ovis` / `.custom`：借 OCR VLM 实例池并发识别（多实例 2 路，单实例池内仍串行）。
-    private func recognizeImages(_ paths: [String],
-                                 archive: Archive,
-                                 options: ParserOptions,
-                                 startingPage: Int)
-        async throws -> (text: String, pages: Int, recognized: Int) {
+    ///
+    /// 多章并发时归档句柄由 `SerializedArchiveReader` 串行化，
+    /// 图片解码与归一化在锁外并行。
+    private static func recognizeImages(_ paths: [String],
+                                        reader: SerializedArchiveReader,
+                                        vlm: VLMService?,
+                                        options: ParserOptions,
+                                        startingPage: Int) async throws -> OCROutcome {
         guard !paths.isEmpty else { return ("", 0, 0) }
 
         let ovis: VLMService?
         if options.epubOCREngine == .ovis || options.epubOCREngine == .custom {
-            guard let service = vlm, service.isAvailable else {
-                throw AgentError.parse(
-                    "扫描版 EPUB 需要 OCR 视觉模型，但视觉模型不可用（未配置本地 VLM）")
-            }
-            ovis = service
+            ovis = vlm
         } else {
             ovis = nil
         }
@@ -763,11 +864,11 @@ public final class EPUBParser: DocumentParser {
             let end = min(cursor + batchSize, paths.count)
             let batch = Array(paths[cursor..<end])
 
-            // 图片解码按批串行执行，避免多个线程同时读同一个 ZIP 句柄。
+            // 图片读取串行（同一个 ZIP 句柄），解码在锁外执行。
             var images: [PDFPageImage] = []
             images.reserveCapacity(batch.count)
             for (offset, relativePath) in batch.enumerated() {
-                guard let data = RAGArchiveReader.data(archive, path: relativePath),
+                guard let data = reader.data(path: relativePath),
                       let image = Self.decodeImage(data) else {
                     AgentLog.warning("EPUB: 无法解码图片 \(relativePath)，已跳过")
                     continue
@@ -813,7 +914,7 @@ public final class EPUBParser: DocumentParser {
                         return results
                     }
                 } else {
-                    texts = try await visionBatch(images, options: options)
+                    texts = try await Self.visionBatch(images, options: options)
                 }
 
                 for (pageNumber, text) in texts.sorted(by: { $0.0 < $1.0 }) {
@@ -834,8 +935,8 @@ public final class EPUBParser: DocumentParser {
                 page - startingPage, recognized)
     }
 
-    private func visionBatch(_ images: [PDFPageImage],
-                             options: ParserOptions) async throws -> [(Int, String)] {
+    private static func visionBatch(_ images: [PDFPageImage],
+                                    options: ParserOptions) async throws -> [(Int, String)] {
         // 复用 PDF 的 Vision 批处理：统一归一化、全局并发闸门与取消传播。
         try await VisionPDFParser.recognizeBatch(
             images,
