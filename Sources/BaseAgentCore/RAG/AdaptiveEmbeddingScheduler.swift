@@ -188,6 +188,10 @@ public final class AdaptiveEmbeddingScheduler: EmbeddingProvider, EmbeddingToken
         public var initialTokenBudget: Int
         /// 每轮上探/下探的 token 预算步进（默认 512）。
         public var tokenBudgetStep: Int
+        /// 单次 embedDocuments 调用内，每隔多少条文本释放一次全局信号量。
+        /// 窗口之间的让出让多个文件交替获得模型时间，避免先到的长文件
+        /// 独占模型直到全部切片完成。默认 32，最小 1。
+        public var windowTexts: Int
 
         public init(minBatchSize: Int = 2,
                     maxBatchSize: Int = 32,
@@ -200,7 +204,8 @@ public final class AdaptiveEmbeddingScheduler: EmbeddingProvider, EmbeddingToken
                     tokenBudgetMin: Int = 4_096,
                     tokenBudgetMax: Int = 8_192,
                     initialTokenBudget: Int = 6_144,
-                    tokenBudgetStep: Int = 512) {
+                    tokenBudgetStep: Int = 512,
+                    windowTexts: Int = 32) {
             let normalizedMin = max(1, minBatchSize)
             let normalizedMax = max(normalizedMin, maxBatchSize)
             self.minBatchSize = normalizedMin
@@ -218,6 +223,7 @@ public final class AdaptiveEmbeddingScheduler: EmbeddingProvider, EmbeddingToken
             self.initialTokenBudget = min(max(normalizedBudgetMin, initialTokenBudget),
                                           normalizedBudgetMax)
             self.tokenBudgetStep = max(128, tokenBudgetStep)
+            self.windowTexts = max(1, windowTexts)
         }
     }
 
@@ -324,18 +330,57 @@ public final class AdaptiveEmbeddingScheduler: EmbeddingProvider, EmbeddingToken
         try await embedDocuments(texts, progress: nil)
     }
 
-    /// 用于流水线内的长文档：按 token 预算组批，每完成一个子批回调一次进度。
+    /// 用于流水线内的长文档：按窗口分批获取模型，窗口之间让出信号量。
     ///
-    /// 先按长度降序排列，贪心装入「条数上限 + token 预算」双约束的子批；
-    /// 当前批装不下的切片跳过并留给下一批，继续用更短的切片填满预算，
-    /// 减少 padding 浪费。向量按原始下标写回，顺序与输入一致。长切片由
-    /// token 预算决定批大小，短切片由条数上限决定。
+    /// 一次调用可能包含整个文档的切片。若全程持有信号量，先到的长文档会
+    /// 独占模型直到自己全部完成，其他文件只能等待，整体完成时间被最长的
+    /// 单文件绑定。按 `options.windowTexts` 切窗口后，每个窗口单独申请许可，
+    /// 窗口之间 `Task.yield()`，公平信号量会把模型让给其他等待的文件。
+    /// 输出仍按原始下标顺序拼接，进度回调按整次调用的条数推进。
     public func embedDocuments(
         _ texts: [String],
         progress: ((Int, Int) -> Void)?
     ) async throws -> [[Float]] {
         guard !texts.isEmpty else { return [] }
-        return try await semaphore.withPermit {
+        let window = max(1, options.windowTexts)
+        guard texts.count > window else {
+            return try await embedWindow(texts, progress: progress, total: texts.count)
+        }
+
+        var result: [[Float]] = []
+        result.reserveCapacity(texts.count)
+        var processed = 0
+        var start = 0
+        while start < texts.count {
+            if Task.isCancelled { throw AgentError.cancelled }
+            let end = min(start + window, texts.count)
+            let slice = Array(texts[start..<end])
+            let completed = processed
+            let vectors = try await embedWindow(
+                slice,
+                progress: { done, _ in progress?(completed + done, texts.count) },
+                total: texts.count)
+            result.append(contentsOf: vectors)
+            processed += slice.count
+            start = end
+            await Task.yield()
+        }
+        return result
+    }
+
+    /// 单个窗口内的组批与执行。调用方负责按窗口切分，这里只在窗口期间
+    /// 持有信号量，因此其他文件可以在窗口之间获得模型时间。
+    ///
+    /// 先按长度降序排列，贪心装入「条数上限 + token 预算」双约束的子批；
+    /// 当前批装不下的切片跳过并留给下一批，继续用更短的切片填满预算，
+    /// 减少 padding 浪费。向量按原始下标写回，顺序与输入一致。长切片由
+    /// token 预算决定批大小，短切片由条数上限决定。
+    private func embedWindow(
+        _ texts: [String],
+        progress: ((Int, Int) -> Void)?,
+        total: Int
+    ) async throws -> [[Float]] {
+        try await semaphore.withPermit {
             let counter: @Sendable (String) -> Int
             if let provider = base as? EmbeddingTokenCounting,
                let exact = await provider.makeTokenCounter() {
@@ -394,7 +439,7 @@ public final class AdaptiveEmbeddingScheduler: EmbeddingProvider, EmbeddingToken
                     result[index] = vectors[offset]
                 }
                 record(texts: batch.count, tokens: tokens, seconds: seconds)
-                progress?(processed, texts.count)
+                progress?(processed, total)
             }
             return result
         }

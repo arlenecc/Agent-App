@@ -40,6 +40,27 @@ final class EmbeddingSchedulerTests: XCTestCase {
         }
     }
 
+    /// 记录底层实际收到的文本顺序，用于验证跨文件窗口交错。
+    private final class OrderedRecordingEmbedding: EmbeddingProvider, @unchecked Sendable {
+        let identifier = "ordered"
+        let dimension = 1
+        private let lock = NSLock()
+        private(set) var texts: [String] = []
+        private let delay: UInt64
+
+        init(delayNanoseconds: UInt64) { self.delay = delayNanoseconds }
+
+        func embedDocuments(_ texts: [String]) async throws -> [[Float]] {
+            lock.lock()
+            self.texts.append(contentsOf: texts)
+            lock.unlock()
+            try? await Task.sleep(nanoseconds: delay)
+            return texts.map { _ in [0] }
+        }
+
+        func embedQuery(_ text: String) async throws -> [Float] { [0] }
+    }
+
     private final class CountingEmbedding: EmbeddingProvider, EmbeddingTokenCounting, @unchecked Sendable {
         let identifier = "counting"
         let dimension = 1
@@ -177,6 +198,57 @@ final class EmbeddingSchedulerTests: XCTestCase {
         XCTAssertTrue(base.batchSizes.allSatisfy { $0 >= 2 && $0 <= 64 },
                       "\(base.batchSizes)")
         XCTAssertEqual(base.batchSizes.reduce(0, +), texts.count)
+    }
+
+    /// 两个文件同时 embed 时，窗口之间必须让出信号量：
+    /// 单个文件不能凭「先到先得」连续占满前几个窗口直到全部切片完成。
+    func testSchedulerInterleavesFilesAcrossWindows() async throws {
+        let base = OrderedRecordingEmbedding(delayNanoseconds: 30_000_000)
+        let scheduler = AdaptiveEmbeddingScheduler(
+            base: base,
+            options: .init(minBatchSize: 1, maxBatchSize: 1,
+                           initialBatchSize: 1, step: 1,
+                           probeBatches: 16, probeSeconds: 30,
+                           windowTexts: 1),
+            log: { _ in })
+        async let first = scheduler.embedDocuments(["a0", "a1", "a2"])
+        async let second = scheduler.embedDocuments(["b0", "b1", "b2"])
+        _ = try await (first, second)
+
+        let prefix = Array(base.texts.prefix(4))
+        XCTAssertTrue(prefix.contains { $0.hasPrefix("a") }, "\(prefix)")
+        XCTAssertTrue(prefix.contains { $0.hasPrefix("b") }, "\(prefix)")
+        var run = 1
+        var maxRun = 1
+        for i in 1..<prefix.count {
+            let sameFile = prefix[i].prefix(1) == prefix[i - 1].prefix(1)
+            run = sameFile ? run + 1 : 1
+            maxRun = max(maxRun, run)
+        }
+        XCTAssertLessThanOrEqual(maxRun, 2,
+                                 "单个文件不应连续占用多个窗口：\(prefix)")
+    }
+
+    /// 窗口切分后输出顺序与进度回调仍按整次调用的原始下标推进。
+    func testSchedulerWindowsPreserveOrderAndProgress() async throws {
+        let base = TokenBudgetRecordingEmbedding()
+        let scheduler = AdaptiveEmbeddingScheduler(
+            base: base,
+            options: .init(minBatchSize: 1, maxBatchSize: 16,
+                           initialBatchSize: 16, step: 1,
+                           probeBatches: 16, probeSeconds: 30,
+                           tokenBudgetMin: 4_096, tokenBudgetMax: 4_096,
+                           initialTokenBudget: 4_096, tokenBudgetStep: 128,
+                           windowTexts: 2),
+            log: { _ in })
+        let texts = ["a", "bb", "ccc", "dddd", "eeeee"]
+        var progress: [(Int, Int)] = []
+        let vectors = try await scheduler.embedDocuments(texts) { done, total in
+            progress.append((done, total))
+        }
+        XCTAssertEqual(vectors.compactMap { $0.first.map(Int.init) }, [1, 2, 3, 4, 5])
+        XCTAssertEqual(progress.map(\.0), [2, 4, 5])
+        XCTAssertTrue(progress.allSatisfy { $0.1 == texts.count })
     }
 
     func testSchedulerSerializesConcurrentCalls() async throws {

@@ -34,7 +34,7 @@
 
 **设计:** `manifest.json` 保留为压实后的基线；每次 `merge` 只向 `manifest.json.journal` 追加一行 JSON 记录（`updated` + `removed`）。`load()` 先读基线，再按行回放；尾部半行解析失败直接忽略。压实时在一个 `flock` 内重写基线并删除 journal，写基线先于删 journal，保证中途读取只会重复回放（幂等）。journal 超过 512KB 时在 `merge` 内自动压实。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```swift
 import XCTest
@@ -118,12 +118,12 @@ final class ManifestStoreTests: XCTestCase {
 }
 ```
 
-- [ ] **Step 2: 运行并确认 RED**
+- [x] **Step 2: 运行并确认 RED**
 
 Run: `swift test --filter ManifestStoreTests`
 Expected: `ManifestStoreTests` 编译通过但 `testCompactWritesBaseAndRemovesJournal` 等因 `compact()` 不存在而失败；至少 `testMergeAppendsJournalAndLoadReplays` 应因未生成 journal 失败。
 
-- [ ] **Step 3: 最小实现**
+- [x] **Step 3: 最小实现**
 
 ```swift
 private struct RAGManifestJournalRecord: Codable {
@@ -237,12 +237,12 @@ final class ManifestStore: @unchecked Sendable {
 }
 ```
 
-- [ ] **Step 4: 运行确认 GREEN**
+- [x] **Step 4: 运行确认 GREEN**
 
 Run: `swift test --filter ManifestStoreTests`
 Expected: 5 tests passed。
 
-- [ ] **Step 5: 同步结束压实**
+- [x] **Step 5: 同步结束压实**
 
 在 `RAGEngine.swift` 的 worker 结束后（`manifestStore.merge(updated: [:], removed: removedKeys)` 之后）调用：
 
@@ -253,7 +253,7 @@ manifestStore.compact()
 Run: `swift test --filter 'ManifestStoreTests|RAGEngineTests'`
 Expected: all passed。
 
-- [ ] **Step 6: 提交**
+- [x] **Step 6: 提交**
 
 ```bash
 git add Sources/BaseAgentCore/RAG/RAGEngine.swift Tests/BaseAgentCoreTests/ManifestStoreTests.swift
@@ -271,7 +271,7 @@ git commit -m "perf(rag): journal manifest writes"
 
 **设计:** 新增 `Options.windowTexts`（默认 32，最小 1）。`embedDocuments` 将输入切成窗口，每个窗口单独 `semaphore.withPermit`；窗口之间 `await Task.yield()`。这样公平信号量会把模型时间让给其他文件，输出仍是原始顺序，token 预算与自适应批大小逻辑不变。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```swift
 private final class OrderedRecordingEmbedding: EmbeddingProvider, @unchecked Sendable {
@@ -318,12 +318,12 @@ func testSchedulerInterleavesFilesAcrossWindows() async throws {
 }
 ```
 
-- [ ] **Step 2: 运行并确认 RED**
+- [x] **Step 2: 运行并确认 RED**
 
 Run: `swift test --filter EmbeddingSchedulerTests`
 Expected: 编译失败（`windowTexts` / 窗口化尚未实现）。
 
-- [ ] **Step 3: 最小实现**
+- [x] **Step 3: 最小实现**
 
 `Options` 增加：
 
@@ -377,12 +377,12 @@ private func embedWindow(_ texts: [String],
 
 注意：`embedWindow` 内部的 `progress?(processed, total)` 需替换原 `texts.count`。
 
-- [ ] **Step 4: 运行确认 GREEN**
+- [x] **Step 4: 运行确认 GREEN**
 
 Run: `swift test --filter EmbeddingSchedulerTests`
 Expected: 全部通过，`testSchedulerSerializesConcurrentCalls` 仍为 `maxConcurrent == 1`。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add Sources/BaseAgentCore/RAG/AdaptiveEmbeddingScheduler.swift Tests/BaseAgentCoreTests/EmbeddingSchedulerTests.swift
