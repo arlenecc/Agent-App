@@ -6,7 +6,7 @@ let package = Package(
     platforms: [.macOS(.v14)],
     products: [
         .library(name: "BaseAgentCore", targets: ["BaseAgentCore"]),
-        .executable(name: "BaseAgent", targets: ["BaseAgentApp"]),
+        .executable(name: "Lightning-RAG", targets: ["BaseAgentApp"]),
     ],
     dependencies: [
         // Tokenizer：swift-transformers 的 Tokenizers 模块

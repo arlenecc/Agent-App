@@ -20,7 +20,7 @@ final class RerankerDiagnosticTests: XCTestCase {
                 .deletingLastPathComponent()
                 .deletingLastPathComponent()
                 .deletingLastPathComponent()
-                .appendingPathComponent("dist/BaseAgent.app/Contents/Resources/models")
+                .appendingPathComponent("dist/Lightning-RAG.app/Contents/Resources/models")
                 .path
         let directory = URL(fileURLWithPath: env, isDirectory: true)
             .appendingPathComponent("jina-reranker-v2-base-multilingual-onnx")
@@ -98,7 +98,7 @@ final class RerankerDiagnosticTests: XCTestCase {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
-            .appendingPathComponent("dist/BaseAgent.app/Contents/Resources/models")
+            .appendingPathComponent("dist/Lightning-RAG.app/Contents/Resources/models")
             .appendingPathComponent("jina-reranker-v2-base-multilingual-onnx")
         let targets = EmbeddingBenchmarkTests.targets
 
@@ -140,7 +140,7 @@ final class RerankerDiagnosticTests: XCTestCase {
             .deletingLastPathComponent()
             .deletingLastPathComponent()
             .deletingLastPathComponent()
-            .appendingPathComponent("dist/BaseAgent.app/Contents/Resources/models")
+            .appendingPathComponent("dist/Lightning-RAG.app/Contents/Resources/models")
             .appendingPathComponent("jina-reranker-v2-base-multilingual-onnx")
         let tokenizer = try await LocalTokenizer.load(directory: directory)
         let session = try OrtSession(

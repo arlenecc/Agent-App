@@ -1,16 +1,18 @@
 #!/bin/bash
-# 把 SwiftPM 产物打包成可分发的 BaseAgent.app。
+# 把 SwiftPM 产物打包成可分发的 Lightning-RAG.app。
 #
 # 用法：scripts/package-app.sh [debug|release]（默认 release）
-# 产物：dist/BaseAgent.app（含 App 图标、资源 bundle 与 llama/onnxruntime 框架）
+# 版本：VERSION 环境变量可覆盖，默认 1.2.5
+# 产物：dist/Lightning-RAG.app（含 App 图标、资源 bundle 与 llama/onnxruntime 框架）
 set -euo pipefail
 
 CONFIG="${1:-release}"
+VERSION="${VERSION:-1.2.5}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 PRODUCTS="$ROOT/.build/out/Products/$([[ "$CONFIG" == "release" ]] && echo Release || echo Debug)"
-BINARY="$PRODUCTS/BaseAgent"
+BINARY="$PRODUCTS/Lightning-RAG"
 DIST="$ROOT/dist"
-APP="$DIST/BaseAgent.app"
+APP="$DIST/Lightning-RAG.app"
 
 if [[ ! -x "$BINARY" ]]; then
   echo "未找到可执行文件：$BINARY（先运行 swift build -c $CONFIG --disable-sandbox）" >&2
@@ -20,7 +22,7 @@ fi
 rm -rf "$APP"
 mkdir -p "$APP/Contents/MacOS" "$APP/Contents/Resources" "$APP/Contents/Frameworks"
 
-cp "$BINARY" "$APP/Contents/MacOS/BaseAgent"
+cp "$BINARY" "$APP/Contents/MacOS/Lightning-RAG"
 
 # SwiftPM 资源 bundle：Bundle.module 会依次查找 Bundle.main.resourceURL
 # （即 Contents/Resources）与 Bundle.main.bundleURL，因此放在 Resources 下。
@@ -78,19 +80,19 @@ if [[ -f "$ROOT/BaseAgent.icns" ]]; then
   cp "$ROOT/BaseAgent.icns" "$APP/Contents/Resources/AppIcon.icns"
 fi
 
-cat > "$APP/Contents/Info.plist" <<'PLIST'
+cat > "$APP/Contents/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-  <key>CFBundleName</key><string>BaseAgent</string>
-  <key>CFBundleDisplayName</key><string>BaseAgent</string>
-  <key>CFBundleExecutable</key><string>BaseAgent</string>
+  <key>CFBundleName</key><string>Lightning-RAG</string>
+  <key>CFBundleDisplayName</key><string>Lightning-RAG</string>
+  <key>CFBundleExecutable</key><string>Lightning-RAG</string>
   <key>CFBundleIdentifier</key><string>com.baseagent.desktop</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>
-  <key>CFBundleShortVersionString</key><string>1.0</string>
-  <key>CFBundleVersion</key><string>1</string>
+  <key>CFBundleShortVersionString</key><string>${VERSION}</string>
+  <key>CFBundleVersion</key><string>${VERSION}</string>
   <key>LSMinimumSystemVersion</key><string>14.0</string>
   <key>NSHighResolutionCapable</key><true/>
   <key>NSPrincipalClass</key><string>NSApplication</string>
@@ -100,7 +102,7 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 PLIST
 
 # 依赖的框架通过 @rpath 解析：可执行文件与框架都在包内。
-install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP/Contents/MacOS/BaseAgent" 2>/dev/null || true
+install_name_tool -add_rpath "@executable_path/../Frameworks" "$APP/Contents/MacOS/Lightning-RAG" 2>/dev/null || true
 
 # 本地运行需要放宽沙箱（模型/知识库位于外部卷），如要上架需替换为正式签名。
 codesign --force --deep --sign - "$APP" 2>&1 | tail -2

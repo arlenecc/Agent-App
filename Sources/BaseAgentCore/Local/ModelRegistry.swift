@@ -89,7 +89,7 @@ public enum LocalModelRegistry {
 
     /// 应用所在目录下的 `models` 目录。
     ///
-    /// 打包后从 `BaseAgent.app` 所在目录向上查找（如 `dist/BaseAgent.app` →
+    /// 打包后从 `Lightning-RAG.app` 所在目录向上查找（如 `dist/Lightning-RAG.app` →
     /// `dist/models`，再向上到项目根的 `models`）；裸可执行文件从可执行文件
     /// 所在目录向上查找。`BASE_AGENT_MODELS_DIR` 可显式覆盖模型根目录。
     public static func applicationModelsDirectory() -> URL? {

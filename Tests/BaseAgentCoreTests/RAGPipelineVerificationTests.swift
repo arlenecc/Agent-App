@@ -33,7 +33,7 @@ final class RAGPipelineVerificationTests: XCTestCase {
 
     func testBundledModelsFullPipeline() async throws {
         // 仓库 models/ 优先；发布回归时用 EMBED_BENCH_MODELS_DIR 指向
-        // `dist/BaseAgent.app/Contents/Resources/models`。
+        // `dist/Lightning-RAG.app/Contents/Resources/models`。
         let modelsRoot = EmbeddingBenchmarkTests.resolveModelsRoot()
         let embeddingDir = modelsRoot.appendingPathComponent(modelName, isDirectory: true)
         let rerankerDir = modelsRoot.appendingPathComponent(rerankerName, isDirectory: true)
