@@ -852,7 +852,7 @@ git commit -m "perf(rag): use WAL read snapshots for search"
 
 **设计:** 新增线程安全的 `RegexCache`，按 `pattern + options` 缓存 `NSRegularExpression`。`DocumentOutline` 的标题规则与代码围栏规则都走缓存；输出行为不变。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 ```swift
 import XCTest
@@ -880,12 +880,12 @@ final class RegexCacheTests: XCTestCase {
 }
 ```
 
-- [ ] **Step 2: 运行并确认 RED**
+- [x] **Step 2: 运行并确认 RED**
 
 Run: `swift test --filter RegexCacheTests`
 Expected: 编译失败（`RegexCache` 不存在）。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 ```swift
 import Foundation
@@ -934,12 +934,12 @@ for (pattern, options, handler) in headingPatterns {
 
 `extract` 与 `codeFenceRanges` 同样改用 `RegexCache.shared.regex`。
 
-- [ ] **Step 4: 运行确认 GREEN**
+- [x] **Step 4: 运行确认 GREEN**
 
 Run: `swift test --filter 'RegexCacheTests|OutlineTests|ChunkingTests|ParserTests'`
 Expected: all passed。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add Sources/BaseAgentCore/RAG/Chunking/RegexCache.swift \

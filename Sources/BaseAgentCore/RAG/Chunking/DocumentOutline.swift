@@ -113,7 +113,7 @@ public enum DocumentOutline {
         guard !isPageHeaderLine(line) else { return nil }
         let s = line as NSString
         for (pattern, options, handler) in headingPatterns {
-            guard let regex = try? NSRegularExpression(pattern: pattern, options: options),
+            guard let regex = RegexCache.shared.regex(pattern, options: options),
                   let match = regex.firstMatch(in: line, options: [],
                                                range: NSRange(location: 0, length: s.length)),
                   let parsed = handler(match, s) else { continue }
@@ -132,7 +132,7 @@ public enum DocumentOutline {
 
         let patterns = usesExplicitHeadings(source) ? explicitHeadingPatterns : headingPatterns
         for (pattern, options, handler) in patterns {
-            guard let regex = try? NSRegularExpression(pattern: pattern, options: options) else { continue }
+            guard let regex = RegexCache.shared.regex(pattern, options: options) else { continue }
             regex.enumerateMatches(in: text, options: [], range: NSRange(location: 0, length: length)) { match, _, _ in
                 guard let match, let parsed = handler(match, ns) else { return }
                 if fencedRanges.contains(where: { NSLocationInRange(match.range.location, $0) }) {
@@ -232,7 +232,7 @@ public enum DocumentOutline {
     /// Markdown 代码围栏范围（``` 与 ~~~），用于排除围栏内的伪标题。
     private static func codeFenceRanges(_ text: String) -> [NSRange] {
         let pattern = "(?m)^[ \\t]*(?:```|~~~)[^\\n]*\\n[\\s\\S]*?^[ \\t]*(?:```|~~~)[ \\t]*$"
-        guard let regex = try? NSRegularExpression(pattern: pattern) else { return [] }
+        guard let regex = RegexCache.shared.regex(pattern) else { return [] }
         let full = NSRange(location: 0, length: (text as NSString).length)
         return regex.matches(in: text, options: [], range: full).map(\.range)
     }
