@@ -83,9 +83,27 @@ struct RAGManifest: Codable, Sendable {
     var files: [String: RAGManifestEntry] = [:]
 }
 
-/// manifest 的原子读改写，避免并发 ingest 互相覆盖。
+/// journal 中的一条增量记录：只包含本次 merge 触达的条目。
+private struct RAGManifestJournalRecord: Codable {
+    var updated: [String: RAGManifestEntry] = [:]
+    var removed: [String] = []
+}
+
+/// manifest 的增量写入。
+///
+/// 每次 merge 只向 `.journal` 追加一行 JSON（updated + removed），避免
+/// N 个文件每次都重写完整 manifest 形成 O(N²) 的编解码与写盘。加载时先读
+/// 压实后的基线 `manifest.json`，再按行回放 journal；尾部半行（崩溃中断）
+/// 解析失败直接忽略。
+///
+/// 压实（compact）在 flock 内重写基线后删除 journal。写基线先于删 journal，
+/// 中途读取最多重复回放一次增量记录（set/remove 幂等），不会读到缺数据的
+/// 中间态。跨进程仍由 `.lock` 文件串行化。
 final class ManifestStore: @unchecked Sendable {
     let path: String
+    private var journalPath: String { path + ".journal" }
+    /// journal 超过该体积时在 merge 内自动压实，避免无限增长。
+    private static let compactThresholdBytes = 512 * 1024
     private let lock = NSRecursiveLock()
 
     init(path: String) { self.path = path }
@@ -96,6 +114,14 @@ final class ManifestStore: @unchecked Sendable {
     }
 
     private func loadUnlocked() -> [String: RAGManifestEntry] {
+        var files = loadBaseUnlocked()
+        for record in journalRecordsUnlocked() {
+            apply(record, to: &files)
+        }
+        return files
+    }
+
+    private func loadBaseUnlocked() -> [String: RAGManifestEntry] {
         guard let data = FileManager.default.contents(atPath: path),
               let manifest = try? JSONDecoder().decode(RAGManifest.self, from: data) else {
             return [:]
@@ -103,18 +129,82 @@ final class ManifestStore: @unchecked Sendable {
         return manifest.files
     }
 
+    private func journalRecordsUnlocked() -> [RAGManifestJournalRecord] {
+        guard let data = FileManager.default.contents(atPath: journalPath) else { return [] }
+        let decoder = JSONDecoder()
+        return data.split(separator: 0x0A).compactMap { line -> RAGManifestJournalRecord? in
+            try? decoder.decode(RAGManifestJournalRecord.self, from: Data(line))
+        }
+    }
+
+    private func apply(_ record: RAGManifestJournalRecord,
+                       to files: inout [String: RAGManifestEntry]) {
+        for key in record.removed { files.removeValue(forKey: key) }
+        for (key, value) in record.updated { files[key] = value }
+    }
+
     /// 合并写入：只覆盖/删除本次触达的条目，保留其它实例写入的记录。
-    /// 使用独立 `.lock` 文件的 flock 做跨进程串行化，manifest 本身仍原子替换。
+    /// 增量记录追加到 journal；journal 过大时在同一次 flock 内压实。
     func merge(updated: [String: RAGManifestEntry], removed: Set<String>) {
+        guard !updated.isEmpty || !removed.isEmpty else { return }
         lock.lock(); defer { lock.unlock() }
         withFileLock {
-            var files = loadUnlocked()
-            for key in removed { files.removeValue(forKey: key) }
-            for (key, value) in updated { files[key] = value }
-            let manifest = RAGManifest(files: files)
-            if let data = try? JSONEncoder().encode(manifest) {
-                try? AtomicFile.write(data, to: path)
+            appendJournalLocked(updated: updated, removed: removed)
+            if journalSizeUnlocked() > Self.compactThresholdBytes {
+                compactLocked()
             }
+        }
+    }
+
+    private func appendJournalLocked(updated: [String: RAGManifestEntry],
+                                     removed: Set<String>) {
+        let record = RAGManifestJournalRecord(
+            updated: updated,
+            removed: Array(removed).sorted())
+        guard let data = try? JSONEncoder().encode(record) else { return }
+
+        // 记录前置换行：上次崩溃留下的半行会成为独立坏行被跳过，
+        // 不会和后续追加的记录拼接成一条无法解析的长行。
+        var payload = Data("\n".utf8)
+        payload.append(data)
+
+        let fd = open(journalPath, O_CREAT | O_WRONLY | O_APPEND, 0o644)
+        guard fd >= 0 else {
+            // 无法打开 journal（磁盘/权限异常）时退回完整重写，保证不丢更新。
+            var files = loadUnlocked()
+            apply(record, to: &files)
+            writeBaseLocked(files)
+            return
+        }
+        payload.withUnsafeBytes { raw in
+            _ = Darwin.write(fd, raw.baseAddress, raw.count)
+        }
+        close(fd)
+    }
+
+    private func journalSizeUnlocked() -> Int {
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: journalPath),
+              let size = attributes[.size] as? NSNumber else { return 0 }
+        return size.intValue
+    }
+
+    /// 把 journal 回放结果写成新的基线并删除 journal。
+    /// 同步结束时调用一次，让下一次加载保持 O(N) 的单文件编解码。
+    func compact() {
+        lock.lock(); defer { lock.unlock() }
+        withFileLock { compactLocked() }
+    }
+
+    private func compactLocked() {
+        guard FileManager.default.fileExists(atPath: journalPath) else { return }
+        writeBaseLocked(loadUnlocked())
+        try? FileManager.default.removeItem(atPath: journalPath)
+    }
+
+    private func writeBaseLocked(_ files: [String: RAGManifestEntry]) {
+        let manifest = RAGManifest(files: files)
+        if let data = try? JSONEncoder().encode(manifest) {
+            try? AtomicFile.write(data, to: path)
         }
     }
 
@@ -133,6 +223,7 @@ final class ManifestStore: @unchecked Sendable {
     func clear() {
         lock.lock(); defer { lock.unlock() }
         try? FileManager.default.removeItem(atPath: path)
+        try? FileManager.default.removeItem(atPath: journalPath)
     }
 }
 
@@ -1115,6 +1206,10 @@ public final class RAGEngine {
             // 由后台任务执行：同步返回即可继续检索，构建不再冻结读路径。
             autoBuildRequested = true
         }
+        // journal 已在 worker 内增量追加；同步结束时压实成单文件基线，
+        // 下一次加载不必回放整轮同步的全部记录。放在所有 merge（含收尾去重）
+        // 之后，保证 manifest.json 对诊断/外部读取仍是最新完整快照。
+        manifestStore.compact()
         return stats
     }
 
@@ -1689,6 +1784,9 @@ public final class RAGEngine {
         }
 
         manifestStore.merge(updated: updates, removed: removedEntries)
+        // 手动去重是独立操作，结束后立即压实，外部读取 manifest.json 时
+        // 能看到 tombstone（不必知道 journal 的存在）。
+        manifestStore.compact()
         AgentLog.info("[vector-dedupe] 移除 \(stats.removedChunks) 个重复切片，"
             + "涉及 \(stats.affectedSources) 个来源，清空 \(stats.emptiedSources) 个副本来源")
         return stats
