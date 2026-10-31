@@ -138,8 +138,8 @@ public struct AgentConfig: Sendable {
     /// `Query: ` / `Document: ` 前缀，8192 上下文。
     public var ragEmbeddingModel: String = "jina-embeddings-v5-text-nano-mlx-int4"
     /// 默认 ONNX int8 版 jina reranker：CPU 推理吞吐约为 MLX mxfp8 的 2 倍，
-    /// 1024 token 上下文。实测中文重排分数整体偏低（目标块 0.25-0.68），
-    /// 需配合 ragRerankThreshold=0.45 使用（原 0.7 阈值会滤掉全部结果）。
+    /// 1024 token 上下文。logit 统一经 sigmoid 后，800 字中文目标切片实测
+    /// 约 0.53-0.91，无关切片约 0.03-0.27，默认阈值 0.45 有稳定间隔。
     /// 追求排序质量可改回 bge-reranker-v2-m3-mlx-mxfp8（MLX 后端）并上调阈值。
     public var ragRerankModel: String = "jina-reranker-v2-base-multilingual-onnx"
     /// 重排分数过滤阈值（0-1）。全部低于阈值时回退原排序，不会空结果。

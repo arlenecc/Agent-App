@@ -2079,9 +2079,9 @@ public final class RAGEngine {
                     for index in hits.indices {
                         hits[index].score = scores[index]
                     }
-                    // 重排序后丢弃阈值以下结果（默认 0.45，适配 jina ONNX 的
-                    // 分数分布；bge-mlx 方案可上调至 0.7）；全部低于阈值时
-                    // 回退到原排序的候选，避免模型完全拿不到上下文。
+                    // 重排序后丢弃阈值以下结果（默认 0.45，适配 jina ONNX 经
+                    // sigmoid 后的分数分布；bge-mlx 方案可上调至 0.7）；全部
+                    // 低于阈值时回退到原排序的候选，避免模型拿不到上下文。
                     let threshold = config.ragRerankThreshold
                     let filtered = hits.filter { $0.score >= threshold }
                         .sorted { $0.score > $1.score }

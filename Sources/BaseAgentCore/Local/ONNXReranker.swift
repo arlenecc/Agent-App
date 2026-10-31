@@ -144,12 +144,12 @@ public final class ONNXReranker: RerankProvider, @unchecked Sendable {
         throw ONNXRuntimeError.shape("logits shape=\(shape) 与 batch=\(batchSize) 不匹配")
     }
 
-    /// 有些导出模型直接输出概率，有些输出 logits。
-    /// 全部落在 [0,1] 时按概率保留，否则做 sigmoid，避免二次压缩破坏阈值语义。
+    /// 交叉编码器导出（jina / bge 系）输出单个相关性 logit，必须统一做 sigmoid。
+    /// 不能按“值落在 [0,1]”猜测概率：正 logit 恰好在 [0,1] 时会被误当成概率，
+    /// 导致相关文档分数被系统性压低（例如 logit 0.183 实际应为 0.546）。
     private func activate(_ values: [Double]) -> [Double] {
         guard !values.isEmpty else { return [] }
-        let looksProbability = values.allSatisfy { $0 >= 0 && $0 <= 1 }
-        return looksProbability ? values : values.map { Self.sigmoid(Float($0)) }
+        return values.map { Self.sigmoid(Float($0)) }
     }
 
     private func preferredOutputName(in session: OrtSession) -> String {

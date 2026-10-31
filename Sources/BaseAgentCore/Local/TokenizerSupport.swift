@@ -182,30 +182,73 @@ public final class LocalTokenizer: @unchecked Sendable {
 
     /// 将 query/document 编码成 reranker 需要的 pair 序列。
     ///
-    /// - XLM-R（bge-reranker-v2-m3）：`<s> query </s></s> document </s>`
+    /// - XLM-R（bge-reranker-v2-m3 / jina-reranker-v2）：`<s> query </s></s> document </s>`
     /// - BERT 系：`[CLS] query [SEP] document [SEP]`
+    ///
+    /// 部分 tokenizer（如 XLM-R）在 swift-transformers 里不会从 tokenizer_config
+    /// 填充 `bosTokenId`，需要按 token 字符串回查；否则会误走 BERT 分支，
+    /// 生成 `<unk> query </s> document </s>`，cross-encoder 分数会明显失真。
     public func encodePair(query: String, document: String, maxLength: Int) -> [Int] {
         let queryIDs = base.encode(text: query, addSpecialTokens: false)
         let documentIDs = base.encode(text: document, addSpecialTokens: false)
 
         var ids: [Int] = []
-        if usesXLMRPairFormat, let bos = base.bosTokenId, let eos = base.eosTokenId {
+        if usesXLMRPairFormat,
+           let bos = resolveSpecialTokenID(base.bosTokenId, token: base.bosToken,
+                                          fallbacks: ["<s>"]),
+           let eos = resolveSpecialTokenID(base.eosTokenId, token: base.eosToken,
+                                          fallbacks: ["</s>"]) {
             ids.append(bos)
             ids.append(contentsOf: queryIDs)
             ids.append(eos)
             ids.append(eos)
             ids.append(contentsOf: documentIDs)
             ids.append(eos)
-        } else {
-            let cls = base.convertTokenToId("[CLS]") ?? base.bosTokenId
-            let sep = base.convertTokenToId("[SEP]") ?? base.eosTokenId
-            if let cls { ids.append(cls) }
-            ids.append(contentsOf: queryIDs)
-            if let sep { ids.append(sep) }
-            ids.append(contentsOf: documentIDs)
-            if let sep { ids.append(sep) }
+            // 截断必须保留末尾的 `</s>`，否则 document 段没有结束标记。
+            if ids.count > maxLength {
+                ids = Array(ids.prefix(max(1, maxLength - 1)))
+                ids.append(eos)
+            }
+            return ids
         }
-        return truncate(ids, maxLength: maxLength)
+
+        let cls = resolveSpecialTokenID(base.convertTokenToId("[CLS]"), token: nil,
+                                        fallbacks: ["[CLS]", "<s>"])
+            ?? resolveSpecialTokenID(base.bosTokenId, token: base.bosToken,
+                                     fallbacks: ["<s>"])
+        let sep = resolveSpecialTokenID(base.convertTokenToId("[SEP]"), token: nil,
+                                        fallbacks: ["[SEP]", "</s>"])
+            ?? resolveSpecialTokenID(base.eosTokenId, token: base.eosToken,
+                                     fallbacks: ["</s>"])
+        if let cls { ids.append(cls) }
+        ids.append(contentsOf: queryIDs)
+        if let sep { ids.append(sep) }
+        ids.append(contentsOf: documentIDs)
+        if let sep { ids.append(sep) }
+        if ids.count > maxLength {
+            ids = Array(ids.prefix(maxLength))
+        }
+        return ids
+    }
+
+    /// 解析特殊 token id：显式 id 优先，其次 token 字符串，最后按约定别名回查。
+    /// 未知 token（`<unk>`）不能当作特殊 token 使用。
+    private func resolveSpecialTokenID(_ explicit: Int?, token: String?,
+                                       fallbacks: [String] = []) -> Int? {
+        if let explicit, explicit >= 0, explicit != base.unknownTokenId {
+            return explicit
+        }
+        if let token, let id = base.convertTokenToId(token),
+           id != base.unknownTokenId {
+            return id
+        }
+        for fallback in fallbacks {
+            if let id = base.convertTokenToId(fallback),
+               id != base.unknownTokenId {
+                return id
+            }
+        }
+        return nil
     }
 
     // MARK: - Chat template
