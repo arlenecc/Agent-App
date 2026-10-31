@@ -73,6 +73,22 @@ public enum TextAnalyzer {
         ftsTokens(text).joined(separator: " ")
     }
 
+    /// 批量预分词：切片之间相互独立，按索引并行回填，输出与逐条 `ftsIndexText` 一致。
+    /// 写入路径在拿到存储写锁之前调用，避免整批分词阻塞检索。
+    static func ftsIndexTexts(_ texts: [String]) -> [String] {
+        guard !texts.isEmpty else { return [] }
+        // 小批量串行：线程调度开销高于分词本身。
+        guard texts.count >= 16 else { return texts.map(ftsIndexText) }
+        var output = [String](repeating: "", count: texts.count)
+        output.withUnsafeMutableBufferPointer { buffer in
+            guard let base = buffer.baseAddress else { return }
+            DispatchQueue.concurrentPerform(iterations: texts.count) { index in
+                base[index] = ftsIndexText(texts[index])
+            }
+        }
+        return output
+    }
+
     /// 查询词里最多参与 MATCH 的显著 token 数。自然语言问句常带几十个词，
     /// 全量交给 AND 会几乎不可能命中；按信息量截断后再逐级回退 OR。
     public static let maxSignificantTokens = 32

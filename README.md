@@ -141,7 +141,7 @@ OvisOCR2 的 MLX 权重使用 `model_type=qwen3_5`（Qwen3.5-0.8B 后训练）�
 `VectorStore` 的设计约束：
 
 - **主表与向量表分离**：`chunks` 存正文/元数据，`chunk_vectors`（vec0）只存向量；
-- **单事务写入**：`chunks` + `chunks_fts` + `chunk_vectors` 在同一 `BEGIN IMMEDIATE` 事务内完成，失败整体回滚；
+- **单事务写入**：FTS 预分词在写锁外按批并行完成，`chunks` + `chunks_fts` + `chunk_vectors` 在同一 `BEGIN IMMEDIATE` 事务内写入，失败整体回滚；
 - **单事务删除**：先取 rowid，再按批删除三张表，仍在同一事务内；
 - **两段式 KNN**：先查 `chunk_vectors` 拿 rowid，再回 `chunks` 按 rowid 取正文，绝不 JOIN 虚拟表；
 - **过滤**：不依赖虚拟表过滤，统一 over-fetch 后在第二阶段过滤；定向检索自动放大召回；

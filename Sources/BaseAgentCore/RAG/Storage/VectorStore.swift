@@ -409,6 +409,9 @@ public final class VectorStore: @unchecked Sendable {
         guard chunks.count == vectors.count else {
             throw AgentError.storage("chunks 与 vectors 数量不一致: \(chunks.count) vs \(vectors.count)")
         }
+        // FTS 预分词是纯 CPU 工作（实测约占单切片写入九成），放在写锁外批量并行完成：
+        // 写事务只做插入，检索取向量候选时不会被整批分词阻塞。
+        let ftsTexts = TextAnalyzer.ftsIndexTexts(chunks.map(\.text))
         lock.lock(); defer { lock.unlock() }
         if let rebuildReason {
             throw AgentError.storage(
@@ -463,7 +466,7 @@ public final class VectorStore: @unchecked Sendable {
                         }
                         try db.execute(
                             "INSERT INTO chunks_fts(rowid, tokens, source_hash, chunk_index) VALUES(?, ?, ?, ?)",
-                            [.int(rowID), .text(TextAnalyzer.ftsIndexText(chunk.text)),
+                            [.int(rowID), .text(ftsTexts[i]),
                              .text(Self.hashSource(chunk.source)), .int(Int64(chunk.chunkIndex))]
                         )
                         try insertVector(rowID: rowID, vector: vector)

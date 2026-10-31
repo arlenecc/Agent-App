@@ -954,14 +954,22 @@ git commit -m "perf(rag): cache outline regular expressions"
 
 **Files:**
 - 只读复核: `/private/tmp/fts_bench.swift`、`/private/tmp/sqlite_insert_bench.swift`
+- Modify: `Sources/BaseAgentCore/RAG/Chunking/TextAnalyzer.swift`（批量并行预分词）
+- Modify: `Sources/BaseAgentCore/RAG/Storage/VectorStore.swift`（写锁外预分词）
+- Create: `Tests/BaseAgentCoreTests/FTSIndexTextTests.swift`
 - Modify: `docs/superpowers/plans/2026-10-31-rag-performance-optimizations.md`（记录结论）
 
-- [ ] **Step 1: 运行两个基准并记录结果**
+- [x] **Step 1: 运行两个基准并记录结果**
 
 Run: `swift /private/tmp/fts_bench.swift` / `swift /private/tmp/sqlite_insert_bench.swift`
 Expected: 得到预分词 ms/片、索引文本膨胀比、单事务写入片/秒与查询耗时。
 
-- [ ] **Step 2: 决策门槛**
+实测（本机 Apple Silicon，2000 片 × 736 字）：
+- 预分词 `ftsIndexText`：1.63s，**0.81 ms/片**；索引文本 **2.6 KB/片**（总 5 MB，约为原文的 3.6 倍）。
+- 单事务三表插入（FTS 已预分词）：5000 片 0.22s，**0.04 ms/片，22704 片/秒**；`COUNT(*)` 0.2 ms，FTS `MATCH` 0.1 ms。
+- 串行 vs 并行预分词（`/private/tmp/fts_parallel_bench.swift`）：0.76 vs **0.30 ms/片，2.5x**，2000 条输出逐条一致。
+
+- [x] **Step 2: 决策门槛**
 
 满足以下任一条件才实施额外代码：
 1. 预分词占单切片写入 > 15%，且存在无行为差异的替代实现（例如复用 token 结果、避免二次切词）；
@@ -970,11 +978,17 @@ Expected: 得到预分词 ms/片、索引文本膨胀比、单事务写入片/�
 
 不满足则在计划末尾记录“维持现状，原因：优化收益低于维护成本/存在语义风险”，不写生产代码。
 
+**结论：** 条件 1 成立（预分词约占单切片写入 90%+，且并行批处理与逐条输出完全一致）；条件 2 不成立（22704 片/秒，远超 200 片/秒），SQLite 语句层维持现状。实施内容：
+
+1. `TextAnalyzer.ftsIndexTexts`：≥16 片时按索引并行回填，小批量串行，输出与 `map(ftsIndexText)` 逐条一致。
+2. `VectorStore.add`：预分词在取得存储写锁前完成，写事务内只做三表插入；检索取向量候选不再被整批分词阻塞。
+3. `FTSIndexTextTests` 覆盖逐条一致、并行路径顺序、空输入；与 `VectorStoreTests` / `RAGEngineTests` 共 37 项通过。
+
 ---
 
 ## 验收与收尾
 
-- [ ] `swift test` 全量通过（当前基线 498 tests / 33 skipped / 0 failures）。
-- [ ] 更新 `README.md` 与 `docs/软件设计文档.md` 中受影响的性能说明。
-- [ ] 逐项独立提交；不提交 `benchmarks/` 未跟踪目录。
+- [x] `swift test` 全量通过（516 tests / 33 skipped / 0 failures）。
+- [x] 更新 `README.md` 与 `docs/软件设计文档.md` 中受影响的性能说明。
+- [x] 逐项独立提交；不提交 `benchmarks/` 未跟踪目录。
 - [ ] 推送与打 tag 由用户确认后执行。
